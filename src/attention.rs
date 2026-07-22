@@ -61,10 +61,24 @@ impl AttnBlock {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
-        // To [head, seq, head_dim] for rope + attention.
-        let q = q.transpose(0, 1)?.contiguous()?;
-        let k = k.transpose(0, 1)?.contiguous()?;
-        let v = v.transpose(0, 1)?.contiguous()?;
+        // To [head, seq, head_dim] for rope + attention. At seq==1 (decode) the
+        // [1, head, dim] and [head, 1, dim] layouts share byte order, so a reshape
+        // (metadata only) is bit-identical to transpose+contiguous and drops three
+        // copy dispatches per layer on the hot decode path. seq>1 (prefill) is a
+        // real permutation, so it keeps the transpose+contiguous.
+        let (q, k, v) = if seq == 1 {
+            (
+                q.reshape((self.n_head, 1, self.head_dim))?,
+                k.reshape((self.n_kv_head, 1, self.head_dim))?,
+                v.reshape((self.n_kv_head, 1, self.head_dim))?,
+            )
+        } else {
+            (
+                q.transpose(0, 1)?.contiguous()?,
+                k.transpose(0, 1)?.contiguous()?,
+                v.transpose(0, 1)?.contiguous()?,
+            )
+        };
 
         let (q, k) = self.rope.apply(&q, &k, pos)?;
 
@@ -85,8 +99,14 @@ impl AttnBlock {
         let gate = softplus(&gate_logits)?.transpose(0, 1)?.reshape((self.n_head, seq, 1))?;
         let attn = attn.broadcast_mul(&gate)?;
 
-        // Back to [seq, n_head*head_dim] then o_proj.
-        let out = attn.transpose(0, 1)?.contiguous()?.reshape((seq, self.n_head * self.head_dim))?;
+        // Back to [seq, n_head*head_dim] then o_proj. Same seq==1 shortcut: the
+        // [head, 1, dim] -> [1, head*dim] regroup is byte-identical to
+        // transpose+contiguous+reshape, so decode skips the copy.
+        let out = if seq == 1 {
+            attn.reshape((seq, self.n_head * self.head_dim))?
+        } else {
+            attn.transpose(0, 1)?.contiguous()?.reshape((seq, self.n_head * self.head_dim))?
+        };
         Ok(self.o_proj.forward(&out)?)
     }
 

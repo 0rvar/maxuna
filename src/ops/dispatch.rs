@@ -16,6 +16,7 @@ use candle_metal_kernels::source::Source;
 use candle_metal_kernels::utils::EncoderProvider;
 
 use crate::gguf::ExpertStack;
+use crate::ops::{MmVariant, pipelines};
 
 /// Build an `MTLSize` without naming `objc2_metal::MTLSize` — laguna does not
 /// depend on objc2-metal directly, and a function cannot return the unnameable
@@ -99,31 +100,74 @@ fn mv_kernel_name(dt: GgmlDType) -> Result<&'static str> {
     Ok(n)
 }
 
-fn mm_kernel_name(dt: GgmlDType) -> Result<&'static str> {
+/// The vendored two-pass `kernel_mul_mm_id_<dtype>_f32` (src/ops/mm_id.metal)
+/// is only instantiated for the dtypes the tests and the production Q4_K_M
+/// experts use; other dtypes stay on the mv_id path.
+pub(crate) fn mm_kernel_name(dt: GgmlDType) -> Result<&'static str> {
     let n = match dt {
-        GgmlDType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
-        GgmlDType::Q4_1 => "kernel_mul_mm_id_q4_1_f32",
-        GgmlDType::Q5_0 => "kernel_mul_mm_id_q5_0_f32",
-        GgmlDType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
-        GgmlDType::Q2K => "kernel_mul_mm_id_q2_K_f32",
-        GgmlDType::Q3K => "kernel_mul_mm_id_q3_K_f32",
         GgmlDType::Q4K => "kernel_mul_mm_id_q4_K_f32",
         GgmlDType::Q5K => "kernel_mul_mm_id_q5_K_f32",
         GgmlDType::Q6K => "kernel_mul_mm_id_q6_K_f32",
-        GgmlDType::F16 => "kernel_mul_mm_id_f16_f32",
-        GgmlDType::F32 => "kernel_mul_mm_id_f32_f32",
-        other => bail!("no kernel_mul_mm_id kernel for dtype {other:?}"),
+        other => bail!("no vendored kernel_mul_mm_id kernel for dtype {other:?}; use mul_mv_id"),
     };
     Ok(n)
 }
 
-/// Matrix-tile threadgroup memory the mm kernel always reserves (sa: 4096 half +
-/// sb: 4096 float), before the per-launch id-remap scratch.
-const MM_TILE_SMEM: usize = 8192;
+/// The `kernel_mul_mm_id_map0` template is instantiated for these top_k values
+/// in mm_id.metal; a top_k outside the set has no map0 pass.
+pub(crate) fn map0_kernel_name(top_k: usize) -> Result<String> {
+    match top_k {
+        1 | 2 | 4 | 5 | 6 | 8 | 10 => Ok(format!("kernel_mul_mm_id_map0_ne20_{top_k}")),
+        other => bail!("no kernel_mul_mm_id_map0 instantiation for top_k={other}; use mul_mv_id"),
+    }
+}
+
+// The 64x32-tile threadgroup memory each mm_id variant reserves (fixed
+// regardless of token count — the two-pass row map lives in device scratch, not
+// threadgroup memory) is `MmVariant::tile_smem()`: 8192 B for the half-tile
+// variants (sa 4096 + sb 2048, store-back float tile reuses the region up to
+// NR0*NR1*4 = 8192) and 12288 B for the f32 `_hp` tiles (sa 8192 + sb 4096).
 /// Apple-silicon threadgroup memory ceiling; we refuse a launch that would exceed
 /// it rather than let the GPU fault.
 const MAX_THREADGROUP_SMEM: usize = 32768;
+
+/// `ggml_metal_kargs_mul_mm_id_map0` (ggml-metal-impl.h). `#[repr(C)]` matches
+/// the Metal `constant` struct layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Map0Args {
+    ne02: i32,
+    ne10: i32,
+    ne11: i32,
+    nb11: u64,
+    nb12: u64,
+    ne21: i32,
+    ne20: i32,
+    nb21: u64,
+}
+
+/// `ggml_metal_kargs_mul_mm_id` (ggml-metal-impl.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MmIdArgs {
+    ne00: i32,
+    ne02: i32,
+    nb01: u64,
+    nb02: u64,
+    nb03: u64,
+    ne11: i32,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    ne20: i32,
+    ne21: i32,
+    ne0: i32,
+    ne1: i32,
+    r2: i16,
+    r3: i16,
+}
 
 /// Encode `kernel_mul_mv_id_<dtype>_f32` (decode path). Each threadgroup along z
 /// handles one (token, expert-slot) pair; the kernel reads the expert id from the
@@ -202,95 +246,129 @@ pub(crate) fn encode_mul_mv_id(
     Ok(())
 }
 
-/// Encode `kernel_mul_mm_id_<dtype>_f32` (prefill path). One threadgroup slab per
-/// expert (grid.z); the kernel scans the ids buffer into a threadgroup row-id map
-/// so each expert's rows are dequantized once for all tokens that selected it.
+/// Count of 4-byte scratch slots `run` over-allocates on the dst buffer's tail
+/// for the mm_id two-pass: the per-expert token count (`tpe`, n_expert i32) then
+/// the per-expert compacted token-slot list (`ids-map`, n_expert*t i32). The dst
+/// buffer is f32 and these entries are i32 (both 4 bytes), so one slot == one
+/// dst element. Living in the dst allocation, the scratch shares its lifetime
+/// (the returned tensor keeps it resident) instead of racing the buffer pool.
+pub(crate) fn mm_scratch_elems(n_expert: usize, t: usize) -> usize {
+    n_expert + n_expert * t
+}
+
+/// Encode the two-pass indexed matmul (prefill path) against the vendored
+/// `mm_id.metal` kernels. Pass 1 (`map0`) builds, per expert, the compacted list
+/// of token-slots routed to it plus a count; pass 2 (`mul_mm_id`) does the
+/// token-grouped quantized matmul, with each expert's threadgroups covering only
+/// its own rows. The two scratch regions live at the tail of `d.dst`.
+///
+/// `variant` picks the mm_id kernel family (tensor `_t` / classic `_hp` / classic
+/// f16), threaded in from the single cached read in `ops::mm_id_variant`, never
+/// re-read here. It sets the kernel host-name suffix and the tile smem.
+///
+/// Ordering: `map0` marks tpe/ids-map as write outputs and `mul_mm_id` reads
+/// them back as inputs on the same buffer, so candle's encoder auto-inserts the
+/// RAW memory barrier between the two dispatches (its `Output`-mark hazard
+/// tracking); no explicit barrier is needed.
 pub(crate) fn encode_mul_mm_id(
     device: &MetalDevice,
     ep: impl EncoderProvider,
     dt: GgmlDType,
     d: &IdDispatch,
+    variant: MmVariant,
 ) -> Result<()> {
-    let name = mm_kernel_name(dt)?;
+    let mm_name = format!("{}{}", mm_kernel_name(dt)?, variant.suffix());
+    let map0_name = map0_kernel_name(d.top_k)?;
 
-    // Worst case every token routes every slot to one expert, so that expert's
-    // row-id map (and the column grid) must cover all top_k*t pairs.
-    let max_rows = d.top_k * d.t;
-    // The row-id map (ushort2 per pair) shares the 32KB threadgroup budget with
-    // the 8KB matrix tile, capping top_k*t at (32768-8192)/4 = 6144. WP9 owns the
-    // prefill chunk sizing; this documents the invariant the runtime guard below
-    // enforces (512 tokens * top_k 10 = 5120 fits).
-    debug_assert!(
-        max_rows <= (MAX_THREADGROUP_SMEM - MM_TILE_SMEM) / std::mem::size_of::<u32>(),
-        "mul_mm_id row-id map for top_k*t={max_rows} exceeds the {MAX_THREADGROUP_SMEM}-byte \
-         threadgroup budget (cap {})",
-        (MAX_THREADGROUP_SMEM - MM_TILE_SMEM) / std::mem::size_of::<u32>()
-    );
-    let smem = MM_TILE_SMEM + max_rows * std::mem::size_of::<u32>();
-    if smem > MAX_THREADGROUP_SMEM {
+    // Scratch offsets on the dst buffer, in bytes (i32-wide entries throughout).
+    const I32_BYTES: usize = 4;
+    let tpe_off = d.t * d.top_k * d.n_out * DType::F32.size_in_bytes();
+    let ids_map_off = tpe_off + d.n_expert * I32_BYTES;
+
+    let map0 = pipelines::mm_id_pipeline(device.device(), &map0_name)?;
+    let mm = pipelines::mm_id_pipeline(device.device(), &mm_name)?;
+
+    // map0 runs one thread per expert; the ids scratch it reads into holds
+    // n_expert * top_k u16 entries.
+    let map0_smem = d.n_expert * d.top_k * std::mem::size_of::<u16>();
+    if map0_smem > MAX_THREADGROUP_SMEM {
         bail!(
-            "mul_mm_id needs {smem} bytes of threadgroup memory for top_k*t={max_rows}, \
-             over the {MAX_THREADGROUP_SMEM}-byte limit; use mul_mv_id or a smaller prefill chunk"
+            "kernel_mul_mm_id_map0 needs {map0_smem} bytes of threadgroup memory for \
+             n_expert={} top_k={}, over the {MAX_THREADGROUP_SMEM}-byte limit",
+            d.n_expert,
+            d.top_k
+        );
+    }
+    if d.n_expert > map0.max_total_threads_per_threadgroup() {
+        bail!(
+            "kernel_mul_mm_id_map0 dispatches {} threads/threadgroup, over the pipeline max {}",
+            d.n_expert,
+            map0.max_total_threads_per_threadgroup()
         );
     }
 
-    let nei0 = d.top_k as i64;
-    let nei1 = d.t as i64;
-    let nbi1 = (d.top_k * DType::U32.size_in_bytes()) as u64;
-    let ne00 = d.k as i64;
-    let ne02 = d.n_expert as i64;
-    let nb01 = d.bytes_per_row as u64;
-    let nb02 = d.per_expert as u64;
-    let ne11 = d.x_per_row as i64;
-    let ne12 = d.t as i64;
-    let ne13 = 1i64;
-    let nb10 = DType::F32.size_in_bytes() as u64;
     let nb11 = (d.k * DType::F32.size_in_bytes()) as u64;
     let nb12 = (d.x_per_row * d.k * DType::F32.size_in_bytes()) as u64;
-    let ne0 = d.n_out as i64;
-    let ne1 = d.top_k as i64;
-    let nb1 = (d.n_out * DType::F32.size_in_bytes()) as u64;
+    let nb21 = (d.top_k * DType::U32.size_in_bytes()) as u64;
 
-    let pipeline = device
-        .kernels()
-        .load_pipeline(device.device(), Source::Quantized, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_compute_pipeline_state(&pipeline);
 
-    candle_metal_kernels::set_params!(
-        encoder,
-        (
-            d.weights,
-            (d.x, d.x_off),
-            candle_metal_kernels::Output::new(d.dst),
-            (d.ids, d.ids_off),
-            nei0,
-            nei1,
-            nbi1,
-            ne00,
-            ne02,
-            nb01,
-            nb02,
-            ne11,
-            ne12,
-            ne13,
-            nb10,
-            nb11,
-            nb12,
-            ne0,
-            ne1,
-            nb1
-        )
-    );
+    // ---- Pass 1: map0 (buffers: 0=args, 1=ids, 2=tpe out, 3=ids-map out).
+    let map0_args = Map0Args {
+        ne02: d.n_expert as i32,
+        ne10: d.k as i32,
+        ne11: d.x_per_row as i32,
+        nb11,
+        nb12,
+        ne21: d.t as i32,
+        ne20: d.top_k as i32,
+        nb21,
+    };
+    encoder.set_compute_pipeline_state(&map0);
+    encoder.set_bytes(0, &map0_args);
+    encoder.set_input_buffer(1, Some(d.ids), d.ids_off);
+    encoder.set_output_buffer(2, Some(d.dst), tpe_off);
+    encoder.set_output_buffer(3, Some(d.dst), ids_map_off);
+    encoder.set_threadgroup_memory_length(0, map0_smem);
+    encoder.dispatch_thread_groups(mtl_size!(1, 1, 1), mtl_size!(d.n_expert, 1, 1));
 
-    encoder.set_threadgroup_memory_length(0, smem);
+    // No explicit barrier needed: map0 marked tpe/ids-map as outputs, and pass 2
+    // reads them back as inputs on the same buffer, so candle's encoder inserts
+    // the RAW barrier automatically (Output-mark hazard tracking, verified in
+    // candle's vendored auto_barrier).
 
-    // BLOCK_SIZE_N=32 columns (token-slots), BLOCK_SIZE_M=64 rows (n_out), one
-    // slab per expert in z.
-    let grid = mtl_size!(max_rows.div_ceil(32), d.n_out.div_ceil(64), d.n_expert);
-    let threads = mtl_size!(128, 1, 1);
-    encoder.dispatch_thread_groups(grid, threads);
+    // ---- Pass 2: mul_mm_id (0=args, 1=weights, 2=x, 3=tpe, 4=ids-map, 5=dst).
+    let mm_args = MmIdArgs {
+        ne00: d.k as i32,
+        ne02: d.n_expert as i32,
+        nb01: d.bytes_per_row as u64,
+        nb02: d.per_expert as u64,
+        nb03: 0,
+        ne11: d.x_per_row as i32,
+        nb10: DType::F32.size_in_bytes() as u64,
+        nb11,
+        nb12,
+        nb13: 0,
+        ne20: d.top_k as i32,
+        ne21: d.t as i32,
+        ne0: d.n_out as i32,
+        ne1: d.top_k as i32,
+        r2: 1,
+        r3: 1,
+    };
+    encoder.set_compute_pipeline_state(&mm);
+    encoder.set_bytes(0, &mm_args);
+    encoder.set_input_buffer(1, Some(d.weights), 0);
+    encoder.set_input_buffer(2, Some(d.x), d.x_off);
+    encoder.set_input_buffer(3, Some(d.dst), tpe_off);
+    encoder.set_input_buffer(4, Some(d.dst), ids_map_off);
+    encoder.set_output_buffer(5, Some(d.dst), 0);
+    encoder.set_threadgroup_memory_length(0, variant.tile_smem());
+
+    // grid: 32-wide token-slot columns, 64-wide n_out rows, one z-slab per expert.
+    let grid = mtl_size!(d.t.div_ceil(32), d.n_out.div_ceil(64), d.n_expert);
+    encoder.dispatch_thread_groups(grid, mtl_size!(128, 1, 1));
     Ok(())
 }
 
@@ -321,7 +399,16 @@ pub(crate) enum Mode {
 
 /// Validate the seam shapes, resolve every operand to a device buffer, and encode
 /// the requested id kernel. Returns the `[t, top_k, n_out]` output tensor.
-pub(crate) fn run(stack: &ExpertStack, x: &Tensor, ids: &Tensor, mode: Mode) -> Result<Tensor> {
+/// `variant` is only consulted for `Mode::Mm` (which mm_id kernel family);
+/// callers pass the cached `ops::mm_id_variant()` in production and an explicit
+/// value in A/B tests. `Mode::Mv` ignores it.
+pub(crate) fn run(
+    stack: &ExpertStack,
+    x: &Tensor,
+    ids: &Tensor,
+    mode: Mode,
+    variant: MmVariant,
+) -> Result<Tensor> {
     let cdev = x.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("mul_*_id requires x on a Metal device");
@@ -365,7 +452,15 @@ pub(crate) fn run(stack: &ExpertStack, x: &Tensor, ids: &Tensor, mode: Mode) -> 
     };
 
     let out_count = t * top_k * stack.n_out;
-    let dst = mdev.new_buffer(out_count, DType::F32, "mul_id")?;
+    // Mm over-allocates the dst buffer to hold the two-pass scratch (tpe +
+    // ids-map) at its tail; the returned tensor keeps the whole allocation
+    // resident, so the scratch shares its lifetime and the pool reuses it once
+    // the tensor drops.
+    let alloc_count = match mode {
+        Mode::Mv => out_count,
+        Mode::Mm => out_count + mm_scratch_elems(stack.n_expert, t),
+    };
+    let dst = mdev.new_buffer(alloc_count, DType::F32, "mul_id")?;
 
     let (x_guard, x_layout) = x.storage_and_layout();
     let Storage::Metal(x_storage) = &*x_guard else {
@@ -401,7 +496,7 @@ pub(crate) fn run(stack: &ExpertStack, x: &Tensor, ids: &Tensor, mode: Mode) -> 
         let cmd = mdev.command_encoder()?;
         match mode {
             Mode::Mv => encode_mul_mv_id(mdev, &cmd, dt, &d)?,
-            Mode::Mm => encode_mul_mm_id(mdev, &cmd, dt, &d)?,
+            Mode::Mm => encode_mul_mm_id(mdev, &cmd, dt, &d, variant)?,
         }
     }
     drop(x_guard);
@@ -439,16 +534,23 @@ pub(crate) mod testutil {
             .dequantize(&Device::Cpu)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        // Mirror the production load path: upload the quantized bytes once and
-        // retain the buffer handle for the fused kernels. (Test-only difference:
-        // the bytes come from `qt.data()` rather than the GGUF file.)
+        // Mirror the production `expert_stack` load path exactly: upload the
+        // quantized bytes once via `from_data`, retain the buffer handle for the
+        // fused kernels, then MOVE that storage into the QTensor. The qtensor and
+        // the retained `buffer` must share one allocation — if `qtensor` came from
+        // a separate `quantize` instead, the shared buffer's only pool reference
+        // would hit strong_count 1 and candle's `drop_unused_buffers` (triggered
+        // by any readback) would evict it from the residency set, so a later fused
+        // dispatch reads a non-resident buffer. (Test-only difference from
+        // production: the bytes come from `qt.data()`, not the GGUF file.)
         let storage = QStorage::from_data(qt.data()?, device, dt)?;
         let buffer = match &storage {
             QStorage::Metal(qms) => Some(Arc::new(qms.buffer().clone())),
             _ => None,
         };
+        let qtensor = Arc::new(QTensor::new(storage, (n_expert, n_out, k))?);
         let stack = ExpertStack {
-            qtensor: Arc::new(qt),
+            qtensor,
             buffer,
             dtype: dt,
             n_expert,
@@ -529,5 +631,30 @@ pub(crate) mod testutil {
         r.into_iter()
             .map(|v| (v as usize % n_expert) as u32)
             .collect()
+    }
+
+    /// Ids with `top_k` DISTINCT experts per token — the invariant real top-k
+    /// routing always satisfies (argsort top-k never repeats an index). The
+    /// two-pass mm_id kernel relies on it: map0 collapses each token's slots for
+    /// an expert into one row, so a token selecting the same expert twice would
+    /// lose a slot. mv_id has no such requirement, but distinct ids exercise both.
+    pub(crate) fn distinct_ids(t: usize, top_k: usize, n_expert: usize, seed: u64) -> Vec<u32> {
+        assert!(top_k <= n_expert, "cannot pick {top_k} distinct of {n_expert} experts");
+        let mut out = Vec::with_capacity(t * top_k);
+        let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        for _ in 0..t {
+            let mut chosen: Vec<u32> = Vec::with_capacity(top_k);
+            while chosen.len() < top_k {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let e = (s % n_expert as u64) as u32;
+                if !chosen.contains(&e) {
+                    chosen.push(e);
+                }
+            }
+            out.extend_from_slice(&chosen);
+        }
+        out
     }
 }

@@ -14,7 +14,8 @@ use crate::ops::dispatch::{self, Mode};
 /// ids: [t, top_k] u32, on-device.
 /// Returns [t, top_k, n_out] f32.
 pub fn mul_mv_id(stack: &ExpertStack, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
-    dispatch::run(stack, x, ids, Mode::Mv)
+    // The mm variant is a no-op for the matvec path (Mode::Mv ignores it).
+    dispatch::run(stack, x, ids, Mode::Mv, crate::ops::MmVariant::ClassicHp)
 }
 
 #[cfg(test)]

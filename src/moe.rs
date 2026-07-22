@@ -7,7 +7,7 @@ use candle_nn::ops::{sigmoid, silu};
 
 use crate::config::LagunaConfig;
 use crate::gguf::{ExpertStack, QLinear, Weights};
-use crate::ops::{ExpertRunner, mv_id};
+use crate::ops::{ExpertRunner, mm_id, mv_id};
 
 /// F16's smallest positive normal, the denominator floor llama.cpp clamps the
 /// routing-weight sum to before normalizing (`ffn_moe_weights_sum_clamped`).
@@ -213,34 +213,72 @@ impl ExpertFfn for FusedExperts {
         let top_k = ids.dim(1)?;
         let x = x.to_dtype(DType::F32)?;
 
-        // Both prefill and decode dispatch through mul_mv_id. The mm_id kernel
-        // (token-grouped matmul) was measured slower here: candle's
-        // kernel_mul_mm_id re-scans the whole ids buffer in every one of its
-        // ~n_expert * (n_out/64) threadgroups, and for a 256-expert model that
-        // redundant scan costs more than the expert-weight-reuse it buys. See
-        // the WP9 report; a proper fix needs the ggml two-pass row-map kernel.
+        // Prefill (many tokens) uses the two-pass token-grouped matmul so each
+        // expert's rows are dequantized once for all the tokens routed to it;
+        // decode (batch=1, and short chunks) stays on the per-token matvec, which
+        // wins at low token counts. 32 is ggml's mm_id break-even point.
+        // `LAGUNA_NO_MM_ID` forces mv_id everywhere as a fallback; mm_id is also
+        // skipped (mv_id fallback) for any dtype/top_k the vendored kernels are
+        // not instantiated for, so other checkpoints still run. Note mm_id's
+        // tiled f32 accumulation drifts a little further from the per-row f32
+        // reference oracle than mv_id does (fork-equivalent tiled behavior; see
+        // docs/parity.md §3b), so mv_id is the reference for the strict gate.
+        let mm_supported = mm_id::supported(self.gate.dtype, top_k)
+            && mm_id::supported(self.up.dtype, top_k)
+            && mm_id::supported(self.down.dtype, top_k);
+        let use_mm = seq >= 32 && !crate::ops::no_mm_id() && mm_supported;
+        let matmul = |stack: &ExpertStack, x: &Tensor, ids: &Tensor| -> Result<Tensor> {
+            if use_mm {
+                mm_id::mul_mm_id(stack, x, ids)
+            } else {
+                mv_id::mul_mv_id(stack, x, ids)
+            }
+        };
 
         // gate/up share one activation per token: x_per_row = 1.
         let x_g = x.reshape((seq, 1, hidden))?;
-        let gate = mv_id::mul_mv_id(&self.gate, &x_g, ids)?; // [seq, top_k, expert_ff]
-        let up = mv_id::mul_mv_id(&self.up, &x_g, ids)?; // [seq, top_k, expert_ff]
+        let gate = matmul(&self.gate, &x_g, ids)?; // [seq, top_k, expert_ff]
+        let up = matmul(&self.up, &x_g, ids)?; // [seq, top_k, expert_ff]
+
+        // The down projection consumes the SwiGLU activation. Some mm_id variants
+        // stage that activation as f16, where a large value would overflow, and
+        // need the L2 rescale guard; others read it as f32 and do not:
+        //   - decode / mv_id: candle's kernel_mul_mv_q{4,6}_K_f32_impl reads src1
+        //     as f32 and accumulates in f32 (quantized.metal:4889/4930, 5188/5225);
+        //   - prefill / mm_id-hp (classic f32 tiles): stages src1 as float — no cast;
+        //   - prefill / mm_id tensor default + classic-f16: stage src1 as half —
+        //     f16 cast, so the rescale is required.
+        let needs_rescale = use_mm && crate::ops::mm_id_variant().casts_activation_f16();
+
+        // silu(gate)*up via candle ops. Vendored fused kernels (a full
+        // silu/mul/L2/rescale one, and a plain elementwise silu*mul) were tried
+        // and abandoned: even ~1e-6 differences in how the activation is computed
+        // cascade through the MoE router (near-tie expert flips downstream) to
+        // ~1e-3 final-logit divergence, below the strict gate. Any reimplementation
+        // of the activation cascades, so it stays on candle's ops, which the f32
+        // reference oracle also uses. See docs/parity.md §3b and TODO.md.
         let act = (silu(&gate)? * up)?; // [seq, top_k, expert_ff]
 
-        // Rescale each (token, expert) column by its L2 norm before the down
-        // projection so the kernel's f16 cast of the activation cannot overflow;
-        // the factor is divided back out afterwards (a per-column identity).
-        let f16_safe = 32768.0_f64;
-        let col_l2 = act
-            .sqr()?
-            .sum_keepdim(2)?
-            .sqrt()?
-            .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
-        let act_s = (act * f16_safe)?.broadcast_div(&col_l2)?;
+        if needs_rescale {
+            // Per-column L2 rescale keeps the f16-tile down cast in range; the
+            // factor divides back out afterwards (a per-column identity). 32768
+            // (f16's safe headroom) is only meaningful on this f16-tile branch.
+            let f16_safe = 32768.0_f64;
+            let col_l2 = act
+                .sqr()?
+                .sum_keepdim(2)?
+                .sqrt()?
+                .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
+            let act_s = (&act * f16_safe)?.broadcast_div(&col_l2)?;
+            let down = matmul(&self.down, &act_s, ids)?; // [seq, top_k, hidden]
+            let down = (down.broadcast_mul(&col_l2)? * (1.0 / f16_safe))?;
+            let w = weights.to_dtype(DType::F32)?.reshape((seq, top_k, 1))?;
+            return Ok(down.broadcast_mul(&w)?.sum(1)?);
+        }
 
-        let down = mv_id::mul_mv_id(&self.down, &act_s, ids)?; // [seq, top_k, hidden]
-        let down = (down.broadcast_mul(&col_l2)? * (1.0 / f16_safe))?;
-
-        // Weight each expert's output (unbiased, scaled weights) and sum.
+        // Default: f32 down projection (mv_id or mm_id-hp) — no f16 cast, so the
+        // activation feeds the down matmul directly, no rescale needed.
+        let down = matmul(&self.down, &act, ids)?; // [seq, top_k, hidden]
         let w = weights.to_dtype(DType::F32)?.reshape((seq, top_k, 1))?;
         Ok(down.broadcast_mul(&w)?.sum(1)?)
     }

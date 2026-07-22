@@ -94,8 +94,13 @@ trap documented here.
 - Runbook: `docs/parity.md`. Fixtures with real token ids:
   `tests/fixtures/parity-prompts.json` (code-short 58 / text-mixed 82 /
   long-swa 609 — the last exercises SWA-ring wraparound).
-- Pass criteria philosophy (learned in WP8): Track B full-logit gate
-  (cos ≥ 0.999, top-1, top-5 ≥ 4/5) is the real gate. Track A vs
+- Pass criteria philosophy (learned in WP8): the Track B full-logit gate is the
+  real gate, and it is now TWO-TIER by expert kernel (see docs/parity.md §3b):
+  mv_id/decode holds the strict cos ≥ 0.999 + top-1 + top-5 ≥ 4/5; the tiled
+  mm_id prefill default holds a fork-equivalence gate (cos ≥ 0.995, top-5 ≥ 4/5,
+  top-1 matches or a reference near-tie < 0.5 logit) because its f32 tile
+  accumulation order drifts from the per-row oracle just as the fork's does.
+  Track A vs
   llama-eval-callback: judge by divergence CLIFF, not absolute thresholds —
   smooth drift to ~0.2 sampled rel-L2 by layer 47 is normal cross-kernel Q4
   noise. Greedy: divergences acceptable only at near-ties, gap < 0.15 logit
