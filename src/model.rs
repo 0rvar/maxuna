@@ -128,9 +128,14 @@ impl LagunaModel {
         self.max_ctx
     }
 
-    /// tokens: [seq] u32 at absolute position pos. Returns last-position
-    /// logits [vocab] f32.
-    pub fn forward(&mut self, tokens: &Tensor, pos: usize) -> Result<Tensor> {
+    /// Run the transformer stack (embedding → 48 layers → final norm) and return
+    /// the post-final-norm hidden states `[seq, hidden]` for EVERY position,
+    /// together with the per-layer taps collected when capture is enabled.
+    /// Shared by `forward` (which narrows to the last position for the lm head)
+    /// and `forward_all_logits` (which keeps every position). Advances the KV
+    /// caches, so callers feeding chunks must pass a monotonically increasing
+    /// `pos`.
+    fn run_stack(&mut self, tokens: &Tensor, pos: usize) -> Result<(Tensor, Vec<(String, Tensor)>)> {
         let seq = tokens.elem_count();
         ensure!(
             pos + seq <= self.max_ctx,
@@ -144,7 +149,7 @@ impl LagunaModel {
         let mut x = self.embed.index_select(&tokens, 0)?.to_dtype(DType::F32)?; // [seq, hidden]
 
         // Taps are collected into a local vec (no self-borrow tangle with the
-        // per-layer cache mutation) and published at the end when enabled.
+        // per-layer cache mutation) and published by the caller when enabled.
         let mut taps: Vec<(String, Tensor)> = Vec::new();
         macro_rules! tap {
             ($name:expr, $il:expr, $t:expr) => {
@@ -187,11 +192,20 @@ impl LagunaModel {
             taps.push(("h_nextn".to_string(), x.clone()));
         }
 
+        let normed = self.output_norm.forward(&x)?; // [seq, hidden]
+        Ok((normed, taps))
+    }
+
+    /// tokens: [seq] u32 at absolute position pos. Returns last-position
+    /// logits [vocab] f32.
+    pub fn forward(&mut self, tokens: &Tensor, pos: usize) -> Result<Tensor> {
+        let seq = tokens.elem_count();
+        let (normed, mut taps) = self.run_stack(tokens, pos)?;
+
         // Final norm over the full sequence, then the lm head on the LAST
         // position only — never run the vocab matmul over the whole prefill
         // chunk. `result_norm` matches the fork, which captures it after the
         // last-position gather, so it is last-position-only too.
-        let normed = self.output_norm.forward(&x)?;
         let last = normed.narrow(0, seq - 1, 1)?.contiguous()?; // [1, hidden]
         // Decode bypass: at one query position, run the vendored ggml-geometry
         // plain mat-vec over the shared lm_head buffer (candle's baked Q6_K mv
@@ -221,6 +235,22 @@ impl LagunaModel {
         }
 
         Ok(logits)
+    }
+
+    /// All-position logits `[seq, vocab]` f32 for offline scoring (perplexity
+    /// parity). Runs the identical transformer stack as `forward` but keeps the
+    /// lm head over EVERY position instead of narrowing to the last, so the
+    /// caller can gather a next-token log-probability at every prefill position.
+    ///
+    /// The lm head runs through the plain QMatMul path (`lm_head.forward`) over
+    /// the full `[seq, hidden]` — the same path `forward` uses for a seq > 1
+    /// prefill chunk — so this shares the default prefill numerics and never
+    /// touches the decode-only vendored mat-vec bypass. Offline tooling only;
+    /// `forward`/`generate` are unaffected. Advances the KV caches like
+    /// `forward`, so a chunked continuous pass must feed a monotonic `pos`.
+    pub fn forward_all_logits(&mut self, tokens: &Tensor, pos: usize) -> Result<Tensor> {
+        let (normed, _taps) = self.run_stack(tokens, pos)?;
+        Ok(self.lm_head.forward(&normed)?) // [seq, vocab]
     }
 
     /// Enable capture of named intermediate tensors (parity bisection).

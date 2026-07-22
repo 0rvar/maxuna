@@ -640,8 +640,11 @@ template [[host_name("kernel_mul_mm_id_q4_K_f32_t")]] kernel mul_mm_id_t kernel_
 template [[host_name("kernel_mul_mm_id_q5_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 
-// Experiment: float-operand tensor tiles (`_t_hp`). If matmul2d accepts float
-// cooperative tensors, this gives f32 precision on the fast path with no f16
-// activation cast (hence no rescale). Needs 12288 B tile smem (sa 8192 + sb 4096).
-template [[host_name("kernel_mul_mm_id_q4_K_f32_t_hp")]] kernel mul_mm_id_t kernel_mul_mm_id_t<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q6_K_f32_t_hp")]] kernel mul_mm_id_t kernel_mul_mm_id_t<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
+// The float-operand tensor-tile variant (`_t_hp`) is instantiated in the
+// SEPARATE source src/ops/mm_id_t_hp.metal, which pipelines.rs concatenates onto
+// this file only when LAGUNA_MM_ID_TENSOR_HP is actually selected. matmul2d over
+// FLOAT cooperative tensors is speculative (the probe test validates only half
+// operands), so keeping it out of THIS library means a future toolchain that
+// rejects float `matmul2d` operands fails only the opt-in TensorHp path, not the
+// default prefill library. This library still requires Metal-4 tensor support to
+// compile — the default `_t` variant above uses half cooperative tensors.

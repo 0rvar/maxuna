@@ -71,7 +71,8 @@ trap documented here.
 ## The candle situation
 
 - Pinned by git rev `27f20fea…` in Cargo.toml (same rev as ../offload). The pin
-  freezes: the baked `kernel_mul_mv_id_*` Metal kernels (decode path — present in
+  freezes: the baked `kernel_mul_mv_id_*` Metal kernels (now only the
+  `LAGUNA_MV_CLASSIC` decode fallback — present in
   candle's metallib with ZERO upstream Rust wiring; src/ops/ is our host
   dispatch; candle's own FusedMoeGGUF/indexed_moe_forward PANIC on non-CUDA),
   plus the public QStorage/MetalDevice/`new_library_with_source` surface both the
@@ -99,30 +100,47 @@ trap documented here.
   the L2 rescale guard); tensor f32 tiles (`_t_hp`, `LAGUNA_MM_ID_TENSOR_HP`,
   ~2e-7 but slower); classic simdgroup f32 (`_hp`, `LAGUNA_MM_ID_CLASSIC`);
   classic simdgroup f16 (`LAGUNA_MM_ID_F16`). `LAGUNA_NO_MM_ID` forces mv_id
-  everywhere. mm_id.metal unconditionally includes `<metal_tensor>` +
-  MetalPerformancePrimitives, so the whole library requires Metal-4 tensor
+  everywhere. mm_id.metal includes `<metal_tensor>` + MetalPerformancePrimitives
+  for the default `_t` path, so the default library requires Metal-4 tensor
   support to compile (fine per the M5-only mandate; the `tensor_matmul2d_probe`
-  test guards it). Decode stays on candle's baked `kernel_mul_mv_id_*` (f32
-  activations + f32 accumulate, ~2e-7 rel).
+  test guards it) — but only with HALF cooperative-tensor operands. The
+  speculative FLOAT-operand `_t_hp` instantiations are split into a separate
+  source (`src/ops/mm_id_t_hp.metal`), concatenated onto mm_id.metal and compiled
+  lazily by pipelines.rs only when `LAGUNA_MM_ID_TENSOR_HP` is selected, so a
+  future toolchain that rejects float `matmul2d` operands fails only that opt-in
+  path, not the default prefill library (the
+  `instantiation_matrix_matches_metal` test enforces the partition). Decode mv
+  (routed gather + seq==1 lm_head) is our VENDORED
+  ggml-current geometry (`src/ops/mv.metal`, separate library, no Metal-4 dep;
+  f32 accumulate) — DEFAULT for q4_K/q6_K; `LAGUNA_MV_CLASSIC` reverts to
+  candle's baked `kernel_mul_mv_id_*`/QMatMul. Perf-identical to candle
+  (bandwidth-bound); kept to insulate decode from upstream candle changes.
 
 ## Verification workflow
 
 - Runbook: `docs/parity.md`. Fixtures with real token ids:
   `tests/fixtures/parity-prompts.json` (code-short 58 / text-mixed 82 /
   long-swa 609 — the last exercises SWA-ring wraparound).
+- One-command full cycle (dumps + all tiered gates, hazard-safe serial):
+  `bun scripts/parity-gate.ts` (`--tiers`/`--fixtures`/`--regen-ref`; see
+  docs/parity.md §3).
 - Pass criteria philosophy (learned in WP8): the Track B full-logit gate is the
   real gate, and it is now THREE-TIER by change kind (`LAGUNA_PARITY_TIER`, see
-  docs/parity.md §3b): **strict** (mv_id/decode legacy full-logit) holds cos ≥
-  0.999 + top-1 + top-5 ≥ 4/5; **mm** (tiled mm_id prefill default) holds a
+  docs/parity.md §3b): **strict** (the CLASSIC mv fallback path only —
+  `LAGUNA_NO_MM_ID=1` + `LAGUNA_MV_CLASSIC=1`) holds cos ≥ 0.999 + top-1 +
+  top-5 ≥ 4/5; **mm** (tiled mm_id prefill default) holds a
   fork-equivalence gate (cos ≥ 0.995, top-5 ≥ 4/5, top-1 matches or a reference
   near-tie < 0.5 logit) because its f32 tile accumulation order drifts from the
-  per-row oracle just as the fork's does; **decode** (decode-kernel changes)
-  can't use full-logit cosine at all — every remaining decode lever reorders f32
-  accumulation and strict passes at 0.999057 with zero headroom — so cosine is
+  per-row oracle just as the fork's does; **decode** (the SHIPPED default
+  decode path — vendored mv kernels — and all future decode-kernel changes)
+  can't use full-logit cosine at all — accumulation reorders drop it to ~0.9979
+  while strict's 0.999 has zero headroom — so cosine is
   DIAGNOSTIC-ONLY and the gate is greedy agreement vs the Reference oracle under
   teacher-forced replay (`greedy_parity`: candidate argmax == reference token,
-  mismatches excused only at reference near-ties < 0.5 logit), plus a proposed
-  perplexity-delta bound (not yet implemented). Track A vs
+  mismatches excused only at reference near-ties < 0.5 logit), plus a live
+  perplexity-delta bound over a frozen wikitext-2 corpus (`ppl_parity`:
+  |mean_NLL(fused) − mean_NLL(reference)| ≤ PPL_NLL_DELTA_MAX; docs/parity.md
+  "Perplexity gate"). Track A vs
   llama-eval-callback: judge by divergence CLIFF, not absolute thresholds —
   smooth drift to ~0.2 sampled rel-L2 by layer 47 is normal cross-kernel Q4
   noise. Greedy: divergences acceptable only at near-ties, gap < 0.15 logit

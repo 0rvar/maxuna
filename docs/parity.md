@@ -145,6 +145,34 @@ straight from the fork rather than dump-vs-dump.
 Prerequisites: the fork is built at `reference/llama.cpp-laguna-branch/build/bin`
 and the model is at `models/laguna-s-2.1-Q4_K_M.gguf`.
 
+**The one-command path: `scripts/parity-gate.ts`.** For the full Track-B cycle —
+produce the Reference dumps, produce the Fused candidate dumps, and run every
+tiered gate — run:
+
+```bash
+bun scripts/parity-gate.ts        # all tiers; ~25-30 min of model time on a cold set
+bun scripts/parity-gate.ts --tiers strict,mm            # just the full-logit gate
+bun scripts/parity-gate.ts --tiers decode --fixtures long-swa   # one decode fixture
+bun scripts/parity-gate.ts --regen-ref                  # rebuild the Reference dumps too
+```
+
+Flags: `--tiers strict,mm,decode,ppl` (default all), `--fixtures
+code-short,text-mixed,long-swa` (default all; strict/mm always grade code-short,
+decode grades all three, ppl has no fixture axis), `--regen-ref` (force-rebuild
+the Reference oracle dumps — otherwise a dump carrying `provenance.moe_impl ==
+"reference"` is reused), `--regen-ppl-ref` (regenerate the *committed*
+`tests/fixtures/reference-ppl.json` — review and stage it yourself),
+`--parity-dir DIR` (default `$LAGUNA_PARITY_DIR` or `/tmp/laguna-parity`).
+
+The script enforces the model-run hazards for you: it `pgrep`s for a running
+`laguna|llama` process before every model invocation, runs strictly serial (one
+75GB process at a time), streams all model output to log files under the parity
+dir, and never pipes through a pager. Candidate dumps are always regenerated (the
+thing under test); Reference dumps are reused when valid. It prints a per-tier
+PASS/FAIL summary with the key metric and exits nonzero on any failure. The
+manual per-step commands below are what the script automates — they remain the
+reference and the fallback.
+
 **1. Produce the reference side** (per prompt). `ref-dump.sh` runs
 eval-callback, extracts the authoritative token ids, cross-checks against
 `llama-tokenize`, and optionally greedy-decodes for a top-1 oracle:
@@ -187,7 +215,8 @@ final-logits sum + sampled cosine. Divergence threshold defaults to rel error
 candidate was produced (`LAGUNA_PARITY_TIER`, default `strict`):
 
 ```bash
-# strict tier — candidate is the mv_id/decode path (dump with LAGUNA_NO_MM_ID=1):
+# strict tier — candidate is the CLASSIC mv fallback path (dump with
+# LAGUNA_NO_MM_ID=1 AND LAGUNA_MV_CLASSIC=1):
 LAGUNA_PARITY_DIR=/tmp/ref-code LAGUNA_PARITY_TIER=strict \
   cargo test --test parity -- --ignored --nocapture
 # mm tier — candidate is the default mm_id prefill path:
@@ -199,10 +228,19 @@ The gate is **two-tier**, because the fused path uses two different expert
 kernels and they have different (both correct) numerical envelopes vs the f32
 `Reference` oracle:
 
-- **mv_id path — decode, and prefill under `LAGUNA_NO_MM_ID=1`** — strict gate:
-  cosine `>= 0.999`, top-1 match, top-5 overlap `>= 4/5`. mv_id's per-(token,slot)
-  matvec accumulates each output as one f32 dot product — the same structure as
-  the oracle's per-row matmul — so it tracks the oracle tightly.
+- **classic mv fallback — prefill under `LAGUNA_NO_MM_ID=1` AND
+  `LAGUNA_MV_CLASSIC=1`** — strict gate: cosine `>= 0.999`, top-1 match, top-5
+  overlap `>= 4/5`. This gates the legacy/kill-switch mat-vec path — candle's
+  classic mv kernels, whose per-(token,slot) matvec accumulates each output as
+  one f32 dot product in the same order as the oracle's per-row matmul, so it
+  tracks the oracle tightly (0.999057 on code-short, essentially zero headroom).
+  **The shipped DEFAULT decode path is the *vendored* ggml-geometry mv kernel**
+  (`LAGUNA_NO_MM_ID=1` alone, without `LAGUNA_MV_CLASSIC`), which reorders that
+  f32 accumulation and lands at ~0.997887 vs the oracle — below the 0.999 gate
+  by ~0.0012, the same class of correct-but-reordered change as a decode-kernel
+  edit. The vendored default is therefore gated by the decode greedy tier +
+  the perplexity tier, with its full-logit cosine reported as a diagnostic only
+  (`LAGUNA_PARITY_TIER=decode`); strict validates only the classic fallback.
 - **mm_id path — prefill at seq >= 32 (the shipped default, f32 `_hp` tiles)** —
   fork-equivalence gate: raw cosine `>= 0.995`, top-5 overlap `>= 4/5`, and top-1
   matches `Reference` **OR the candidate's top-1 is the `Reference`'s top-1 or
@@ -223,8 +261,8 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   the strict tier passes at cosine 0.999057 with essentially zero headroom, so no
   such change can ever clear a 0.999 cosine even when it is correct. The gate for
   decode-kernel work is instead **greedy agreement vs the frozen Reference oracle
-  under teacher-forced replay** (`greedy_parity`, below), plus a *proposed*
-  perplexity-delta bound (see "Perplexity gate", not yet implemented). Under the
+  under teacher-forced replay** (`greedy_parity`, below), plus a
+  perplexity-delta bound (see "Perplexity gate"). Under the
   decode tier `logit_parity` still hard-fails on input-token / logit-length
   mismatch (a diagnostic on mismatched inputs is meaningless) but only *prints*
   cosine / top-1 / top-5.
@@ -242,7 +280,7 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   `1.0178` (a 1.78% drift; `ew_strict` 0.9907 on the low side), so ~10× headroom
   over the 1.78% drift gives 1.18 (floor 1.05). This is a coarse guard against a
   gross scale/NaN bug, not a precision gate — cosine/top-1 handle precision. The
-  proposed perplexity gate would be the other scale-sensitive layer for decode.
+  perplexity gate is the other scale-sensitive layer for decode.
 
   **Dump provenance + the mm tier.** The tier is caller-selected (`LAGUNA_PARITY_TIER`)
   with no cross-check against how the dump was produced, so a decode/mv_id candidate
@@ -287,7 +325,8 @@ exact expert config so the near-identical numbers are distinguishable:
 
 | candidate config | raw cos vs Reference | top-1 |
 |---|---|---|
-| mv_id fused, glue-off (decode/strict default) | 0.99906 | 350 = ref |
+| classic mv fallback (`LAGUNA_NO_MM_ID=1 LAGUNA_MV_CLASSIC=1`) — the **strict** gate | 0.999057 | 350 = ref (top5 5/5; still holds post-`run_stack` refactor) |
+| vendored mv (`LAGUNA_NO_MM_ID=1`, shipped decode default) — diagnostic only | 0.997887 | 350 = ref (top5 4/5) |
 | mm_id `_hp` f32 tiles, glue-off (shipped prefill default) | 0.99687 | 268 |
 | mm_id `_hp` f32 tiles, with the (removed) L2 rescale glue | 0.99694 | 350 |
 | mm_id f16 tiles (`LAGUNA_MM_ID_F16=1`), glue-off | 0.99672 | 268 |
@@ -364,8 +403,11 @@ dumps.)
   identical Q4_K_M weights, not a bug. parity.ts's `--threshold` (default `1e-2`)
   flags candidates; judge them against the drift profile.
 - Track B: two-tier by expert kernel (see §3b for the rationale and calibration).
-  mv_id (decode / `LAGUNA_NO_MM_ID`): cosine `>= 0.999`, top-1 agreement, top-5
-  `>= 4/5`. mm_id (default prefill, f32 tiles): cosine `>= 0.995`, top-5 `>= 4/5`,
+  classic mv fallback (`LAGUNA_NO_MM_ID=1 LAGUNA_MV_CLASSIC=1`): cosine `>= 0.999`,
+  top-1 agreement, top-5 `>= 4/5` — this is the **strict** tier, and it gates the
+  legacy kill-switch path, NOT the shipped default (the shipped vendored mv path
+  reorders f32 accumulation to ~0.997887 and is gated by the decode + ppl tiers,
+  cosine diagnostic-only). mm_id (default prefill, f32 tiles): cosine `>= 0.995`, top-5 `>= 4/5`,
   top-1 matches Reference OR (candidate top-1 is the Reference's top-1/top-2 AND
   the Reference's top-1/top-2 margin is `< 0.5` logit — near-tie). Both tiers
   require identical input ids. The `logit_parity` test selects the tier via
@@ -378,8 +420,8 @@ dumps.)
   non-excused mismatch fails. The full-logit cosine is reported (via
   `LAGUNA_PARITY_TIER=decode logit_parity`) but NOT gated — the strict 0.999
   cosine passes with zero headroom and can't accept accumulation-reordering
-  decode changes. A perplexity-delta bound is proposed to complement this (see
-  below), not yet implemented.
+  decode changes. A perplexity-delta bound complements this (see "Perplexity
+  gate" below).
 - Greedy vs the FORK (Track A style, distinct from the Reference-oracle decode
   gate above): sequences must agree except at near-ties. A divergence is
   acceptable when the logit gap between the two candidate tokens at the
@@ -402,32 +444,99 @@ curl -s localhost:8080/completion -d '{
 }'
 ```
 
-## Perplexity gate (PROPOSED — not yet implemented, awaiting approval)
+## Perplexity gate
 
-Greedy agreement (§3c) catches token flips but is blind to how the decode kernel
+Greedy agreement (§3c) catches token flips but is blind to how the fused path
 reshapes the *distribution* — a change that keeps every argmax but systematically
-sharpens or flattens the tails would pass. A perplexity-delta bound over a small
-held-out corpus complements it. This is a PROPOSAL for Orvar to approve; nothing
-below is built.
+sharpens or flattens the tails would pass. The perplexity-delta bound over a
+frozen held-out corpus is that scale-sensitive complement: it compares the mean
+next-token NLL of the Fused runner against the Reference oracle on the identical
+corpus and fails if they drift more than the frozen bound.
 
-- **Corpus**: an ~8k-token held-out mixed prose/code text checked into
-  `tests/fixtures`. Candidate source: the head of the wikitext-2-raw *test* split
-  (the standard LM-perplexity corpus; check in with attribution/license note).
-  Alternatives welcome — the only requirements are held-out (not the parity
-  prompts), mixed register (prose + code, to exercise both token regimes), and
-  ~8k tokens (enough positions to average the per-token NLL, small enough for one
-  forward under the 4096 max-ctx in a couple of chunks).
-- **Method**: `logits-dump` gains a mode that computes, per position, the
-  next-token log-probability (`log_softmax` over the full logits, gather the
-  actual next token) and emits only those scalars — the dumps stay tiny (no
-  all-position full-logit capture; note the current dumps are last-position-only,
-  see Limitations). Mean NLL = `-mean(logprob)` over all scored positions.
-- **Gate**: `|mean_NLL(fused) − mean_NLL(reference)| <= bound`, with `bound` set
-  calibrate-then-freeze: measure the current fused-vs-reference delta on the
-  frozen corpus, freeze `bound` at ~3x that delta with an absolute floor of
-  `0.002` nats (so a near-zero measured delta doesn't set an impossibly tight
-  bound). Both sides run the identical corpus; the reference side uses the
-  Reference runner.
+**Corpus** (`tests/fixtures/ppl-corpus.txt`, attribution in
+`tests/fixtures/ppl-corpus-README.md`): the head of the WikiText-2 raw *test*
+split (`Salesforce/wikitext`, config `wikitext-2-raw-v1`, split `test`), the
+standard LM-perplexity corpus — held out (not the parity prompts), mixed-register
+prose, truncated at a paragraph boundary. 4386 tokens after the crate tokenizer
+(`add_special_tokens=false`, one leading BOS prepended by hand), 4385 scored.
+Sized so the one-time Reference pass stays under the ~30 min budget (see the
+calibration record).
+
+**Protocol** (both runners run it identically, so protocol quirks cancel in the
+delta): a single continuous chunked-prefill pass over the whole corpus —
+512-token chunks (`PREFILL_CHUNK`-sized), positions continuous, the KV cache
+fresh at the start (just-loaded model) and never reset between chunks. At every
+position `p` the all-position lm-head path (`LagunaModel::forward_all_logits`)
+yields logits that predict `tokens[p+1]`; we gather
+`log_softmax(logits[p])[tokens[p+1]]` in f64 (stable logsumexp). Every position
+`0..T-1` is scored — each target is a real corpus token; the BOS (`tokens[0]`) is
+never itself a target, and the final position has no successor.
+`mean_NLL = -mean(logprob)` over all scored positions. `forward_all_logits` runs
+the identical transformer stack as the generate path but keeps the lm head over
+every position instead of narrowing to the last, so the default generate/decode
+path (which still narrows) and every other parity gate are unaffected. The fused
+side runs the mm_id prefill kernel (chunks of 512 >= `MM_ID_MIN_SEQ`), so the
+delta bounds that kernel's distribution fidelity, not just its argmax.
+
+**Gate** (`ppl_parity` in `tests/parity.rs`, `#[ignore]`): loads
+`reference-ppl.json` + `candidate-ppl.json` from `LAGUNA_PARITY_DIR`, enforces
+runner provenance (reference `moe_impl=="reference"`, candidate `=="fused"` —
+same fail-closed rule as the greedy gate; a forgotten `--moe-impl fused` would
+otherwise self-compare the oracle), zero non-finite logprobs on both sides,
+identical scored token streams (count + FNV `token_hash` + full ids), then
+asserts `|mean_NLL(fused) − mean_NLL(reference)| <= PPL_NLL_DELTA_MAX`. The bound
+is calibrate-then-freeze: `max(3 × |measured delta|, 0.002)` nats, the 0.002
+floor keeping a near-zero measured delta from setting an impossibly tight bound.
+The rejection paths (wrong kind, wrong/missing provenance, non-finite, token
+mismatch, over-bound delta) have non-ignored unit tests alongside the greedy
+ones.
+
+Commands (STRICTLY SERIAL — one 75GB model process at a time, `pgrep -fl
+"laguna|llama"` first; the corpus + BOS exceeds the default 4096 ctx, so pass
+`--max-ctx`):
+
+```bash
+DIR=/tmp/ppl
+mkdir -p "$DIR"
+# reference side — keepable: the frozen oracle NLL lives at
+# tests/fixtures/reference-ppl.json; only regenerate on a corpus change:
+cargo run --release --bin logits-dump -- \
+  --model models/laguna-s-2.1-Q4_K_M.gguf \
+  --moe-impl reference --max-ctx 5120 \
+  --ppl tests/fixtures/ppl-corpus.txt --output "$DIR/reference-ppl.json"
+# candidate side (fused):
+cargo run --release --bin logits-dump -- \
+  --model models/laguna-s-2.1-Q4_K_M.gguf \
+  --moe-impl fused --max-ctx 5120 \
+  --ppl tests/fixtures/ppl-corpus.txt --output "$DIR/candidate-ppl.json"
+# gate — the frozen fixture can stand in for the reference side:
+cp tests/fixtures/reference-ppl.json "$DIR/reference-ppl.json"
+LAGUNA_PARITY_DIR="$DIR" cargo test --test parity ppl_parity -- --ignored --nocapture
+```
+
+The reference dump is a keepable artifact (frozen oracle → frozen NLL): the
+blessed copy is `tests/fixtures/reference-ppl.json` (21 KB — mean NLL, per-chunk
+means, and the full token stream for alignment re-verification), so a routine
+fused check only regenerates the fused side and points the gate at a dir holding
+the fixture (as `reference-ppl.json`) beside the fresh `candidate-ppl.json`.
+Resizing or regenerating the corpus invalidates both the fixture and the frozen
+bound — recalibrate.
+
+**Calibration record (2026-07-22).** Corpus 4386 tokens (4385 scored). The
+Reference all-position-prefill rate was measured first on a 642-token slice:
+~3.1 tok/s (~205 s wall including the ~30 s weight upload), which projected the
+full pass to well under the 30 min budget; the full Reference pass then took
+~15 min, the Fused pass ~46 s. Measured mean NLLs on the full corpus (both
+`nonfinite == 0`):
+
+| runner | mean NLL (nats) |
+|---|---|
+| Reference (oracle) | 2.020392 |
+| Fused (mm_id prefill) | 2.018455 |
+
+Delta `|fused − reference|` = **0.001937** nats. `max(3 × 0.001937, 0.002)` =
+0.005811, frozen (rounded up to a clean value that keeps the >=3× margin) at
+**`PPL_NLL_DELTA_MAX = 0.006`**.
 
 ## Limitations
 

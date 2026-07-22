@@ -13,12 +13,30 @@ use anyhow::{Context, Result};
 use candle_metal_kernels::metal::{ComputePipeline, Device, Library};
 
 /// Vendored kernel source, compiled at runtime (candle's metallib carries no
-/// Rust wiring for these and cannot be extended at build time).
+/// Rust wiring for these and cannot be extended at build time). This is the
+/// DEFAULT prefill library; it instantiates every mm_id variant EXCEPT the
+/// float-operand cooperative-tensor `_t_hp` one (split into `mm_id_t_hp.metal`),
+/// so a toolchain that rejects float `matmul2d` operands cannot break it.
 const MM_ID_SOURCE: &str = include_str!("mm_id.metal");
+/// The `_t_hp` (float-operand cooperative tensor) instantiations, split out of
+/// `mm_id.metal` so the default library carries no float-cooperative-tensor
+/// code. Not a standalone translation unit — it references that file's template,
+/// typedef and dequant definitions, so it is compiled by concatenating it onto
+/// `MM_ID_SOURCE` (see `mm_id_t_hp_source`), and only on first TensorHp dispatch.
+const MM_ID_T_HP_INSTANTIATIONS: &str = include_str!("mm_id_t_hp.metal");
 /// Vendored ggml-geometry mat-vec kernels (decode expert gather + lm_head).
 /// Deliberately separate from `mm_id.metal` so it carries no Metal-4 tensor
 /// dependency.
 const MV_SOURCE: &str = include_str!("mv.metal");
+
+/// The concatenated source for the TensorHp library: the shared mm_id template
+/// portion plus the split-out `_t_hp` instantiations. Built once on first use,
+/// so the (potentially unsupported) float-cooperative-tensor code is only ever
+/// handed to the Metal compiler when TensorHp is actually selected.
+fn mm_id_t_hp_source() -> &'static str {
+    static SRC: OnceLock<String> = OnceLock::new();
+    SRC.get_or_init(|| format!("{MM_ID_SOURCE}\n{MM_ID_T_HP_INSTANTIATIONS}"))
+}
 
 struct Cache {
     /// One compiled library per (device registry id, source key).
@@ -77,8 +95,18 @@ fn compiled_pipeline(
 }
 
 /// Pipeline for a `mm_id.metal` kernel (two-pass indexed matmul).
+///
+/// The float-operand cooperative-tensor `_t_hp` kernels live in a separate
+/// library, compiled lazily by concatenating `mm_id_t_hp.metal` onto the shared
+/// source. Routing on the kernel name keeps the default library free of
+/// float-cooperative-tensor code: a `_t_hp` compile failure surfaces only here,
+/// on the TensorHp path, and never touches the default prefill library.
 pub(crate) fn mm_id_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
-    compiled_pipeline(device, MM_ID_SOURCE, "mm_id", name)
+    if name.ends_with("_t_hp") {
+        compiled_pipeline(device, mm_id_t_hp_source(), "mm_id_t_hp", name)
+    } else {
+        compiled_pipeline(device, MM_ID_SOURCE, "mm_id", name)
+    }
 }
 
 /// Pipeline for a `mv.metal` kernel (vendored ggml-geometry mat-vec).

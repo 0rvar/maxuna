@@ -261,10 +261,44 @@ mod tests {
         use crate::ops::MmVariant;
         use crate::ops::dispatch::{map0_kernel_name, mm_kernel_instantiated, mm_kernel_name};
 
-        const METAL_SRC: &str = include_str!("mm_id.metal");
+        // The `_t_hp` (TensorHp) float-cooperative-tensor instantiations live in a
+        // SEPARATE source (mm_id_t_hp.metal), concatenated onto mm_id.metal only for
+        // the lazily-compiled TensorHp library. Every other variant lives in
+        // mm_id.metal. Check each variant against the source that actually hosts it.
+        const MM_ID_SRC: &str = include_str!("mm_id.metal");
+        const T_HP_SRC: &str = include_str!("mm_id_t_hp.metal");
         // Strip comments FIRST: a commented-out instantiation must not count as
         // present, or the matrix could claim a kernel the compiler never emits.
-        let src = strip_metal_comments(METAL_SRC);
+        let src = strip_metal_comments(MM_ID_SRC);
+        let t_hp_src = strip_metal_comments(T_HP_SRC);
+
+        // Partition proof: the default library (mm_id.metal) must contain NO
+        // float-operand cooperative-tensor (`_t_hp`) instantiation, so a toolchain
+        // rejecting float `matmul2d` operands cannot break the default prefill path.
+        assert!(
+            !src.contains("_t_hp"),
+            "mm_id.metal must not host any `_t_hp` instantiation — it belongs in \
+             mm_id_t_hp.metal so the default library stays free of float-cooperative-tensor code"
+        );
+        // And the split-out source must host ONLY `_t_hp` kernels (no default ones).
+        for line in t_hp_src.lines() {
+            if let Some(rest) = line.split_once("host_name(\"").map(|(_, r)| r) {
+                let host = &rest[..rest.find('"').unwrap_or(rest.len())];
+                assert!(
+                    host.ends_with("_t_hp"),
+                    "mm_id_t_hp.metal hosts non-`_t_hp` kernel {host:?}; only the split-out \
+                     float-cooperative-tensor instantiations belong there"
+                );
+            }
+        }
+
+        // Per-variant: the source hosting a variant's instantiations.
+        let host_src = |variant: MmVariant| -> &str {
+            match variant {
+                MmVariant::TensorHp => &t_hp_src,
+                MmVariant::Tensor | MmVariant::ClassicHp | MmVariant::ClassicF16 => &src,
+            }
+        };
 
         const VARIANTS: &[MmVariant] = &[
             MmVariant::Tensor,
@@ -288,7 +322,7 @@ mod tests {
                 let claimed = mm_kernel_instantiated(dt, variant);
                 // The exact host name the encoder would dispatch: base + variant suffix.
                 let name = mm_kernel_name(dt).ok().map(|base| format!("{base}{}", variant.suffix()));
-                let present = name.as_ref().is_some_and(|n| host_name_present(&src, n));
+                let present = name.as_ref().is_some_and(|n| host_name_present(host_src(variant), n));
                 assert_eq!(
                     claimed, present,
                     "support matrix disagrees with mm_id.metal for {dt:?}/{variant:?}: \

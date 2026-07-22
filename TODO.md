@@ -1,5 +1,24 @@
 # Deferred work ledger
 
+## Priority order (decided 2026-07-22, next session starts at P1)
+
+1. **Attention per-layer dispatch-chain fusion** (decode; claimed ~48.6 ms of
+   76.9 ms/token). PHASE 0 IS MANDATORY: re-measure the decode budget with
+   isolation benches / GPU capture before writing any kernel — the mv-geometry
+   lever died because this same ablation attributed 6.5 ms to lm_head vs 0.7 ms
+   measured directly. Note the gate reframing: for DECODE-path kernels the
+   acceptance criteria are the decode greedy + ppl tiers (bit-identity to candle
+   is no longer required — that was a strict-gate-era rule); PREFILL-path
+   attention fusion must still clear the mm cosine tier, so the router-cascade
+   caution stands there.
+2. **MoE route+glue+combine fusion** (prefill; the ~188 vs 361 pp512 gap is
+   surrounding dispatch overhead). Now fusable INTO the owned mv.metal/mm_id
+   kernels — the strategic payoff of vendoring.
+3. **mmap + no-copy model load** (see ledger item below) — dev-velocity
+   multiplier: every parity/bench cycle pays ~30 s/load today.
+4. **DFlash speculative decoding** — multiplies whatever decode speed exists,
+   so it lands after P1.
+
 - [x] **Prefill mm_id kernel (biggest perf item)** — DONE. Vendored ggml's
   two-pass token→expert row-map kernels (`src/ops/mm_id.metal`, runtime-compiled
   via `src/ops/pipelines.rs`); `FusedExperts::forward` uses mm_id for seq>=32,
@@ -76,10 +95,13 @@
     BIT-IDENTICAL to candle; post-router ops (down output, lm_head) are safe to
     fuse (no cascade). The glue-removal win needed no kernel — it just dropped the
     now-unnecessary rescale and kept candle's silu*mul.
-  - [ ] **Top decode lever: fuse the attention per-layer dispatch chain.** The
-    ~48.6 ms of non-sdpa attention overhead (~24 dispatches x 48 layers) is the
-    prize. Fuse QK-norm+transpose+rope+f16-cast into one kernel and drop the 3
+  - [ ] **Top decode lever (P1): fuse the attention per-layer dispatch chain.**
+    The ~48.6 ms of non-sdpa attention overhead (~24 dispatches x 48 layers) is
+    the prize — but RE-MEASURE that number first (phase 0 in the priority list
+    above; this budget's lm_head line was off by ~10x). Fuse
+    QK-norm+transpose+rope+f16-cast into one kernel and drop the 3
     transpose-contiguous copies; possibly fuse the softplus-gate+o_proj tail.
+    Decode-path acceptance = decode greedy + ppl gates (not bit-identity).
     sdpa (2.3 ms) is fine — leave it. lm_head (6.5 ms) is a single vocab matmul,
     minor. mv_id routed gather (18.4 ms) — vendor ggml's mv_id N_R0/N_SG geometry
     — is the concrete FFN-side secondary.
@@ -106,10 +128,9 @@
     decode pipeline, not mv compute — geometry can't recover them. The vendored
     kernels are strictly not slower and are more fork-faithful (ggml's current
     geometry), so kept as default, but the real decode prize remains the
-    attention per-layer dispatch chain (48.6 ms). DECISION FOR ORVAR: keep
-    vendored as default (marginally faster, drops the candle-baked-kernel
-    dependency for these two paths) or revert to classic default (fewer moving
-    parts, cosine 0.99906) — both correct.
+    attention per-layer dispatch chain (48.6 ms). DECIDED (Orvar, 2026-07-22):
+    vendored stays the default — insulates these two paths from upstream candle
+    kernel changes; `LAGUNA_MV_CLASSIC` remains the escape hatch.
 - [ ] **Track B dumps for text-mixed / long-swa** — the full-logit reference-vs-
   fused gate ran only on code-short (greedy covers the other two fixtures);
   generate the remaining dumps if fused ever changes.
@@ -126,6 +147,19 @@
   only; AttnBlock/MoeBlock expose no sub-node intermediates (Qcur_rope,
   attn_gated, ffn_moe_out, …), limiting first-divergence bisection to layer
   granularity. Add hooks if a real divergence ever needs sub-layer localization.
+- [ ] **mmap + no-copy model load** — warm load is ~30s because gguf.rs reads
+  each tensor into a heap Vec and `QStorage::from_data` copies it again into a
+  fresh MTLBuffer (~2 full passes over 75GB), plus the expert_stack re-layout
+  pass. The fork loads near-instantly warm via mmap + `newBufferWithBytesNoCopy`
+  (unified memory: GPU reads the page-cache pages in place; one page-aligned
+  buffer over the whole file, per-tensor offsets). For us that needs (a) a
+  one-time repack cache file with experts ALREADY stacked in our layout (no-copy
+  can't reorder, and the stacks are most of the 75GB), mmapped on subsequent
+  loads, and (b) a check whether the pinned candle rev can wrap an existing
+  Metal buffer as QStorage/Tensor for the QMatMul + F16 attention paths (our
+  vendored kernels take raw buffers already). Expected: warm load → a few
+  seconds; first-touch page wiring moves into the first forward (already
+  excluded from steady-state numbers).
 
 Items deliberately out of v1 scope. Append as new deferrals come up during
 implementation — never silently drop scope.

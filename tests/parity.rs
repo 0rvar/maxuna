@@ -44,6 +44,18 @@ const TOP5_OVERLAP_MIN: usize = 4;
 /// layers.
 const NORM_RATIO_MAX: f64 = 1.18;
 
+/// Max allowed |mean_NLL(fused) − mean_NLL(reference)| over the frozen ppl corpus
+/// (docs/parity.md "Perplexity gate"). The greedy decode gate (`greedy_parity`)
+/// catches argmax flips but is blind to a change that reshapes the distribution's
+/// tails while keeping every argmax; the perplexity delta is that scale-sensitive
+/// complement. Calibrate-then-freeze: `max(3 × measured |delta|, 0.002)` nats, the
+/// 0.002 floor keeping a near-zero measured delta from setting an impossibly tight
+/// bound. Frozen from the 2026-07-22 calibration (see docs/parity.md): the fused
+/// (mm_id prefill) vs Reference-oracle delta on the 4386-token wikitext-2 corpus
+/// was 0.001937 nats (reference 2.020392, fused 2.018455), so `max(3 × 0.001937,
+/// 0.002)` = 0.005811, rounded up to a clean 0.006 (keeps the >=3x margin).
+const PPL_NLL_DELTA_MAX: f64 = 0.006;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Tier {
     Strict,
@@ -805,6 +817,150 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
     }
 }
 
+// --- Perplexity-delta gate ----------------------------------------------------
+
+/// A `kind:"ppl"` dump from `logits-dump --ppl`: the mean next-token NLL over the
+/// frozen corpus plus enough to re-verify the two runners scored the identical
+/// token stream. The reference side (`--moe-impl reference`) is a keepable frozen
+/// artifact under `tests/fixtures/reference-ppl.json`.
+struct PplDump {
+    kind: String,
+    /// Full scored token stream (leading BOS + corpus). Empty only if a stored
+    /// reference dump ever trims it — the `token_hash` still gates alignment.
+    tokens: Vec<u32>,
+    n_tokens: usize,
+    token_hash: String,
+    mean_nll: f64,
+    nonfinite: u64,
+    provenance: Option<Provenance>,
+}
+
+fn load_ppl_dump(path: &Path) -> Result<PplDump> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let v: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(PplDump {
+        kind: v["kind"].as_str().context("ppl dump missing `kind`")?.to_string(),
+        tokens: u32_array(&v, "tokens")?,
+        n_tokens: v["n_tokens"].as_u64().context("ppl dump missing `n_tokens`")? as usize,
+        token_hash: v["token_hash"].as_str().context("ppl dump missing `token_hash`")?.to_string(),
+        mean_nll: v["mean_nll"].as_f64().context("ppl dump missing `mean_nll`")?,
+        nonfinite: v["nonfinite"].as_u64().context("ppl dump missing `nonfinite`")?,
+        provenance: parse_provenance(&v)?,
+    })
+}
+
+/// Perplexity-parity gate comparison, split from disk I/O so every rejection path
+/// is unit-testable (same pattern as `greedy_compare`). Enforces: both sides are
+/// `kind:"ppl"`; the reference ran the Reference oracle and the candidate the
+/// Fused runner (a forgotten `--moe-impl fused` would self-compare the oracle);
+/// neither side hit a non-finite logprob; the two sides scored the identical
+/// token stream (count, ids, and hash); and the mean-NLL delta is within
+/// `PPL_NLL_DELTA_MAX`.
+fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
+    if reference.kind != "ppl" {
+        bail!("reference-ppl.json must be kind `ppl`, got `{}`", reference.kind);
+    }
+    if candidate.kind != "ppl" {
+        bail!("candidate-ppl.json must be kind `ppl`, got `{}`", candidate.kind);
+    }
+
+    match &reference.provenance {
+        Some(p) if p.moe_impl == "reference" => {}
+        Some(p) => bail!(
+            "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
+             with the current `logits-dump` (--moe-impl reference --ppl ...)",
+            p.moe_impl
+        ),
+        None => bail!(
+            "reference-ppl.json has no provenance (predates the field); regenerate it with the \
+             current `logits-dump` (--moe-impl reference --ppl ...)"
+        ),
+    }
+    match &candidate.provenance {
+        Some(p) if p.moe_impl == "fused" => {}
+        Some(p) => bail!(
+            "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
+             be the Fused runner. Regenerate it with the current `logits-dump` (--moe-impl fused --ppl ...)",
+            p.moe_impl
+        ),
+        None => bail!(
+            "candidate-ppl.json has no provenance (predates the field); regenerate it with the \
+             current `logits-dump` (--moe-impl fused --ppl ...)"
+        ),
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+
+    if !reference.mean_nll.is_finite() {
+        failures.push(format!("reference mean_nll is non-finite ({})", reference.mean_nll));
+    }
+    if !candidate.mean_nll.is_finite() {
+        failures.push(format!("candidate mean_nll is non-finite ({})", candidate.mean_nll));
+    }
+    if reference.nonfinite > 0 {
+        failures.push(format!("reference scored {} non-finite logprobs", reference.nonfinite));
+    }
+    if candidate.nonfinite > 0 {
+        failures.push(format!("candidate scored {} non-finite logprobs", candidate.nonfinite));
+    }
+
+    // Both sides must have scored the identical token stream, or the delta is
+    // comparing perplexities of different corpora. Count + hash always; the full
+    // id vector when both dumps carry it (a trimmed reference falls back to hash).
+    if reference.n_tokens != candidate.n_tokens {
+        failures.push(format!(
+            "token counts differ: reference {} vs candidate {}",
+            reference.n_tokens, candidate.n_tokens
+        ));
+    }
+    if reference.token_hash != candidate.token_hash {
+        failures.push(format!(
+            "token_hash differs: reference {} vs candidate {} (different token streams)",
+            reference.token_hash, candidate.token_hash
+        ));
+    }
+    if !reference.tokens.is_empty() && !candidate.tokens.is_empty() && reference.tokens != candidate.tokens {
+        failures.push("token id streams differ (see token_hash)".to_string());
+    }
+
+    let delta = (candidate.mean_nll - reference.mean_nll).abs();
+    if delta > PPL_NLL_DELTA_MAX {
+        failures.push(format!(
+            "mean-NLL delta {delta:.6} > {PPL_NLL_DELTA_MAX} \
+             (fused {:.6} vs reference {:.6})",
+            candidate.mean_nll, reference.mean_nll
+        ));
+    }
+
+    if failures.is_empty() {
+        eprintln!(
+            "ppl parity PASS: |Δmean_nll| = {delta:.6} <= {PPL_NLL_DELTA_MAX} \
+             (fused {:.6} vs reference {:.6}, {} tokens)",
+            candidate.mean_nll, reference.mean_nll, reference.n_tokens
+        );
+        Ok(())
+    } else {
+        bail!(
+            "ppl parity FAIL ({} criteria):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        )
+    }
+}
+
+/// Perplexity-delta gate: bound |mean_NLL(fused) − mean_NLL(reference)| over the
+/// frozen corpus (docs/parity.md "Perplexity gate"). Reads `reference-ppl.json`
+/// (keepable, `tests/fixtures/reference-ppl.json`) and `candidate-ppl.json` from
+/// `LAGUNA_PARITY_DIR`.
+#[test]
+#[ignore = "needs real dumps; run with LAGUNA_PARITY_DIR=<dir> cargo test --test parity ppl_parity -- --ignored"]
+fn ppl_parity() -> Result<()> {
+    let dir = parity_dir()?;
+    let reference = load_ppl_dump(&dir.join("reference-ppl.json"))?;
+    let candidate = load_ppl_dump(&dir.join("candidate-ppl.json"))?;
+    ppl_compare(&reference, &candidate)
+}
+
 // --- Rejection-path unit tests (non-ignored: no model, no real dumps) ---------
 //
 // These exercise the soundness guards added to the decode gate and the dump
@@ -984,4 +1140,96 @@ fn compare_requires_reference_provenance() {
     // fused-vs-fused self-comparison would hide a regression).
     let err = compare(&candidate, &tiny_dump(Some(prov("fused"))), Tier::Strict).unwrap_err().to_string();
     assert!(err.contains("expected \"reference\""), "unexpected error: {err}");
+}
+
+// --- Perplexity-gate rejection-path unit tests --------------------------------
+
+/// A ppl dump; `token_hash` is derived from the ids so equal ids ⇒ equal hash,
+/// matching the invariant the binary's real FNV hash preserves.
+fn ppl_dump(kind: &str, moe_impl: &str, mean_nll: f64, tokens: Vec<u32>, nonfinite: u64) -> PplDump {
+    let token_hash = format!("{tokens:?}");
+    PplDump {
+        kind: kind.to_string(),
+        n_tokens: tokens.len(),
+        tokens,
+        token_hash,
+        mean_nll,
+        nonfinite,
+        provenance: Some(prov(moe_impl)),
+    }
+}
+
+/// A reference(ppl)/candidate(ppl) pair that passes the gate cleanly.
+fn valid_ppl_pair() -> (PplDump, PplDump) {
+    let tokens = vec![2u32, 100, 200, 300];
+    let reference = ppl_dump("ppl", "reference", 2.5, tokens.clone(), 0);
+    let candidate = ppl_dump("ppl", "fused", 2.5, tokens, 0);
+    (reference, candidate)
+}
+
+#[test]
+fn ppl_gate_accepts_valid_dumps() {
+    let (r, c) = valid_ppl_pair();
+    ppl_compare(&r, &c).expect("a clean reference/candidate ppl pair should pass");
+}
+
+#[test]
+fn ppl_gate_accepts_delta_within_bound() {
+    let (r, mut c) = valid_ppl_pair();
+    // Half the frozen bound: comfortably inside.
+    c.mean_nll = r.mean_nll + PPL_NLL_DELTA_MAX * 0.5;
+    ppl_compare(&r, &c).expect("a sub-bound delta should pass");
+}
+
+#[test]
+fn ppl_gate_rejects_delta_over_bound() {
+    let (r, mut c) = valid_ppl_pair();
+    // Twice the frozen bound: must fail whatever the frozen value is.
+    c.mean_nll = r.mean_nll + PPL_NLL_DELTA_MAX * 2.0;
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("mean-NLL delta"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_reference_runner_candidate() {
+    // Candidate produced with the default `--moe-impl reference` self-compares.
+    let (r, mut c) = valid_ppl_pair();
+    c.provenance = Some(prov("reference"));
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("expected \"fused\""), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_missing_provenance() {
+    let (r, mut c) = valid_ppl_pair();
+    c.provenance = None;
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no provenance"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_nonfinite() {
+    let (r, mut c) = valid_ppl_pair();
+    c.nonfinite = 1;
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("non-finite"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_token_stream_mismatch() {
+    // Different scored token stream ⇒ comparing perplexities of different corpora.
+    let (r, mut c) = valid_ppl_pair();
+    c.tokens = vec![2u32, 100, 200, 999];
+    c.n_tokens = c.tokens.len();
+    c.token_hash = format!("{:?}", c.tokens);
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("token_hash differs") || err.contains("token id streams differ"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_wrong_kind() {
+    let (mut r, c) = valid_ppl_pair();
+    r.kind = "greedy".to_string();
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("must be kind `ppl`"), "unexpected error: {err}");
 }

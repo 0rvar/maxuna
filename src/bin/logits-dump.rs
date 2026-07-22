@@ -47,6 +47,7 @@ use laguna::LagunaConfig;
 use laguna::gguf;
 use laguna::model::LagunaModel;
 use laguna::ops::ExpertRunner;
+use laguna::tokenizer::LagunaTokenizer;
 
 /// Full `last_row` arrays above this many elements are dropped (summary stats
 /// only). 16384 keeps hidden-sized rows (~3072) but drops vocab-sized rows;
@@ -90,6 +91,19 @@ struct Cli {
     /// dump, so --tokens is not needed (and is ignored if given).
     #[arg(long, value_name = "GREEDY_DUMP")]
     replay: Option<PathBuf>,
+
+    /// Perplexity-parity gate: tokenize the given raw-text corpus (via the
+    /// crate tokenizer, add_special_tokens=false, one leading BOS), score the
+    /// whole corpus in a single continuous chunked-prefill pass, and emit a
+    /// `kind:"ppl"` dump (mean next-token NLL + per-chunk means). Mutually
+    /// exclusive with --greedy/--replay; ignores --taps/--tokens. See
+    /// docs/parity.md "Perplexity gate".
+    #[arg(long, value_name = "CORPUS")]
+    ppl: Option<PathBuf>,
+
+    /// Tokenizer JSON for --ppl (the crate errors on GGUF-embedded vocab).
+    #[arg(long, default_value = "reference/tokenizer.json")]
+    tokenizer: PathBuf,
 
     /// Expert FFN implementation: "reference" (correctness oracle) or "fused".
     #[arg(long, default_value = "reference")]
@@ -228,12 +242,162 @@ fn main() -> Result<()> {
     anyhow::ensure!(vocab >= 2, "vocab {vocab} < 2: cannot form a top-2 for the parity dumps");
     let model = LagunaModel::load(gguf, runner, cli.max_ctx)?;
 
+    if let Some(corpus) = cli.ppl.clone() {
+        anyhow::ensure!(
+            cli.greedy.is_none() && cli.replay.is_none(),
+            "--ppl is mutually exclusive with --greedy/--replay"
+        );
+        return run_ppl(&cli, model, &device, vocab, &corpus);
+    }
+
     match (cli.greedy, &cli.replay) {
         (Some(_), Some(_)) => anyhow::bail!("--greedy and --replay are mutually exclusive"),
         (Some(n), None) => run_greedy(&cli, model, &device, vocab, n),
         (None, Some(path)) => run_replay(&cli, model, &device, vocab, &path.clone()),
         (None, None) => run_single(&cli, model, &device, vocab),
     }
+}
+
+/// Prompt chunk size for the perplexity pass — matches `generate::PREFILL_CHUNK`
+/// so the fused side exercises the same 512-token mm_id prefill kernel the real
+/// generate path uses (and `>= MM_ID_MIN_SEQ`, so the mm_id path is active).
+const PPL_CHUNK: usize = 512;
+
+/// FNV-1a 64-bit over the little-endian token bytes: a stable, dependency-free
+/// digest of the exact scored token stream, so the gate can re-verify alignment
+/// even against a stored reference dump whose full `tokens` array was trimmed.
+fn token_hash(tokens: &[u32]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &t in tokens {
+        for b in t.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// `--ppl <corpus>`: single continuous chunked-prefill pass over the corpus,
+/// gathering the next-token log-probability at every position. Perplexity is
+/// blind to argmax flips (the greedy gate's job) but sensitive to how the fused
+/// path reshapes the whole distribution's tails, so it is the scale-sensitive
+/// complement to the decode greedy gate. Both the Reference and Fused runners
+/// use this identical protocol, so protocol quirks cancel in the fused−reference
+/// delta the gate bounds.
+///
+/// Scoring convention: `logits[p]` predicts `tokens[p+1]`; we score every
+/// position `p` in `0..T-1` (each target is a real corpus token). The BOS token
+/// (`tokens[0]`) is never itself a target — there is no position predicting it —
+/// so it drops out naturally. The final position has no successor and is skipped.
+fn run_ppl(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, corpus: &std::path::Path) -> Result<()> {
+    let tokenizer = LagunaTokenizer::from_file(&cli.tokenizer)
+        .with_context(|| format!("loading tokenizer {}", cli.tokenizer.display()))?;
+    let text = std::fs::read_to_string(corpus)
+        .with_context(|| format!("reading corpus {}", corpus.display()))?;
+
+    // add_special_tokens=false (the crate default), one leading BOS prepended by
+    // hand — the standard LM-perplexity setup, and identical on both runners.
+    let mut tokens = vec![LagunaTokenizer::BOS];
+    tokens.extend(tokenizer.encode(&text)?);
+    let n_tokens = tokens.len();
+    anyhow::ensure!(n_tokens >= 2, "corpus tokenized to {n_tokens} tokens: need at least 2 to score one prediction");
+    anyhow::ensure!(
+        n_tokens <= model.max_ctx(),
+        "corpus is {n_tokens} tokens but max_ctx is {} — raise --max-ctx to cover the whole corpus \
+         (the pass is one continuous context, never truncated)",
+        model.max_ctx()
+    );
+
+    // Continuous pass: feed 512-token chunks with a monotonically advancing
+    // absolute position and never reset the KV cache (the model was just loaded,
+    // so it starts empty). Positions are one unbroken context across chunks.
+    let mut logprobs: Vec<f64> = Vec::with_capacity(n_tokens.saturating_sub(1));
+    let mut per_chunk_means: Vec<f64> = Vec::new();
+    let mut nonfinite: u64 = 0;
+    let mut pos = 0usize;
+    for chunk in tokens.chunks(PPL_CHUNK) {
+        let input = Tensor::new(chunk, device)?;
+        let chunk_logits = model.forward_all_logits(&input, pos)?; // [chunk, vocab]
+        let host = chunk_logits.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+
+        let mut chunk_sum = 0.0f64;
+        let mut chunk_scored = 0usize;
+        for i in 0..chunk.len() {
+            let p = pos + i; // absolute position whose logits predict tokens[p+1]
+            if p + 1 >= n_tokens {
+                break; // final corpus position: no successor to score
+            }
+            let target = tokens[p + 1] as usize;
+            let row = &host[i * vocab..(i + 1) * vocab];
+            let lp = target_logprob(row, target);
+            if lp.is_finite() {
+                logprobs.push(lp);
+                chunk_sum += lp;
+                chunk_scored += 1;
+            } else {
+                nonfinite += 1;
+            }
+        }
+        if chunk_scored > 0 {
+            per_chunk_means.push(-chunk_sum / chunk_scored as f64);
+        }
+        pos += chunk.len();
+    }
+
+    let n_scored = logprobs.len();
+    anyhow::ensure!(n_scored > 0, "no positions scored (corpus too short?)");
+    let mean_nll = -logprobs.iter().sum::<f64>() / n_scored as f64;
+
+    let seq_len = n_tokens.min(PPL_CHUNK); // the prefill chunk length the runner actually saw
+    let dump = json!({
+        "kind": "ppl",
+        "model": cli.model.display().to_string(),
+        "corpus": corpus.display().to_string(),
+        "moe_impl": cli.moe_impl,
+        "provenance": provenance(&cli.moe_impl, seq_len),
+        "tokens": tokens,
+        "n_tokens": n_tokens,
+        "token_hash": token_hash(&tokens),
+        "n_scored": n_scored,
+        "vocab": vocab,
+        "nonfinite": nonfinite,
+        "mean_nll": mean_nll,
+        "per_chunk_means": per_chunk_means,
+    });
+    std::fs::write(&cli.output, serde_json::to_string(&dump)?)
+        .with_context(|| format!("writing {}", cli.output.display()))?;
+    eprintln!(
+        "wrote {} (ppl, runner {}, {} tokens, {} scored, mean_nll {:.6}, {} nonfinite)",
+        cli.output.display(),
+        cli.moe_impl,
+        n_tokens,
+        n_scored,
+        mean_nll,
+        nonfinite,
+    );
+    Ok(())
+}
+
+/// Next-token log-probability `log_softmax(row)[target]` in f64. A numerically
+/// stable logsumexp (subtract the row max). Returns a non-finite value if the
+/// row itself contains non-finite logits, so the caller counts and excludes it.
+fn target_logprob(row: &[f32], target: usize) -> f64 {
+    let mut max = f32::NEG_INFINITY;
+    for &x in row {
+        if x > max {
+            max = x;
+        }
+    }
+    if !max.is_finite() {
+        return f64::NAN;
+    }
+    let m = max as f64;
+    let mut sumexp = 0.0f64;
+    for &x in row {
+        sumexp += (x as f64 - m).exp();
+    }
+    let lse = m + sumexp.ln();
+    row[target] as f64 - lse
 }
 
 /// Default mode: one forward pass, dump the full last-position logits + taps.
