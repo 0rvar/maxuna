@@ -28,7 +28,8 @@
  * /tmp/laguna-parity.
  *
  * Reuse: an existing Reference dump is reused iff it carries provenance with
- * moe_impl=="reference"; --regen-ref forces regeneration. Candidate dumps are
+ * moe_impl=="reference" and attn_dtype=="f32" (the pinned oracle environment);
+ * --regen-ref forces regeneration. Candidate dumps are
  * ALWAYS regenerated (they are the thing under test). The ppl reference is the
  * frozen fixture tests/fixtures/reference-ppl.json (copied in), regenerated only
  * under --regen-ppl-ref (a committed artifact — the user must review/stage it).
@@ -119,11 +120,23 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
+    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k.startsWith("LAGUNA_MM_ID")) continue;
     if (k === "LAGUNA_PARITY_DIR" || k === "LAGUNA_PARITY_TIER") continue;
     e[k] = v;
   }
   return e;
+}
+
+/**
+ * Environment for REFERENCE-ORACLE dumps: the oracle is the maximally precise
+ * path, so attention is pinned to f32 compute (`LAGUNA_ATTN_F32=1`) regardless
+ * of the shipped f16 default. All cached/committed reference artifacts are
+ * f32-attention; regenerating with anything else would silently move the
+ * strict tier's 0.999 anchor. Candidate dumps use baseEnv() and run whatever
+ * path their tier is gating.
+ */
+function referenceEnv(): Record<string, string> {
+  return { ...baseEnv(), LAGUNA_ATTN_F32: "1" };
 }
 
 /** Run a command with stdout+stderr streamed to `logPath` (never a pager). */
@@ -202,14 +215,17 @@ async function fixtureTokens(id: string): Promise<string> {
 // -------------------------------------------------------------- provenance
 
 /** True iff `path` is a JSON dump whose provenance is a genuine Reference-oracle
- *  run — the only kind the gate accepts as a reference. `kind` (when given) must
- *  also match. Any parse/shape problem returns false (regenerate). */
+ *  run — the only kind the gate accepts as a reference: moe_impl=="reference"
+ *  AND attn_dtype=="f32" (referenceEnv() pins LAGUNA_ATTN_F32=1; a dump without
+ *  the field predates it and the Rust gate hard-fails on it, so regenerate here
+ *  instead of failing mid-run). `kind` (when given) must also match. Any
+ *  parse/shape problem returns false (regenerate). */
 async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
   if (!existsSync(path)) return false;
   try {
     const j = await Bun.file(path).json();
     if (kind && j.kind !== kind) return false;
-    return j?.provenance?.moe_impl === "reference";
+    return j?.provenance?.moe_impl === "reference" && j?.provenance?.attn_dtype === "f32";
   } catch {
     return false;
   }
@@ -337,7 +353,7 @@ async function ensureFullLogitRef(parityDir: string, regen: boolean): Promise<st
       runToLog(
         [LOGITS_DUMP, "--model", MODEL, "--moe-impl", "reference", "--tokens", tokens, "--output", refPath],
         log,
-        baseEnv(),
+        referenceEnv(),
       ),
     );
     if (code !== 0) die(`full-logit reference dump failed (exit ${code}):\n${await tailLog(log)}`);
@@ -359,15 +375,17 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   const candLog = join(dir, "candidate.log");
   const candPath = join(dir, "candidate.json");
   const tokens = await fixtureTokens(fixture);
-  // strict gates the CLASSIC mv fallback: LAGUNA_NO_MM_ID=1 forces the expert
-  // path off mm_id onto the per-token mat-vec, and LAGUNA_MV_CLASSIC=1 reverts
+  // strict gates the CLASSIC fallback path: LAGUNA_NO_MM_ID=1 forces the expert
+  // path off mm_id onto the per-token mat-vec, LAGUNA_MV_CLASSIC=1 reverts
   // that mat-vec from the vendored ggml geometry to candle's classic kernels —
   // the f32-accumulation-order the 0.999 baseline was calibrated against (the
   // DEFAULT vendored mv path is gated by the decode + ppl tiers instead; its
-  // full-logit cosine is a diagnostic only — see docs/parity.md §3b). mm runs
-  // the default mm_id prefill (code-short's 58 tokens are >= MM_ID_MIN_SEQ).
+  // full-logit cosine is a diagnostic only — see docs/parity.md §3b) — and
+  // LAGUNA_ATTN_F32=1 reverts attention from the default f16 compute path to
+  // the legacy f32 one. mm runs the default mm_id prefill (code-short's 58
+  // tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
   const env = tier === "strict"
-    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1" }
+    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1" }
     : baseEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);
@@ -408,7 +426,7 @@ async function runDecodeFixture(fixture: string, parityDir: string, regenRef: bo
       runToLog(
         [LOGITS_DUMP, "--model", MODEL, "--moe-impl", "reference", "--tokens", tokens, "--greedy", String(GREEDY_N), "--output", refPath],
         log,
-        baseEnv(),
+        referenceEnv(),
       ),
     );
     if (code !== 0) die(`decode reference (${fixture}) failed (exit ${code}):\n${await tailLog(log)}`);
@@ -452,7 +470,7 @@ async function runPplTier(parityDir: string, regenPplRef: boolean): Promise<void
       runToLog(
         [LOGITS_DUMP, "--model", MODEL, "--moe-impl", "reference", "--max-ctx", String(PPL_MAX_CTX), "--ppl", CORPUS, "--output", PPL_FIXTURE],
         log,
-        baseEnv(),
+        referenceEnv(),
       ),
     );
     if (code !== 0) die(`ppl reference regeneration failed (exit ${code}):\n${await tailLog(log)}`);

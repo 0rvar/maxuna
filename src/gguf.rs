@@ -188,6 +188,22 @@ impl Weights {
         Ok(qt.dequantize(&self.src.device)?.to_dtype(candle_core::DType::F32)?)
     }
 
+    /// A rank-2 weight `[out_dim, in_dim]` as a dense f16 tensor, for layers
+    /// whose matmuls run natively in f16 (the GGUF stores the attention weights
+    /// as F16, so this keeps them at their stored precision — `QMatMul` would
+    /// dequantize them to f32 and double the streamed bytes). The f32
+    /// intermediate `dequantize_f16` goes through is dropped before this
+    /// returns; no f32 copy stays alive.
+    pub fn dense_f16(&self, name: &str) -> Result<Tensor> {
+        let qt = self.qtensor(name)?;
+        let t = qt.dequantize_f16(&self.src.device)?;
+        let dims = t.dims().to_vec();
+        let [_out_dim, _in_dim] = dims[..] else {
+            bail!("{} is not a rank-2 weight: {dims:?}", self.name(name));
+        };
+        Ok(t)
+    }
+
     /// Loads a stacked expert tensor `[n_expert, n_out, k]` such that the fused
     /// MoE kernels and the wrapping `QTensor` share ONE device allocation. We read
     /// the quantized bytes from the file ourselves, upload them once via

@@ -87,11 +87,9 @@ impl Rope {
             }
         }
 
-        Ok(Self {
-            cos: Tensor::from_vec(cos, (max_ctx, half), device)?,
-            sin: Tensor::from_vec(sin, (max_ctx, half), device)?,
-            n_rot,
-        })
+        let cos = Tensor::from_vec(cos, (max_ctx, half), device)?;
+        let sin = Tensor::from_vec(sin, (max_ctx, half), device)?;
+        Ok(Self { cos, sin, n_rot })
     }
 
     /// q, k: [n_head, seq, head_dim]; positions pos..pos+seq.
@@ -99,8 +97,8 @@ impl Rope {
         Ok((self.rotate(q, pos)?, self.rotate(k, pos)?))
     }
 
-    /// Rotate the first `n_rot` dims of x with NEOX pairing (dim i with i +
-    /// n_rot/2); any trailing dims pass through untouched.
+    /// Rotate the first `n_rot` dims of x (f32) with NEOX pairing (dim i with
+    /// i + n_rot/2); any trailing dims pass through untouched.
     fn rotate(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
         let (_, seq, head_dim) = x.dims3()?;
         let cos = self.cos.narrow(0, pos, seq)?;

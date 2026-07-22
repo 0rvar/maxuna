@@ -215,8 +215,9 @@ final-logits sum + sampled cosine. Divergence threshold defaults to rel error
 candidate was produced (`LAGUNA_PARITY_TIER`, default `strict`):
 
 ```bash
-# strict tier — candidate is the CLASSIC mv fallback path (dump with
-# LAGUNA_NO_MM_ID=1 AND LAGUNA_MV_CLASSIC=1):
+# strict tier — candidate is the CLASSIC mv fallback path with legacy f32
+# attention (dump with LAGUNA_NO_MM_ID=1 AND LAGUNA_MV_CLASSIC=1 AND
+# LAGUNA_ATTN_F32=1):
 LAGUNA_PARITY_DIR=/tmp/ref-code LAGUNA_PARITY_TIER=strict \
   cargo test --test parity -- --ignored --nocapture
 # mm tier — candidate is the default mm_id prefill path:
@@ -229,7 +230,9 @@ kernels and they have different (both correct) numerical envelopes vs the f32
 `Reference` oracle:
 
 - **classic mv fallback — prefill under `LAGUNA_NO_MM_ID=1` AND
-  `LAGUNA_MV_CLASSIC=1`** — strict gate: cosine `>= 0.999`, top-1 match, top-5
+  `LAGUNA_MV_CLASSIC=1` AND `LAGUNA_ATTN_F32=1` (the legacy f32 attention
+  path; the shipped default computes attention in f16)** — strict gate: cosine
+  `>= 0.999`, top-1 match, top-5
   overlap `>= 4/5`. This gates the legacy/kill-switch mat-vec path — candle's
   classic mv kernels, whose per-(token,slot) matvec accumulates each output as
   one f32 dot product in the same order as the oracle's per-row matmul, so it
@@ -241,7 +244,8 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   edit. The vendored default is therefore gated by the decode greedy tier +
   the perplexity tier, with its full-logit cosine reported as a diagnostic only
   (`LAGUNA_PARITY_TIER=decode`); strict validates only the classic fallback.
-- **mm_id path — prefill at seq >= 32 (the shipped default, f32 `_hp` tiles)** —
+- **mm_id path — prefill at seq >= 32 (the shipped default, tensor `_t` f16
+  tiles; the `_hp`/`_t_hp` f32-tile variants gate identically)** —
   fork-equivalence gate: raw cosine `>= 0.995`, top-5 overlap `>= 4/5`, and top-1
   matches `Reference` **OR the candidate's top-1 is the `Reference`'s top-1 or
   top-2 AND the `Reference`'s own top-1/top-2 margin is < 0.5 logit** (a genuine
@@ -282,22 +286,34 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   gross scale/NaN bug, not a precision gate — cosine/top-1 handle precision. The
   perplexity gate is the other scale-sensitive layer for decode.
 
-  **Dump provenance + the mm tier.** The tier is caller-selected (`LAGUNA_PARITY_TIER`)
-  with no cross-check against how the dump was produced, so a decode/mv_id candidate
-  graded under the looser mm tier would mask a regression the strict tier would catch.
-  Every dump `logits-dump` writes now carries a `provenance` object (moe_impl, prefill
-  `seq_len`, active `mm_variant`, `no_mm_id`, and `mm_min_seq` = the seq threshold, all
-  from a single source in `src/ops`). Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE dump
-  must carry provenance proving the mm_id path was actually active — `moe_impl == "fused"`,
-  `seq_len >= mm_min_seq`, `no_mm_id == false` — else the gate hard-fails asking you to
-  regenerate the dump. The strict and decode tiers add no *candidate* provenance requirement
-  (strict over-rejects mm output, which is safe). **The reference side now requires provenance
-  in every tier**: `reference.json`'s `provenance.moe_impl` must be `"reference"`, or `compare`
-  hard-fails (a `reference.json` accidentally produced with `--moe-impl fused` would otherwise
-  make every tier a fused-vs-fused self-comparison that hides a regression). This is fail-closed
-  with no legacy exception, so **a long-lived `reference.json` that predates the provenance field
-  must be regenerated once with the current `logits-dump`** (`--moe-impl reference`) before the
-  gate will run.
+  **Dump provenance + per-tier enforcement.** The tier is caller-selected
+  (`LAGUNA_PARITY_TIER`) with no cross-check against how the dump was produced, so a
+  decode/mv_id candidate graded under the looser mm tier would mask a regression the
+  strict tier would catch. Every dump `logits-dump` writes now carries a `provenance`
+  object (moe_impl, prefill `seq_len`, active `mm_variant`, `no_mm_id`, `mm_min_seq` =
+  the seq threshold, and `attn_dtype` = the attention compute dtype, all from a single
+  source in `src/ops`). Enforcement by tier:
+  - `attn_dtype` is pinned per side in EVERY tier: the reference must always be
+    `"f32"` (the oracle runs under `LAGUNA_ATTN_F32=1`); the strict candidate must be
+    `"f32"` (strict gates the legacy f32 attention path); mm/decode/ppl candidates
+    must be `"f16"` (the shipped default). A dump missing the field came from a stale
+    `logits-dump` binary and hard-fails (regenerate).
+  - Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE must prove the mm_id path was
+    actually active — `moe_impl == "fused"`, `seq_len >= mm_min_seq`,
+    `no_mm_id == false` — else the gate hard-fails asking you to regenerate.
+  - Under `LAGUNA_PARITY_TIER=strict` the CANDIDATE must be a Fused-runner dump
+    produced under `LAGUNA_NO_MM_ID=1` — `moe_impl == "fused"` and
+    `no_mm_id == true` — else a copied reference dump (moe_impl "reference",
+    attn_dtype "f32": exactly what strict's attn pin expects) would clear the strict
+    thresholds vacuously. (`LAGUNA_MV_CLASSIC` is not recorded in provenance and
+    cannot yet be asserted from the dump — see TODO.md.)
+  **The reference side requires provenance in every tier**: `reference.json`'s
+  `provenance.moe_impl` must be `"reference"`, or `compare` hard-fails (a
+  `reference.json` accidentally produced with `--moe-impl fused` would otherwise make
+  every tier a fused-vs-fused self-comparison that hides a regression). This is
+  fail-closed with no legacy exception, so **a long-lived dump that predates the
+  provenance (or `attn_dtype`) field must be regenerated once with the current
+  `logits-dump`** before the gate will run.
 
   **Why forced replay, not free-run.** Comparing two free-running greedy decodes
   cascades at the first near-tie: the moment the two engines pick different
@@ -310,7 +326,14 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   step before being forced. A step passes when the candidate's argmax equals the
   reference token; a mismatch is excused only when the *Reference's own*
   top-1/top-2 margin at that step is `< 0.5` logit (same NEAR_TIE_MARGIN rule as
-  the mm tier — which token wins a sub-0.5 oracle tie is noise).
+  the mm tier — which token wins a sub-0.5 oracle tie is noise) AND the two picks
+  are mutual contenders: the candidate's pick is in the reference's top-2, or the
+  reference token is in the candidate's top-2 with the candidate's own top-1/top-2
+  margin also `< 0.5` (fork calibration showed the reference's stored top-2 can be
+  the wrong contender set at 3-way ties, but only when the candidate is also flat
+  there — a confident wrong pick is never fork-class). Total excused steps are
+  capped at `max(2, n/8)` (fork calibration measured `<= 4/64` tie-flips per
+  fixture; more than 1-in-8 is drift, not tie noise).
 
 Calibration (code-short fixture, 2026-07-22, full-logit vs the f32 `Reference`):
 
@@ -321,15 +344,20 @@ Calibration (code-short fixture, 2026-07-22, full-logit vs the f32 `Reference`):
 | long-text | ~2.3 logit (350 decisive) | must match: candidate top-1 = 350 |
 
 Candidate cosines on code-short (all configs `>= 0.995`), each labelled by its
-exact expert config so the near-identical numbers are distinguishable:
+exact expert config AND attention era so the near-identical numbers are
+distinguishable. The shipped default's mm cosine is identical across the
+f32→f16 attention switch because the vendored f16-weight prefill gemm is
+BIT-IDENTICAL to candle's f32 gemm (simdgroup MMA, same K order, identical
+operand values; the decode gemv differs in ulps only):
 
 | candidate config | raw cos vs Reference | top-1 |
 |---|---|---|
-| classic mv fallback (`LAGUNA_NO_MM_ID=1 LAGUNA_MV_CLASSIC=1`) — the **strict** gate | 0.999057 | 350 = ref (top5 5/5; still holds post-`run_stack` refactor) |
+| classic mv fallback (`LAGUNA_NO_MM_ID=1 LAGUNA_MV_CLASSIC=1 LAGUNA_ATTN_F32=1`) — the **strict** gate | 0.999057 | 350 = ref (top5 5/5; still holds post-`run_stack` refactor) |
 | vendored mv (`LAGUNA_NO_MM_ID=1`, shipped decode default) — diagnostic only | 0.997887 | 350 = ref (top5 4/5) |
-| mm_id `_hp` f32 tiles, glue-off (shipped prefill default) | 0.99687 | 268 |
-| mm_id `_hp` f32 tiles, with the (removed) L2 rescale glue | 0.99694 | 350 |
-| mm_id f16 tiles (`LAGUNA_MM_ID_F16=1`), glue-off | 0.99672 | 268 |
+| mm_id tensor `_t` prefill + vendored f16 attention (**shipped default**) | 0.996987 | 268 |
+| mm_id `_hp` f32 tiles, glue-off (f32-attention era) | 0.99687 | 268 |
+| mm_id `_hp` f32 tiles, with the (removed) L2 rescale glue (f32-attention era) | 0.99694 | 350 |
+| mm_id f16 tiles (`LAGUNA_MM_ID_F16=1`), glue-off (f32-attention era) | 0.99672 | 268 |
 | fork tensor-path prefill (llama-server, same oracle) | ~0.9962 raw / 0.99091 centered | 350 |
 
 On code-short the model genuinely can't separate 350 from 268 (0.319-logit
@@ -407,7 +435,7 @@ dumps.)
   top-1 agreement, top-5 `>= 4/5` — this is the **strict** tier, and it gates the
   legacy kill-switch path, NOT the shipped default (the shipped vendored mv path
   reorders f32 accumulation to ~0.997887 and is gated by the decode + ppl tiers,
-  cosine diagnostic-only). mm_id (default prefill, f32 tiles): cosine `>= 0.995`, top-5 `>= 4/5`,
+  cosine diagnostic-only). mm_id (default tensor prefill): cosine `>= 0.995`, top-5 `>= 4/5`,
   top-1 matches Reference OR (candidate top-1 is the Reference's top-1/top-2 AND
   the Reference's top-1/top-2 margin is `< 0.5` logit — near-tie). Both tiers
   require identical input ids. The `logit_parity` test selects the tier via
@@ -416,7 +444,9 @@ dumps.)
   under forced replay** (`greedy_parity`, §3c), across all three fixtures. Each
   step passes when the candidate's argmax equals the reference token; a mismatch
   is excused only at a reference near-tie (the Reference's own top-1/top-2 margin
-  at that step `< 0.5` logit — the same NEAR_TIE_MARGIN rule as the mm tier). Any
+  at that step `< 0.5` logit — the same NEAR_TIE_MARGIN rule as the mm tier) with
+  mutual-contender overlap (both-sides-flat for the reference-in-candidate-top-2
+  direction; see §3b), and total excuses are capped at `max(2, n/8)`. Any
   non-excused mismatch fails. The full-logit cosine is reported (via
   `LAGUNA_PARITY_TIER=decode logit_parity`) but NOT gated — the strict 0.999
   cosine passes with zero headroom and can't accept accumulation-reordering
@@ -440,9 +470,15 @@ with a token-id ARRAY as the prompt (no template, no tokenizer):
 ```bash
 curl -s localhost:8080/completion -d '{
   "prompt": [2, 750, 15243, ...], "n_predict": 200, "temperature": 0,
-  "samplers": []
+  "top_k": 1
 }'
 ```
+
+**Trap** (fork-calibration, 2026-07-22): on this fork build `temperature: 0`
+(with or without `samplers: []`) still DIST-samples the emitted token — ~25% of
+steps disagree with the server's own top logprob. A greedy oracle must either
+force `top_k: 1` (as above) or ignore the emitted tokens entirely and read the
+argmax from `n_probs` raw logprobs (`post_sampling_probs: false`).
 
 ## Perplexity gate
 

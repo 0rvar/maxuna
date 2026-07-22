@@ -2,15 +2,32 @@
 
 ## Priority order (decided 2026-07-22, next session starts at P1)
 
-1. **Attention per-layer dispatch-chain fusion** (decode; claimed ~48.6 ms of
-   76.9 ms/token). PHASE 0 IS MANDATORY: re-measure the decode budget with
-   isolation benches / GPU capture before writing any kernel — the mv-geometry
-   lever died because this same ablation attributed 6.5 ms to lm_head vs 0.7 ms
-   measured directly. Note the gate reframing: for DECODE-path kernels the
-   acceptance criteria are the decode greedy + ppl tiers (bit-identity to candle
-   is no longer required — that was a strict-gate-era rule); PREFILL-path
-   attention fusion must still clear the mm cosine tier, so the router-cascade
-   caution stands there.
+1. **Attention decode cost — PHASE 0 DONE (2026-07-22), plan revised.**
+   Re-measured with isolation benches (`decode_bench` modules in attention.rs /
+   moe.rs, `#[ignore]`, synthetic weights, no GGUF) + real-model sweep. Findings:
+   (i) SUSTAINED vs BOOST CLOCKS: identical GPU work runs ~1.7x slower after ~1 s
+   of load (full_stack_decode_bench time series: 41→76 ms plateau matching real
+   78.7 ms/token within 3%) — isolation mins are boost-clock; use plateau means,
+   or trust ratios only. (ii) Sum-checked sustained budget of the 78.7 ms token:
+   attention ~49 (projections ~40 = f32 weight streaming at bandwidth — candle
+   dequantizes the GGUF's F16 attn weights to dense f32, 11.2 GB/token; sdpa ~4;
+   glue+dispatch ~6), MoE ~24 (mv_id gather ~14, routing ~6, shared ~3),
+   tail+sampler ~3. (iii) Dispatch overhead is 2.4 µs/dispatch ≈ 3 ms boost
+   (~6 sustained) TOTAL, and decode tok/s is flat across
+   CANDLE_METAL_COMPUTE_PER_BUFFER 10→1000 — death-by-dispatch REFUTED as the
+   main story; the old 48.6 ms fusion prize does not exist. Revised attack:
+   (a) **f16 attention — DONE 2026-07-22** (decode 11.7 → 18.2 tok/s sustained
+   LPM, ALL parity tiers pass at the f32-era anchors). Shipped as VENDORED
+   mixed-dtype kernels (`src/ops/f16.metal`, f16 weights × f32 activations →
+   f32, ggml's convention) after two rejected intermediates (all-f16 chain,
+   cast-based hybrid) — full arc + lessons in docs/log.md. `LAGUNA_ATTN_F32`
+   kill-switch; strict tier + reference dumps pin it.
+   (b) fuse the remaining attention glue (~6 ms sustained: QK-norm, rope,
+   softplus, casts around sdpa) — NEXT; (c) MoE mv_id gather latency (~14 ms
+   sustained vs ~7 ms bandwidth floor) folds into P2. NOTE: decode now matches
+   the fork's tg128 number (18.2 vs 18.1) but power modes may differ
+   (CLAUDE.md LPM caveat) — same-mode calibration pair still pending, needs
+   Orvar present (fan noise).
 2. **MoE route+glue+combine fusion** (prefill; the ~188 vs 361 pp512 gap is
    surrounding dispatch overhead). Now fusable INTO the owned mv.metal/mm_id
    kernels — the strategic payoff of vendoring.
@@ -95,16 +112,22 @@
     BIT-IDENTICAL to candle; post-router ops (down output, lm_head) are safe to
     fuse (no cascade). The glue-removal win needed no kernel — it just dropped the
     now-unnecessary rescale and kept candle's silu*mul.
-  - [ ] **Top decode lever (P1): fuse the attention per-layer dispatch chain.**
-    The ~48.6 ms of non-sdpa attention overhead (~24 dispatches x 48 layers) is
-    the prize — but RE-MEASURE that number first (phase 0 in the priority list
-    above; this budget's lm_head line was off by ~10x). Fuse
-    QK-norm+transpose+rope+f16-cast into one kernel and drop the 3
-    transpose-contiguous copies; possibly fuse the softplus-gate+o_proj tail.
-    Decode-path acceptance = decode greedy + ppl gates (not bit-identity).
-    sdpa (2.3 ms) is fine — leave it. lm_head (6.5 ms) is a single vocab matmul,
-    minor. mv_id routed gather (18.4 ms) — vendor ggml's mv_id N_R0/N_SG geometry
-    — is the concrete FFN-side secondary.
+  - [x] **Phase-0 re-measurement of this budget — DONE 2026-07-22; the numbers
+    above are superseded by the P1 entry in the priority list.** The 50.9 ms
+    attention total was roughly right at sustained clocks, but its attribution
+    was wrong: it is ~80% f32 weight streaming (candle dequantizes F16 attn
+    weights to f32), not dispatch overhead (measured 2.4 µs/dispatch; PER_BUFFER
+    sweep flat). lm_head is ~1.3 ms sustained (not 6.5); MoE half ~24 ms
+    (mv_id gather ~14). "Fuse the dispatch chain" as originally scoped is
+    retired; see priority list P1 for the f16-first plan. Measurement harness:
+    ignored benches `attn_decode_chain_bench` / `attn_decode_ablation_bench` /
+    `attn_proj_f16_bench` / `attn_decode_f16_chain_bench` /
+    `dispatch_overhead_bench` (attention.rs) and `moe_decode_ffn_bench` /
+    `sampler_decode_bench` / `token_tail_bench` / `full_stack_decode_bench`
+    (moe.rs); run via `cargo test --release <name> -- --ignored --nocapture`,
+    iters via LAGUNA_BENCH_ITERS/WARMUP. CAVEAT baked into the harness: compare
+    plateau means (time series printed by full_stack bench), not means-vs-mins
+    across variants — boost-clock decay otherwise poisons ablation deltas.
   - [x] **Vendored ggml mv geometry for the routed gather + lm_head — DONE, but
     NO measurable decode gain (LESSON: the mv compute was not the bottleneck).**
     Ported ggml's CURRENT `kernel_mul_mv_{id_,}q{4,6}_K_f32_impl` geometry
@@ -209,3 +232,17 @@ implementation — never silently drop scope.
   residual false-pass. A runtime mm_id-dispatch counter surfaced into dump
   provenance would close it. Deferred: the ops dispatch layer is under concurrent
   rework, so touching it now would collide.
+- [ ] **`LAGUNA_MV_CLASSIC` in dump provenance** — the strict tier's mv-classic env
+  can't be asserted from the dump (`attn_dtype`/`no_mm_id` now are); close if
+  provenance grows a runtime kernel-dispatch record (same mechanism as the
+  mm_id-dispatch counter item above).
+- [ ] **Small-batch f16 attention gemv (`mul_mv_ext`)** — the vendored f16-weight
+  attention matmul (src/ops/f16.metal) mirrors ggml's mv/mm split at ne11 > 8, but
+  skips ggml's `mul_mv_ext` small-batch kernels (its preferred path for ne11 2..8);
+  those seqs ride the plain gemv with one grid.y column per token. Only reachable
+  by a sub-9-token prefill (never on the decode or chunked-prefill hot paths), so
+  perf-only and tiny. Vendor `kernel_mul_mv_ext_f16_f32_r1_N` if it ever matters.
+- [ ] **Cooperative-tensor f16 attention prefill gemm** — the vendored f16-weight
+  prefill gemm (src/ops/f16.metal) uses the classic simdgroup path; the fork on M5
+  would take the cooperative-tensor mul_mm for f16×f32. Potential prefill perf
+  follow-up; correctness unaffected.

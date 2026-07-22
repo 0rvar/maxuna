@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::RmsNorm;
 
-use crate::attention::AttnBlock;
+use crate::attention::{AttnBlock, AttnWeights};
 use crate::config::LagunaConfig;
 use crate::gguf::{GgufFile, QLinear, Weights};
 use crate::kv_cache::LayerCache;
@@ -53,6 +53,10 @@ pub struct LagunaModel {
     /// which case the decode path stays on `lm_head.forward`.
     lm_head_buffer: Option<Arc<candle_metal_kernels::metal::Buffer>>,
     lm_head_dtype: candle_core::quantized::GgmlDType,
+    /// Attention weight dtype resolved once at load (F16 default, F32 under
+    /// LAGUNA_ATTN_F32); activations are f32 either way. Surfaced so dump
+    /// provenance can record which path ran.
+    attn_dtype: DType,
     max_ctx: usize,
     tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
@@ -63,6 +67,25 @@ impl LagunaModel {
         let cfg = LagunaConfig::from_gguf(&gguf.content)?;
         let device = gguf.device.clone();
         let w = Weights::from_gguf(gguf.clone());
+
+        // Attention WEIGHT dtype, read ONCE at load: f16 by default — the GGUF
+        // stores the attention weights as F16, so the default keeps them dense
+        // f16 and runs each projection through the vendored mixed-dtype kernels
+        // (ops::matmul_f16: f16 weights x f32 activations, f32 accumulate and
+        // output — the fork's exact mul_mat precision structure, with the
+        // stored weights as the only f16 rounding). LAGUNA_ATTN_F32
+        // (presence-based, like the other LAGUNA_* switches) dequantizes them
+        // to dense f32 instead — the fully legacy path, which the strict
+        // parity tier gates.
+        let attn_dtype = if std::env::var_os("LAGUNA_ATTN_F32").is_some() {
+            DType::F32
+        } else {
+            DType::F16
+        };
+        let attn_weights = match attn_dtype {
+            DType::F32 => AttnWeights::DequantF32,
+            _ => AttnWeights::F16,
+        };
 
         // Two RoPE tables shared across all layers of each type (Arc-shared into
         // every AttnBlock): YaRN for full-attention layers, plain for SWA. Built
@@ -84,7 +107,7 @@ impl LagunaModel {
         for il in 0..cfg.n_layer {
             let lw = w.pp(format!("blk.{il}"));
             let rope = if cfg.is_full_attn(il) { rope_full.clone() } else { rope_swa.clone() };
-            let attn = AttnBlock::new(&lw, &cfg, il, rope)?;
+            let attn = AttnBlock::new(&lw, &cfg, il, rope, attn_weights)?;
             let ffn = if il < cfg.dense_layers {
                 Ffn::Dense(DenseMlp::new(&lw)?)
             } else {
@@ -114,6 +137,7 @@ impl LagunaModel {
             lm_head,
             lm_head_buffer,
             lm_head_dtype,
+            attn_dtype,
             max_ctx,
             tap_enabled: false,
             taps: Vec::new(),
@@ -126,6 +150,14 @@ impl LagunaModel {
 
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
+    }
+
+    /// The attention WEIGHT dtype `load` resolved: `F16` (GGUF-stored f16
+    /// weights through the vendored mixed-dtype kernels — the shipped default)
+    /// or `F32` (dequantized dense f32, the legacy path selected by
+    /// `LAGUNA_ATTN_F32`). Activations are f32 in both modes.
+    pub fn attn_dtype(&self) -> DType {
+        self.attn_dtype
     }
 
     /// Run the transformer stack (embedding → 48 layers → final norm) and return

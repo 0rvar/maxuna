@@ -28,6 +28,11 @@ const MM_ID_T_HP_INSTANTIATIONS: &str = include_str!("mm_id_t_hp.metal");
 /// Deliberately separate from `mm_id.metal` so it carries no Metal-4 tensor
 /// dependency.
 const MV_SOURCE: &str = include_str!("mv.metal");
+/// Vendored f16-weight x f32-activation matmul kernels (attention projections).
+/// Separate from both `mm_id.metal` (no Metal-4 tensor dependency) and
+/// `mv.metal` (attention-critical vs MoE-decode-critical: neither library can
+/// break the other).
+const F16_SOURCE: &str = include_str!("f16.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -112,4 +117,9 @@ pub(crate) fn mm_id_pipeline(device: &Device, name: &str) -> Result<ComputePipel
 /// Pipeline for a `mv.metal` kernel (vendored ggml-geometry mat-vec).
 pub(crate) fn mv_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, MV_SOURCE, "mv", name)
+}
+
+/// Pipeline for an `f16.metal` kernel (vendored f16-weight attention matmul).
+pub(crate) fn f16_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, F16_SOURCE, "f16", name)
 }

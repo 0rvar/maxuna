@@ -217,15 +217,24 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// mask a regression). `seq_len` is the prefill length; `mm_min_seq` /
 /// `mm_variant` / `no_mm_id` are the fused-MoE kernel-selection state, so
 /// "mm_id path active" is derivable as `moe_impl == "fused" && seq_len >=
-/// mm_min_seq && !no_mm_id`. Additive: readers that ignore it still parse older/newer
-/// dumps.
-fn provenance(moe_impl: &str, seq_len: usize) -> Value {
+/// mm_min_seq && !no_mm_id`. `attn_dtype` is the attention weight dtype the
+/// model resolved at load ("f16" default, "f32" under LAGUNA_ATTN_F32) — the
+/// gate enforces it per side/tier, so a dump from a binary that predates the
+/// f16 attention path (and thus omits the field) cannot pass as current.
+/// Additive: readers that ignore it still parse older/newer dumps.
+fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
+    let attn_dtype = match model.attn_dtype() {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        other => unreachable!("attention computes in f16 or f32, not {other:?}"),
+    };
     json!({
         "moe_impl": moe_impl,
         "seq_len": seq_len,
         "mm_variant": laguna::ops::active_mm_variant_name(),
         "no_mm_id": laguna::ops::no_mm_id_forced(),
         "mm_min_seq": laguna::ops::MM_ID_MIN_SEQ,
+        "attn_dtype": attn_dtype,
     })
 }
 
@@ -354,7 +363,7 @@ fn run_ppl(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, cor
         "model": cli.model.display().to_string(),
         "corpus": corpus.display().to_string(),
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&cli.moe_impl, seq_len),
+        "provenance": provenance(&model, &cli.moe_impl, seq_len),
         "tokens": tokens,
         "n_tokens": n_tokens,
         "token_hash": token_hash(&tokens),
@@ -426,7 +435,7 @@ fn run_single(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize) 
         "model": cli.model.display().to_string(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&cli.moe_impl, tokens.len()),
+        "provenance": provenance(&model, &cli.moe_impl, tokens.len()),
         "tokens": tokens,
         "n_tokens": tokens.len(),
         "vocab": vocab,
@@ -492,7 +501,7 @@ fn run_greedy(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, 
         "model": cli.model.display().to_string(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&cli.moe_impl, tokens.len()),
+        "provenance": provenance(&model, &cli.moe_impl, tokens.len()),
         "tokens": tokens,
         "n_tokens": tokens.len(),
         "vocab": vocab,
@@ -564,7 +573,7 @@ fn run_replay(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, 
         "model": cli.model.display().to_string(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&cli.moe_impl, prompt.len()),
+        "provenance": provenance(&model, &cli.moe_impl, prompt.len()),
         "tokens": prompt,
         "n_tokens": prompt.len(),
         "vocab": vocab,

@@ -1,9 +1,11 @@
 mod dispatch;
+pub mod f16;
 pub mod mm_id;
 pub mod mv_id;
 mod pipelines;
 
 pub use dispatch::mv_vendored_supported;
+pub use f16::matmul_f16;
 pub use mm_id::mul_mm_id;
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 

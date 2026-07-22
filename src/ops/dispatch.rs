@@ -215,6 +215,28 @@ struct MvArgs {
     r3: i16,
 }
 
+/// `ggml_metal_kargs_mul_mm` (ggml-metal-impl.h). Written to buffer(0) of the
+/// vendored `kernel_mul_mm_f16_f32_v` prefill gemm. `#[repr(C)]` matches the
+/// Metal `constant` struct layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MmArgs {
+    ne00: i32,
+    ne02: i32,
+    nb01: u64,
+    nb02: u64,
+    nb03: u64,
+    ne12: i32,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    ne0: i32,
+    ne1: i32,
+    r2: i16,
+    r3: i16,
+}
+
 /// `ggml_metal_kargs_mul_mv_id` (ggml-metal-impl.h). Written to buffer(0) of the
 /// vendored indexed mat-vec kernels (`kernel_mul_mv_id_<dtype>_f32_v`).
 #[repr(C)]
@@ -241,6 +263,20 @@ struct MvIdArgs {
     nb1: u64,
     nr0: i32,
 }
+
+/// The fork's host-side mv/mm break-even for the float-family mul_mat path
+/// (ggml-metal-ops.cpp `ne11_mm_min`): the tiled matmul kernel is dispatched
+/// when the token count EXCEEDS this, the gemv otherwise. `run_matmul_f16`
+/// mirrors it. (ggml additionally has small-batch `mul_mv_ext` kernels for
+/// ne11 2..8; not vendored — see TODO.md — so those seqs ride the gemv.)
+const F16_MM_MIN_SEQ: usize = 8;
+
+/// Fork host constants for `kernel_mul_mv_f16_f32_v` at our shapes: nr0 = 2
+/// src0 rows per threadgroup (the only case in ggml's disp switch) and
+/// nsg = min(4, ceil(ne00/128)) = 4 simdgroups splitting the K reduction
+/// (every attention K is >= 3072). Baked into the kernel as well.
+const MV_F16_NR0: usize = 2;
+const MV_F16_NSG: usize = 4;
 
 /// ggml's N_R0 * N_SG for the vendored q4_K/q6_K mat-vec kernels (both dtypes
 /// carry N_R0 = 2, N_SG = 2 in ggml-metal-impl.h). Rows are grouped into blocks
@@ -755,6 +791,158 @@ pub(crate) fn run_plain_mv(
         let threads = mtl_size!(32, MV_NSG, 1);
         encoder.dispatch_thread_groups(grid, threads);
     }
+    drop(x_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (t, n_out)))
+}
+
+/// Dense f16-weight x f32-activation matmul against the vendored ggml-geometry
+/// kernels (f16.metal) — the attention projections. `weight` is a rank-2
+/// `[n_out, k]` dense f16 tensor, `x` is `[t, k]` f32; returns `[t, n_out]` f32
+/// with no activation cast and no output rounding (the stored f16 weights are
+/// the only f16 in the chain). Dispatches per the fork's host split: the gemv
+/// for t <= 8 tokens, the tiled gemm above (`F16_MM_MIN_SEQ`).
+pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("matmul_f16 requires x on a Metal device");
+    };
+    let (n_out, k) = weight.dims2().map_err(|e| anyhow::anyhow!("weight must be rank-2 [n_out, k]: {e}"))?;
+    let (t, kx) = x.dims2().map_err(|e| anyhow::anyhow!("x must be rank-2 [t, k]: {e}"))?;
+    if weight.dtype() != DType::F16 {
+        bail!("weight must be f16, got {:?}", weight.dtype());
+    }
+    if x.dtype() != DType::F32 {
+        bail!("x must be f32, got {:?}", x.dtype());
+    }
+    if !weight.is_contiguous() {
+        bail!("weight must be contiguous");
+    }
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    if kx != k {
+        bail!("x k ({kx}) does not match weight k ({k})");
+    }
+    // Both kernels stream K through vector types (half4/float4 in the gemv,
+    // half4x4/float2x4 tiles in the gemm) and skip the fork's bc_inp/K-tail
+    // handling, and the gemm's float4 output copy needs 16-byte-aligned dst
+    // rows. Every attention shape satisfies these (K multiple of 1024, out
+    // dims all multiples of 4).
+    if !k.is_multiple_of(32) {
+        bail!("matmul_f16 requires k % 32 == 0, got {k}");
+    }
+    if !n_out.is_multiple_of(4) {
+        bail!("matmul_f16 requires n_out % 4 == 0, got {n_out}");
+    }
+
+    let out_count = t * n_out;
+    let dst = mdev.new_buffer(out_count, DType::F32, "matmul_f16")?;
+
+    let (w_guard, w_layout) = weight.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("weight is not on a Metal device");
+    };
+    let w_buf = w_storage.buffer();
+    let w_off = w_layout.start_offset() * DType::F16.size_in_bytes();
+    // The kernels read the weight through half4/half4x4 device pointers, which
+    // Metal requires 16-byte aligned; rows are (k % 8 == 0 checked above), so
+    // only a misaligned view start could break it. Production passes whole
+    // tensors (offset 0), but `matmul_f16` is pub and a future sliced f16 view
+    // would land here.
+    if !w_off.is_multiple_of(16) {
+        bail!("matmul_f16 requires a 16-byte-aligned weight view, got byte offset {w_off}");
+    }
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let x_buf = x_storage.buffer();
+    let x_off = x_layout.start_offset() * DType::F32.size_in_bytes();
+    // The kernels read x through float4/float2x4 device pointers, which Metal
+    // requires 16-byte aligned; rows are (k % 4 == 0 checked above), so only a
+    // misaligned view start could break it.
+    if !x_off.is_multiple_of(16) {
+        bail!("matmul_f16 requires a 16-byte-aligned x view, got byte offset {x_off}");
+    }
+
+    let nb01 = (k * DType::F16.size_in_bytes()) as u64;
+    let nb11 = (k * DType::F32.size_in_bytes()) as u64;
+
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        if t > F16_MM_MIN_SEQ {
+            // Tiled gemm: 64(out) x 32(token) tiles, 128 threads / 4 simdgroups,
+            // float sa/sb tiles (12288 B; the store-back tile reuses the region).
+            let args = MmArgs {
+                ne00: k as i32,
+                ne02: 1,
+                nb01,
+                nb02: n_out as u64 * nb01,
+                nb03: n_out as u64 * nb01,
+                ne12: 1,
+                nb10: DType::F32.size_in_bytes() as u64,
+                nb11,
+                nb12: t as u64 * nb11,
+                nb13: t as u64 * nb11,
+                ne0: n_out as i32,
+                ne1: t as i32,
+                r2: 1,
+                r3: 1,
+            };
+            let pipeline = pipelines::f16_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_v")?;
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_bytes(0, &args);
+            encoder.set_input_buffer(1, Some(w_buf), w_off);
+            encoder.set_input_buffer(2, Some(x_buf), x_off);
+            encoder.set_output_buffer(3, Some(&dst), 0);
+            encoder.set_threadgroup_memory_length(0, 12288);
+            let grid = mtl_size!(t.div_ceil(32), n_out.div_ceil(64), 1);
+            encoder.dispatch_thread_groups(grid, mtl_size!(128, 1, 1));
+        } else {
+            // gemv: NR0 rows per threadgroup, NSG simdgroups splitting K, one
+            // grid.y column per token; smem is the cross-simdgroup reduce
+            // scratch (NR0 * 32 floats).
+            let args = MvArgs {
+                ne00: k as i32,
+                ne01: n_out as i32,
+                ne02: 1,
+                nb00: 0,
+                nb01,
+                nb02: n_out as u64 * nb01,
+                nb03: n_out as u64 * nb01,
+                ne10: k as i32,
+                ne11: t as i32,
+                ne12: 1,
+                nb10: DType::F32.size_in_bytes() as u64,
+                nb11,
+                nb12: t as u64 * nb11,
+                nb13: t as u64 * nb11,
+                ne0: n_out as i32,
+                ne1: t as i32,
+                nr0: MV_F16_NR0 as i32,
+                r2: 1,
+                r3: 1,
+            };
+            let pipeline = pipelines::f16_pipeline(mdev.device(), "kernel_mul_mv_f16_f32_v")?;
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_bytes(0, &args);
+            encoder.set_input_buffer(1, Some(w_buf), w_off);
+            encoder.set_input_buffer(2, Some(x_buf), x_off);
+            encoder.set_output_buffer(3, Some(&dst), 0);
+            encoder.set_threadgroup_memory_length(
+                0,
+                MV_F16_NR0 * 32 * DType::F32.size_in_bytes(),
+            );
+            let grid = mtl_size!(n_out.div_ceil(MV_F16_NR0), t, 1);
+            encoder.dispatch_thread_groups(grid, mtl_size!(32, MV_F16_NSG, 1));
+        }
+    }
+    drop(w_guard);
     drop(x_guard);
 
     Ok(output_tensor(dst, mdev, out_count, (t, n_out)))

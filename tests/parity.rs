@@ -91,13 +91,21 @@ struct Dump {
 }
 
 /// The `logits-dump` `provenance` object: enough to tell whether a candidate dump
-/// actually exercised the mm_id prefill path it is being graded against.
+/// actually exercised the mm_id prefill path it is being graded against, and
+/// which attention weight dtype the run used.
 struct Provenance {
     moe_impl: String,
     seq_len: usize,
     mm_variant: String,
     no_mm_id: bool,
     mm_min_seq: usize,
+    /// Attention weight dtype: "f16" (the shipped default — f16 weights, f32
+    /// activations) or "f32" (the legacy path, `LAGUNA_ATTN_F32`). `None` for
+    /// dumps written by a
+    /// `logits-dump` binary that predates the field — the gate hard-fails on
+    /// that (a stale binary's dumps are otherwise indistinguishable from
+    /// current ones).
+    attn_dtype: Option<String>,
 }
 
 impl Provenance {
@@ -141,6 +149,12 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
             mm_variant: p["mm_variant"].as_str().context("provenance missing `mm_variant`")?.to_string(),
             no_mm_id: p["no_mm_id"].as_bool().context("provenance missing `no_mm_id`")?,
             mm_min_seq: p["mm_min_seq"].as_u64().context("provenance missing `mm_min_seq`")? as usize,
+            // Absent in dumps from binaries predating the field (the gate hard-fails
+            // on that later, per side); present-but-not-a-string is malformed.
+            attn_dtype: match p.get("attn_dtype") {
+                Some(d) => Some(d.as_str().context("provenance `attn_dtype` is not a string")?.to_string()),
+                None => None,
+            },
         })),
         _ => Ok(None),
     }
@@ -378,6 +392,27 @@ fn is_near_tie(candidate: &Dump, reference: &Dump) -> bool {
     cand_is_contender && margin < NEAR_TIE_MARGIN
 }
 
+/// Enforce the attention weight dtype recorded in one side's provenance.
+/// `want` is "f32" for the Reference-oracle side (reference dumps are produced
+/// under `LAGUNA_ATTN_F32=1`) and for strict-tier candidates; "f16" for
+/// candidates gating the shipped default path. A provenance MISSING the field
+/// came from a `logits-dump` binary that predates it — hard fail, because such
+/// a stale binary's dumps are otherwise indistinguishable from current ones
+/// and the gate would pass vacuously.
+fn check_attn_dtype(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    match p.attn_dtype.as_deref() {
+        Some(d) if d == want => Ok(()),
+        Some(other) => bail!(
+            "{side} provenance.attn_dtype is {other:?}, expected {want:?}; regenerate the dump \
+             under the environment its gate prescribes (see docs/parity.md §3)"
+        ),
+        None => bail!(
+            "{side} provenance has no attn_dtype (stale `logits-dump` binary predating the \
+             field); rebuild logits-dump and regenerate the dump"
+        ),
+    }
+}
+
 fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
@@ -388,7 +423,10 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     // a regenerate, not a legacy exception (the reference side is what we grade
     // against, so it must be trustworthy). See docs/parity.md §3.
     match &reference.provenance {
-        Some(p) if p.moe_impl == "reference" => {}
+        // The oracle also pins f32 attention compute (`LAGUNA_ATTN_F32=1`, see
+        // parity-gate.ts referenceEnv()); an f16 or field-less reference would
+        // silently move the strict tier's anchor.
+        Some(p) if p.moe_impl == "reference" => check_attn_dtype(p, "reference dump", "f32")?,
         Some(p) => bail!(
             "reference dump provenance.moe_impl is {:?}, expected \"reference\": the reference side \
              must be a Reference-oracle run. Regenerate reference.json with the current `logits-dump` \
@@ -418,9 +456,9 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     // mm tier: the CANDIDATE must carry provenance proving it actually ran the
     // mm_id prefill path. Grading a decode/mv_id (or reference) dump under the
     // looser mm gate would mask a regression the strict gate would catch, so a
-    // missing or non-mm provenance is a hard fail (regenerate the dump). Strict
-    // and decode tiers add no requirement: the strict gate over-rejects mm output,
-    // which is safe.
+    // missing or non-mm provenance is a hard fail (regenerate the dump). The
+    // strict tier has its own candidate check below; decode adds none beyond the
+    // attn_dtype pin.
     if tier == Tier::Mm {
         match &candidate.provenance {
             None => bail!(
@@ -434,6 +472,55 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
                  A candidate graded under the loose mm tier must have run the fused mm_id path; \
                  regenerate it (fused runner, prompt seq_len >= {}, LAGUNA_NO_MM_ID unset).",
                 p.moe_impl, p.seq_len, p.mm_min_seq, p.no_mm_id, p.mm_variant, p.mm_min_seq
+            ),
+            Some(_) => {}
+        }
+    }
+
+    // EVERY tier pins the CANDIDATE's attention weight dtype: strict gates the
+    // legacy f32 attention path (candidate produced under LAGUNA_ATTN_F32=1),
+    // while mm and decode gate the shipped f16-weight default. Candidate provenance is
+    // therefore required in every tier — a dump missing it (or missing the
+    // attn_dtype field) came from a stale `logits-dump` binary and must be
+    // regenerated, not graded.
+    let want_attn = match tier {
+        Tier::Strict => "f32",
+        Tier::Mm | Tier::Decode => "f16",
+    };
+    match &candidate.provenance {
+        Some(p) => check_attn_dtype(p, "candidate dump", want_attn)?,
+        None => bail!(
+            "candidate dump has no provenance (predates the field). Regenerate the candidate with \
+             the current `logits-dump` — see docs/parity.md §3b."
+        ),
+    }
+
+    // strict tier: the CANDIDATE must be a Fused-runner dump produced under
+    // LAGUNA_NO_MM_ID=1 (the classic mv fallback path strict grades). Without
+    // this, a copied reference dump (moe_impl "reference", attn_dtype "f32" —
+    // exactly what strict's attn pin expects) would clear the strict thresholds
+    // vacuously, and an mm_id-path dump would be graded against the wrong
+    // envelope. Mirrors the mm tier's candidate check above.
+    if tier == Tier::Strict {
+        match &candidate.provenance {
+            None => bail!(
+                "strict tier requires candidate provenance, but the dump has none (predates the \
+                 provenance field). Regenerate the candidate with the current `logits-dump` \
+                 (fused runner, LAGUNA_NO_MM_ID=1 LAGUNA_MV_CLASSIC=1 LAGUNA_ATTN_F32=1) — see \
+                 docs/parity.md §3b."
+            ),
+            Some(p) if p.moe_impl != "fused" => bail!(
+                "strict tier: candidate provenance.moe_impl is {:?}, expected \"fused\" — a \
+                 reference dump graded as its own candidate passes vacuously. Regenerate the \
+                 candidate with the fused runner — see docs/parity.md §3b.",
+                p.moe_impl
+            ),
+            Some(p) if !p.no_mm_id => bail!(
+                "strict tier: candidate provenance shows no_mm_id={}, but strict grades the \
+                 classic mv fallback path (candidate produced under LAGUNA_NO_MM_ID=1 \
+                 LAGUNA_MV_CLASSIC=1 LAGUNA_ATTN_F32=1). Regenerate the candidate — see \
+                 docs/parity.md §3b.",
+                p.no_mm_id
             ),
             Some(_) => {}
         }
@@ -644,7 +731,11 @@ fn load_greedy_dump(path: &Path) -> Result<GreedyDump> {
 /// forced step-by-step along the reference's tokens. A step passes when the
 /// candidate's argmax equals the reference token; a mismatch is excused only
 /// when the reference itself barely separated its own top-1/top-2 (margin <
-/// `NEAR_TIE_MARGIN`), i.e. which token wins there is oracle noise.
+/// `NEAR_TIE_MARGIN`) AND the two sides' picks are mutual contenders (the
+/// candidate's pick is in the reference's top-2, or the reference token is in
+/// the candidate's top-2 with the candidate's own margin also sub-tie), i.e.
+/// which token wins there is oracle noise. Total excuses are capped at
+/// max(2, n/8) — see `greedy_compare`.
 ///
 /// Forced replay (not free-run) is deliberate: a free-run comparison cascades at
 /// the first near-tie — once the two engines pick different tokens the histories
@@ -678,7 +769,9 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
     // vacuous self-agreement pass. A missing provenance predates the field and is
     // a hard fail (regenerate), not a legacy exemption.
     match &reference.provenance {
-        Some(p) if p.moe_impl == "reference" => {}
+        // The oracle side additionally pins f32 attention compute
+        // (`LAGUNA_ATTN_F32=1`, parity-gate.ts referenceEnv()).
+        Some(p) if p.moe_impl == "reference" => check_attn_dtype(p, "reference-greedy.json", "f32")?,
         Some(p) => bail!(
             "reference-greedy.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate \
              it with the current `logits-dump` (--moe-impl reference --greedy N)",
@@ -690,7 +783,9 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
         ),
     }
     match &candidate.provenance {
-        Some(p) if p.moe_impl == "fused" => {}
+        // The decode gate grades the SHIPPED path, which computes attention in
+        // f16; an f32 (or field-less) candidate ran some other build/env.
+        Some(p) if p.moe_impl == "fused" => check_attn_dtype(p, "candidate-greedy.json", "f16")?,
         Some(p) => bail!(
             "candidate-greedy.json (replay) provenance.moe_impl is {:?}, expected \"fused\"; the \
              candidate must be the Fused runner. Regenerate it with the current `logits-dump` \
@@ -775,15 +870,27 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             continue;
         }
         // Excuse a mismatch ONLY as a genuine reference near-tie: the oracle's own
-        // top-1/top-2 margin is below NEAR_TIE_MARGIN AND the candidate picked one
-        // of the reference's two contenders (its top-1 or top-2). An arbitrary
-        // wrong token at a reference near-tie is still a failure — the near-tie
-        // only excuses picking the OTHER contender, not any token. (Since the
-        // agreement case above already handled `cand_token == ref_token == top1`,
-        // "contender" here means the candidate landed on the reference's top-2.)
+        // top-1/top-2 margin is below NEAR_TIE_MARGIN AND the two argmaxes are
+        // mutual contenders — the candidate's pick appears in the reference's
+        // top-2, OR the reference's pick appears in the candidate's top-2 AND
+        // the candidate's own top-1/top-2 margin is also below NEAR_TIE_MARGIN.
+        // The second clause is fork-grounded: at small margins the oracle's
+        // stored top-2 is not always the true contender set (the fork itself has
+        // ranked a candidate's "non-contender" pick #2 at a 3-way tie), but only
+        // when the candidate is itself flat there (the calibrated case had
+        // candidate margin 0.068) — a candidate that CONFIDENTLY picks a token
+        // outside the reference's contenders is never fork-class tie noise, so
+        // that branch requires the tie to be flat on BOTH sides. An arbitrary
+        // wrong token with no contender overlap is always a failure.
+        // (`cand_token == r.top1.0` and `ref_token == c.top1.0` are impossible
+        // here — the agreement case above already returned — but the symmetric
+        // form keeps the rule readable.)
         let ref_margin = (r.top1.1 - r.top2.1).abs() as f64;
-        let cand_is_contender = cand_token == r.top1.0 || cand_token == r.top2.0;
-        if ref_margin < NEAR_TIE_MARGIN && cand_is_contender {
+        let cand_margin = (c.top1.1 - c.top2.1).abs() as f64;
+        let cand_in_ref_top2 = cand_token == r.top1.0 || cand_token == r.top2.0;
+        let ref_in_cand_top2 = ref_token == c.top1.0 || ref_token == c.top2.0;
+        let both_sides_flat = ref_in_cand_top2 && cand_margin < NEAR_TIE_MARGIN;
+        if ref_margin < NEAR_TIE_MARGIN && (cand_in_ref_top2 || both_sides_flat) {
             near_ties += 1;
             eprintln!(
                 "  step {i}: excused near-tie — candidate {cand_token} vs reference {ref_token}, \
@@ -791,13 +898,39 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             );
             continue;
         }
-        let reason = if !cand_is_contender {
-            format!("candidate {cand_token} is not a reference contender (top1 {}, top2 {})", r.top1.0, r.top2.0)
-        } else {
+        let reason = if ref_margin >= NEAR_TIE_MARGIN {
             format!("reference top1/top2 margin {ref_margin:.4} >= {NEAR_TIE_MARGIN}")
+        } else if ref_in_cand_top2 {
+            format!(
+                "candidate confidently picked a non-contender: candidate {cand_token} not in \
+                 reference top-2 (top1 {}, top2 {}) and candidate top1/top2 margin \
+                 {cand_margin:.4} >= {NEAR_TIE_MARGIN} (the reference-in-candidate-top-2 excuse \
+                 requires a near-tie on BOTH sides)",
+                r.top1.0, r.top2.0
+            )
+        } else {
+            format!(
+                "no contender overlap: candidate {cand_token} not in reference top-2 \
+                 (top1 {}, top2 {}) and reference {ref_token} not in candidate top-2 \
+                 (top1 {}, top2 {})",
+                r.top1.0, r.top2.0, c.top1.0, c.top2.0
+            )
         };
         failures.push(format!(
             "step {i}: candidate {cand_token} vs reference {ref_token}, {reason}"
+        ));
+    }
+
+    // Cap the total excused near-ties: each excuse is individually plausible, but
+    // fork calibration measured <= 4/64 tie-flips per fixture and observed
+    // legitimate runs top out at 6/64 (long-swa's 5 plus headroom) — a candidate
+    // that needs to excuse more than 1-in-8 steps is drifting, not riding oracle
+    // tie noise.
+    let excused_cap = std::cmp::max(2, n / 8);
+    if near_ties > excused_cap {
+        failures.push(format!(
+            "{near_ties} excused near-ties exceed the cap {excused_cap} (max(2, n/8) with n={n}): \
+             this many tie-flips is systematic drift, not tie noise"
         ));
     }
 
@@ -865,7 +998,9 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
     }
 
     match &reference.provenance {
-        Some(p) if p.moe_impl == "reference" => {}
+        // The oracle side additionally pins f32 attention compute
+        // (`LAGUNA_ATTN_F32=1`, parity-gate.ts referenceEnv()).
+        Some(p) if p.moe_impl == "reference" => check_attn_dtype(p, "reference-ppl.json", "f32")?,
         Some(p) => bail!(
             "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
              with the current `logits-dump` (--moe-impl reference --ppl ...)",
@@ -877,7 +1012,8 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
         ),
     }
     match &candidate.provenance {
-        Some(p) if p.moe_impl == "fused" => {}
+        // The ppl gate grades the SHIPPED path, which streams f16 attention weights.
+        Some(p) if p.moe_impl == "fused" => check_attn_dtype(p, "candidate-ppl.json", "f16")?,
         Some(p) => bail!(
             "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
              be the Fused runner. Regenerate it with the current `logits-dump` (--moe-impl fused --ppl ...)",
@@ -967,7 +1103,10 @@ fn ppl_parity() -> Result<()> {
 // loaders with synthetic in-memory / temp-file dumps. They MUST run in the plain
 // `cargo test --test parity` (no `--ignored`), unlike the model-fed gate tests.
 
-/// A `provenance` object with the given runner and otherwise-inert fields.
+/// A `provenance` object with the given runner and otherwise-inert fields. The
+/// attention dtype matches how the gate script produces each side: the
+/// Reference oracle runs under `LAGUNA_ATTN_F32=1` (f32), fused candidates run
+/// the shipped f16 default. Tests perturb the fields to hit rejection paths.
 fn prov(moe_impl: &str) -> Provenance {
     Provenance {
         moe_impl: moe_impl.to_string(),
@@ -975,6 +1114,7 @@ fn prov(moe_impl: &str) -> Provenance {
         mm_variant: "tensor".to_string(),
         no_mm_id: false,
         mm_min_seq: 32,
+        attn_dtype: Some(if moe_impl == "reference" { "f32" } else { "f16" }.to_string()),
     }
 }
 
@@ -1034,29 +1174,136 @@ fn greedy_gate_rejects_missing_provenance() {
 }
 
 #[test]
-fn greedy_near_tie_excuses_only_a_contender() {
-    // One reference step is a genuine near-tie (top1/top2 margin 0.2 < 0.5).
-    let build = |cand_top1: (u32, f32)| {
-        let prompt = vec![2u32];
-        let reference = GreedyDump {
-            kind: "greedy".to_string(),
-            prompt: prompt.clone(),
-            steps: vec![ref_step(10, (10, 5.0), (11, 4.8))],
-            provenance: Some(prov("reference")),
-        };
-        let candidate = GreedyDump {
-            kind: "replay".to_string(),
-            prompt,
-            steps: vec![cand_step(10, cand_top1, (10, 4.7))],
-            provenance: Some(prov("fused")),
-        };
-        greedy_compare(&reference, &candidate)
+fn greedy_gate_rejects_wrong_attn_dtype() {
+    // The decode gate grades the shipped f16 attention path; a candidate replay
+    // produced under LAGUNA_ATTN_F32=1 ran the legacy f32 path instead.
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().attn_dtype = Some("f32".to_string());
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("attn_dtype"), "unexpected error: {err}");
+    // The reference oracle pins f32 attention; an f16 reference moved the anchor.
+    let (mut r, c) = valid_pair();
+    r.provenance.as_mut().unwrap().attn_dtype = Some("f16".to_string());
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("attn_dtype"), "unexpected error: {err}");
+}
+
+#[test]
+fn greedy_gate_rejects_missing_attn_dtype() {
+    // A provenance without attn_dtype comes from a stale `logits-dump` binary
+    // predating the field — such dumps are otherwise indistinguishable from
+    // current ones, so both sides must fail closed.
+    let (mut r, c) = valid_pair();
+    r.provenance.as_mut().unwrap().attn_dtype = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().attn_dtype = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
+}
+
+/// A one-step reference/candidate pair for the near-tie excuse tests: the
+/// reference produced 10 with the given top-2 logit, the candidate (forced with
+/// 10) recorded the given top-1/top-2.
+fn one_step_pair(
+    ref_top2: (u32, f32),
+    cand_top1: (u32, f32),
+    cand_top2: (u32, f32),
+) -> Result<()> {
+    let prompt = vec![2u32];
+    let reference = GreedyDump {
+        kind: "greedy".to_string(),
+        prompt: prompt.clone(),
+        steps: vec![ref_step(10, (10, 5.0), ref_top2)],
+        provenance: Some(prov("reference")),
     };
-    // Candidate landed on the reference's OTHER contender (top-2 = 11): excused.
-    build((11, 4.9)).expect("a near-tie contender mismatch should be excused");
-    // Candidate landed on an arbitrary token (99) at the same near-tie: must fail.
-    let err = build((99, 4.9)).unwrap_err().to_string();
-    assert!(err.contains("not a reference contender"), "unexpected error: {err}");
+    let candidate = GreedyDump {
+        kind: "replay".to_string(),
+        prompt,
+        steps: vec![cand_step(10, cand_top1, cand_top2)],
+        provenance: Some(prov("fused")),
+    };
+    greedy_compare(&reference, &candidate)
+}
+
+#[test]
+fn greedy_near_tie_excuses_only_contender_overlap() {
+    // Reference near-tie (top1/top2 margin 0.2 < 0.5); candidate landed on the
+    // reference's OTHER contender (top-2 = 11): excused.
+    one_step_pair((11, 4.8), (11, 4.9), (12, 4.7))
+        .expect("a near-tie contender mismatch should be excused");
+    // Candidate picked an arbitrary token at the same near-tie, with no overlap
+    // in either direction (its own top-2 doesn't rank the reference token
+    // either): must fail.
+    let err = one_step_pair((11, 4.8), (99, 4.9), (98, 4.7)).unwrap_err().to_string();
+    assert!(err.contains("no contender overlap"), "unexpected error: {err}");
+}
+
+#[test]
+fn greedy_near_tie_excuses_reference_in_candidate_top2() {
+    // The widened clause: the candidate's pick (99) is outside the reference's
+    // stored top-2, but the candidate ranks the reference token #2 itself AND is
+    // flat on its own top-1/top-2 (margin 0.2 < 0.5). At a small reference
+    // margin the oracle's stored top-2 is not always the true contender set, so
+    // a tie that is flat on BOTH sides is tie noise: excused.
+    one_step_pair((11, 4.8), (99, 4.9), (10, 4.7))
+        .expect("reference token in the candidate's top-2 at a both-sides-flat near-tie should be excused");
+    // The same disagreement at a decisive reference margin (2.0 >= 0.5) is a
+    // real mismatch regardless of the candidate's ranking.
+    let err = one_step_pair((11, 3.0), (99, 4.9), (10, 4.7)).unwrap_err().to_string();
+    assert!(err.contains("margin"), "unexpected error: {err}");
+}
+
+#[test]
+fn greedy_near_tie_rejects_confident_wrong_pick() {
+    // Reference near-tie (margin 0.49 < 0.5) and the candidate ranks the
+    // reference token #2 — but its own top-1 is an unrelated token a decisive
+    // 5.0 logits clear of it. The reference-in-candidate-top-2 excuse covers
+    // ties that are flat on BOTH sides (the fork-calibrated case had candidate
+    // margin 0.068); a candidate that confidently promotes a non-contender is
+    // never fork-class tie noise and must fail.
+    let err = one_step_pair((11, 4.51), (99, 9.7), (10, 4.7)).unwrap_err().to_string();
+    assert!(err.contains("confidently picked a non-contender"), "unexpected error: {err}");
+    // The same contender geometry with the candidate also flat (margin 0.2)
+    // stays excused.
+    one_step_pair((11, 4.51), (99, 4.9), (10, 4.7))
+        .expect("a both-sides-flat near-tie should stay excused");
+}
+
+#[test]
+fn greedy_gate_caps_excused_near_ties() {
+    // Every mismatch here is individually excusable (reference margin 0.2 and
+    // the candidate picks the reference's #2 contender), but 4 excused of 24
+    // steps exceeds the max(2, n/8) = 3 cap: fork calibration measured <= 4/64
+    // tie-flips per fixture, so an engine flipping more than 1-in-8 steps is
+    // drifting, not riding oracle tie noise.
+    let n = 24;
+    let prompt = vec![2u32];
+    let mut ref_steps = Vec::new();
+    let mut cand_steps = Vec::new();
+    for i in 0..n {
+        ref_steps.push(ref_step(10, (10, 5.0), (11, 4.8)));
+        if i < 4 {
+            cand_steps.push(cand_step(10, (11, 4.9), (10, 4.7)));
+        } else {
+            cand_steps.push(cand_step(10, (10, 5.0), (11, 4.8)));
+        }
+    }
+    let reference = GreedyDump {
+        kind: "greedy".to_string(),
+        prompt: prompt.clone(),
+        steps: ref_steps,
+        provenance: Some(prov("reference")),
+    };
+    let candidate = GreedyDump {
+        kind: "replay".to_string(),
+        prompt,
+        steps: cand_steps,
+        provenance: Some(prov("fused")),
+    };
+    let err = greedy_compare(&reference, &candidate).unwrap_err().to_string();
+    assert!(err.contains("excused near-ties exceed the cap"), "unexpected error: {err}");
 }
 
 #[test]
@@ -1091,7 +1338,7 @@ fn load_greedy_dump_requires_per_step_scale_fields() {
     let dump = json!({
         "kind": "greedy",
         "tokens": [2, 3],
-        "provenance": { "moe_impl": "reference", "seq_len": 2, "mm_variant": "tensor", "no_mm_id": false, "mm_min_seq": 32 },
+        "provenance": { "moe_impl": "reference", "seq_len": 2, "mm_variant": "tensor", "no_mm_id": false, "mm_min_seq": 32, "attn_dtype": "f32" },
         "steps": [ { "token": 10, "top1": [10, 5.0], "top2": [11, 3.0], "nonfinite": 0 } ],
     });
     let p = dir.join("greedy.json");
@@ -1140,6 +1387,98 @@ fn compare_requires_reference_provenance() {
     // fused-vs-fused self-comparison would hide a regression).
     let err = compare(&candidate, &tiny_dump(Some(prov("fused"))), Tier::Strict).unwrap_err().to_string();
     assert!(err.contains("expected \"reference\""), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_requires_reference_attn_dtype() {
+    let candidate = tiny_dump(Some(prov("fused")));
+    // Reference regenerated WITHOUT LAGUNA_ATTN_F32 (f16 attention) → hard fail
+    // in every tier: the oracle pins f32 attention compute.
+    let mut f16_ref = prov("reference");
+    f16_ref.attn_dtype = Some("f16".to_string());
+    let err = compare(&candidate, &tiny_dump(Some(f16_ref)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("attn_dtype"), "unexpected error: {err}");
+    // Reference written by a stale `logits-dump` binary predating the field —
+    // otherwise indistinguishable from a current dump — must also hard-fail.
+    let mut stale_ref = prov("reference");
+    stale_ref.attn_dtype = None;
+    let err = compare(&candidate, &tiny_dump(Some(stale_ref)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_pins_candidate_attn_dtype_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // strict gates the legacy f32 attention path: an f16 candidate (the shipped
+    // default, i.e. LAGUNA_ATTN_F32 forgotten) must be rejected.
+    let err = compare(&tiny_dump(Some(prov("fused"))), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("attn_dtype"), "unexpected error: {err}");
+    // strict also requires candidate provenance at all (stale-binary dump).
+    let err = compare(&tiny_dump(None), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("no provenance"), "unexpected error: {err}");
+    // A candidate provenance missing only the attn_dtype field is equally stale.
+    let mut stale = prov("fused");
+    stale.attn_dtype = None;
+    let err = compare(&tiny_dump(Some(stale)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
+
+    // mm and decode gate the shipped f16 default: an f32 candidate ran the
+    // wrong path. (The mm candidate must be mm-active to reach the dtype check.)
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq;
+    p.attn_dtype = Some("f32".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("attn_dtype"), "unexpected error: {err}");
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("attn_dtype"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_strict_requires_fused_no_mm_id_candidate() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // A copied reference dump graded as its own candidate (moe_impl
+    // "reference", attn_dtype "f32" — exactly what strict's attn pin expects)
+    // would clear the strict thresholds vacuously: rejected.
+    let err = compare(&tiny_dump(Some(prov("reference"))), &reference, Tier::Strict)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("expected \"fused\""), "unexpected error: {err}");
+
+    // A fused candidate that ran WITHOUT LAGUNA_NO_MM_ID (no_mm_id false) took
+    // the mm_id path and belongs under the mm tier, not strict.
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("no_mm_id"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_mm_requires_mm_active_candidate() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // No candidate provenance at all (stale `logits-dump` binary): rejected.
+    let err = compare(&tiny_dump(None), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("requires candidate provenance"), "unexpected error: {err}");
+
+    // Fused candidate with LAGUNA_NO_MM_ID set (mm_id force-disabled — the
+    // classic fallback path): not an mm_id run, rejected.
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq;
+    p.no_mm_id = true;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("NOT active"), "unexpected error: {err}");
+
+    // Fused candidate whose prompt was below the mm_id seq threshold (a
+    // decode-style dump that ran mv_id): rejected. prov() defaults seq_len 2
+    // against mm_min_seq 32.
+    let err = compare(&tiny_dump(Some(prov("fused"))), &reference, Tier::Mm)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT active"), "unexpected error: {err}");
 }
 
 // --- Perplexity-gate rejection-path unit tests --------------------------------
@@ -1205,6 +1544,22 @@ fn ppl_gate_rejects_missing_provenance() {
     c.provenance = None;
     let err = ppl_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("no provenance"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_wrong_or_missing_attn_dtype() {
+    // The ppl gate grades the shipped f16 attention path; a candidate produced
+    // under LAGUNA_ATTN_F32=1 ran the legacy f32 path instead.
+    let (r, mut c) = valid_ppl_pair();
+    c.provenance.as_mut().unwrap().attn_dtype = Some("f32".to_string());
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("attn_dtype"), "unexpected error: {err}");
+    // A reference from a stale `logits-dump` binary predating the field must
+    // hard-fail (the oracle pins f32 attention; the field proves it).
+    let (mut r, c) = valid_ppl_pair();
+    r.provenance.as_mut().unwrap().attn_dtype = None;
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
 }
 
 #[test]

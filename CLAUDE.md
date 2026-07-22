@@ -115,6 +115,14 @@ trap documented here.
   f32 accumulate) — DEFAULT for q4_K/q6_K; `LAGUNA_MV_CLASSIC` reverts to
   candle's baked `kernel_mul_mv_id_*`/QMatMul. Perf-identical to candle
   (bandwidth-bound); kept to insulate decode from upstream candle changes.
+- Attention projections are our VENDORED mixed-dtype f16 kernels
+  (`src/ops/f16.metal`, own runtime-compiled library, no Metal-4 dep):
+  f16 weights × f32 activations → f32 out, f32 accum (ggml's
+  `mul_mv_f16_f32`/`mul_mm_f16_f32` convention; ggml's ne11 ≥ 8 mv/mm split).
+  candle CANNOT express this (its matmul requires same-dtype operands and
+  would round activations + outputs to f16 — measured 22x worse per block).
+  `LAGUNA_ATTN_F32` reverts to dequant-f32 QMatMul (the legacy path the strict
+  tier gates; reference dumps pin it via parity-gate's referenceEnv()).
 
 ## Verification workflow
 
@@ -174,34 +182,47 @@ trap documented here.
 
 ## Perf state (2026-07-22)
 
+POWER MODE CAVEAT: this machine runs in macOS Low Power Mode during dev
+sessions (owner's choice — high-perf mode = coil whine + fans). The low-power
+governor allows a ~1 s GPU burst then clamps ~1.7x (bandwidth ~540 → ~315
+GB/s), so all "ours" numbers below are low-power sustained figures; the fork
+column's power mode is unrecorded. Ratios/budget shares transfer across modes;
+absolute cross-mode comparisons do not (see docs/log.md phase-0 entry). Bench
+long enough to hit the plateau — first-second numbers are burst fiction.
+
 Warm steady-state, fused path, vs fork `llama-bench` on this machine:
 
 | | ours | fork |
 |---|---|---|
-| decode (512 ctx) | ~13.4 tok/s | 18.1 (tg128) |
-| prefill (925-tok chunk) | ~188 tok/s | 361 (pp512) |
-| prefill (4230-tok) | ~157 tok/s | 328 (pp4096) |
+| decode (630 ctx, 256-tok sustained, LPM) | ~18.2 tok/s | 18.1 (tg128, mode unknown) |
+| prefill (925-tok chunk) | ~174 tok/s | 361 (pp512) |
+| prefill (4230-tok) | ~150-160 tok/s | 328 (pp4096) |
 
 Prefill: the vendored two-pass mm_id kernel (tensor `matmul2d` default) took
-prefill ~60 → ~188 tok/s (3.1x). Decode: mv_id, unchanged (the rescale glue was
-removed from the default path — only the f16 mm_id prefill variants need it).
-Decode audit is clean: one CPU↔GPU sync/token, routing on-GPU, no per-token
-contiguous copies (the q/k/v/out transpose-contiguous copies are metadata
-reshapes at seq==1). Bandwidth ceiling ≈ 95 tok/s.
+prefill ~60 → ~188 tok/s (3.1x; ~174 re-measured 2026-07-22 in LPM). Decode:
+11.7 → 18.2 tok/s (2026-07-22) via **f16 attention weights + vendored
+mixed-dtype matmul kernels** (`src/ops/f16.metal`: f16 weights × f32
+activations → f32 out, f32 accum — ggml's convention; the only f16 rounding is
+the stored weights, so numerics match the legacy f32 path: prefill gemm is
+bit-identical by MMA determinism, decode gemv differs in ulps). `LAGUNA_ATTN_F32`
+(presence-based, load-time) reverts to the legacy dequant-f32 QMatMul path —
+the strict parity tier gates that path; reference-oracle dumps pin it. The
+per-token budget and how it was measured (sustained-vs-boost clocks, LPM
+caveat above) live in docs/log.md's phase-0 entry; death-by-dispatch was
+REFUTED — attention was ~80% weight-streaming, now halved.
+One CPU↔GPU sync/token, routing on-GPU, transpose-contiguous copies are
+metadata reshapes at seq==1.
 
-Known remaining gaps (see TODO.md for numbers):
-- **Prefill (188 vs fork 361)**: the mm itself is 2 dispatches (map0 + matmul2d)
-  and well-amortized; the gap is the ~50 surrounding candle dispatches per
-  MoE+attention layer (route, L2 rescale glue, silu*mul, combine, shared expert,
-  attention chain) that ggml fuses, plus candle per-op overhead — NOT the matmul.
-- **Decode (13.4 vs fork 18.1)**: death-by-dispatch in attention — of 76.9
-  ms/token, attention (48 layers) is 50.9 ms but its sdpa core is only 2.3 ms;
-  the ~24 non-sdpa dispatches/layer (q/k/v/g projections, QK-norm, rope, f16
-  casts, softplus gate, o_proj) dominate. lm_head is ~6.5 ms (candle's Q6_K mv
-  geometry runs ~15x under bandwidth). Levers: fuse the attention per-layer
-  chain (bit-identical-to-candle, else it cascades through the MoE router);
-  vendor ggml's mv N_R0/N_SG geometry for lm_head + the routed gather.
+Known remaining gaps (see TODO.md priority list for the plan):
+- **Prefill (~174 vs fork 361)**: surrounding candle dispatches per MoE+attn
+  layer (route, silu*mul, combine, shared expert) that ggml fuses, plus candle
+  per-op overhead — NOT the matmul. P2: fuse route+glue+combine into the owned
+  kernels.
+- **Decode (18.2 vs fork 18.1, modes possibly unequal)**: remaining levers are
+  the MoE mv_id gather (~14 ms sustained vs ~7 ms bandwidth floor), attention
+  glue fusion (~6 ms sustained), then DFlash.
 - `LAGUNA_BENCH` env var enables a warm-up forward for steady-state timing.
+  Bench ≥ 256 decode tokens — sub-second runs report boost-clock fiction.
 
 ## DFlash (deferred, designed-for)
 
