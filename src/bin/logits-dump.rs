@@ -62,8 +62,10 @@ struct Cli {
     /// Token ids: comma- or space-separated, brackets optional, so the output
     /// of `llama-tokenize --ids` or the token echo of `llama-eval-callback`
     /// can be pasted straight through (e.g. "[2, 1288, 40]" or "2 1288 40").
+    /// Required except in `--replay` mode, where the prompt is taken from the
+    /// greedy dump being replayed.
     #[arg(short, long)]
-    tokens: String,
+    tokens: Option<String>,
 
     /// Optional prompt text, recorded in the dump for provenance only (this
     /// tool never tokenizes — feed ids via --tokens so both sides agree).
@@ -73,6 +75,21 @@ struct Cli {
     /// Also capture the per-layer intermediate taps (the fork cb() names).
     #[arg(long)]
     taps: bool,
+
+    /// Decode-parity gate, reference side: after prefill, free-run greedy decode
+    /// N tokens (argmax over logits, no sampling) and emit a `kind:"greedy"`
+    /// dump. Never stops early on EOG — always emits exactly N steps so the gate
+    /// can compare equal-length sequences. Ignores --taps.
+    #[arg(long, value_name = "N")]
+    greedy: Option<usize>,
+
+    /// Decode-parity gate, candidate side: load a `kind:"greedy"` dump, prefill
+    /// its prompt, then teacher-force its step tokens one at a time — recording
+    /// THIS runner's own argmax (top-1/top-2) at each step BEFORE forcing the
+    /// reference token. Emits a `kind:"replay"` dump. The prompt comes from the
+    /// dump, so --tokens is not needed (and is ignored if given).
+    #[arg(long, value_name = "GREEDY_DUMP")]
+    replay: Option<PathBuf>,
 
     /// Expert FFN implementation: "reference" (correctness oracle) or "fused".
     #[arg(long, default_value = "reference")]
@@ -151,25 +168,85 @@ fn tap_value(name: &str, t: &Tensor) -> Result<Value> {
     }))
 }
 
+/// (top-1, top-2) as (token id, logit) pairs. Argmax is `top2(..).0.0`.
+/// Caller guarantees `logits.len() >= 2` (checked once against `vocab` in `main`).
+fn top2(logits: &[f32]) -> ((u32, f32), (u32, f32)) {
+    let t = topk(logits, 2);
+    (t[0], t[1])
+}
+
+/// (L2 norm in f64, count of non-finite entries) over a full logit vector. The
+/// greedy/replay dumps carry no full logits, so these per-step scalars are the
+/// only scale/finiteness signal the decode gate has. Non-finite entries are
+/// excluded from the norm (so `l2` stays finite and usable) and reported
+/// separately via the count.
+fn logit_scale(logits: &[f32]) -> (f64, u64) {
+    let mut sumsq = 0.0f64;
+    let mut nonfinite = 0u64;
+    for &x in logits {
+        if x.is_finite() {
+            sumsq += x as f64 * x as f64;
+        } else {
+            nonfinite += 1;
+        }
+    }
+    (sumsq.sqrt(), nonfinite)
+}
+
+/// Read a forward's last-position logits back to a host `Vec<f32>`.
+fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
+    Ok(t.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?)
+}
+
+/// Records HOW a dump was produced so the parity gate can validate the tier it is
+/// graded under (a decode/mv_id candidate graded under the loose mm tier would
+/// mask a regression). `seq_len` is the prefill length; `mm_min_seq` /
+/// `mm_variant` / `no_mm_id` are the fused-MoE kernel-selection state, so
+/// "mm_id path active" is derivable as `moe_impl == "fused" && seq_len >=
+/// mm_min_seq && !no_mm_id`. Additive: readers that ignore it still parse older/newer
+/// dumps.
+fn provenance(moe_impl: &str, seq_len: usize) -> Value {
+    json!({
+        "moe_impl": moe_impl,
+        "seq_len": seq_len,
+        "mm_variant": laguna::ops::active_mm_variant_name(),
+        "no_mm_id": laguna::ops::no_mm_id_forced(),
+        "mm_min_seq": laguna::ops::MM_ID_MIN_SEQ,
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tokens = parse_tokens(&cli.tokens)?;
-    anyhow::ensure!(!tokens.is_empty(), "no token ids parsed from --tokens");
     let runner = expert_runner(&cli.moe_impl)?;
 
     let device = gguf::metal_device()?;
     let gguf = gguf::open(&cli.model, &device)?;
     let cfg = LagunaConfig::from_gguf(&gguf.content)?;
     let vocab = cfg.vocab;
+    // `top2` (used by the greedy/replay decode dumps) indexes the top-2 logits;
+    // a degenerate vocab would panic there. Fail with a clear error instead.
+    anyhow::ensure!(vocab >= 2, "vocab {vocab} < 2: cannot form a top-2 for the parity dumps");
+    let model = LagunaModel::load(gguf, runner, cli.max_ctx)?;
 
-    let mut model = LagunaModel::load(gguf, runner, cli.max_ctx)?;
+    match (cli.greedy, &cli.replay) {
+        (Some(_), Some(_)) => anyhow::bail!("--greedy and --replay are mutually exclusive"),
+        (Some(n), None) => run_greedy(&cli, model, &device, vocab, n),
+        (None, Some(path)) => run_replay(&cli, model, &device, vocab, &path.clone()),
+        (None, None) => run_single(&cli, model, &device, vocab),
+    }
+}
+
+/// Default mode: one forward pass, dump the full last-position logits + taps.
+fn run_single(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize) -> Result<()> {
+    let tokens = parse_tokens(cli.tokens.as_deref().context("--tokens is required")?)?;
+    anyhow::ensure!(!tokens.is_empty(), "no token ids parsed from --tokens");
     if cli.taps {
         model.set_tap_capture(true);
     }
 
-    let input = Tensor::new(tokens.as_slice(), &device)?;
+    let input = Tensor::new(tokens.as_slice(), device)?;
     let logits_t = model.forward(&input, 0)?;
-    let logits = logits_t.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let logits = logits_to_host(&logits_t)?;
 
     let top5 = topk(&logits, 5);
     let top1 = top5.first().map(|&(id, _)| id).unwrap_or(0);
@@ -185,6 +262,7 @@ fn main() -> Result<()> {
         "model": cli.model.display().to_string(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
+        "provenance": provenance(&cli.moe_impl, tokens.len()),
         "tokens": tokens,
         "n_tokens": tokens.len(),
         "vocab": vocab,
@@ -203,6 +281,140 @@ fn main() -> Result<()> {
         vocab,
         taps.len(),
         top1
+    );
+    Ok(())
+}
+
+/// Prefill `prompt` in one forward at position 0 and return the last-position
+/// logits plus the next decode position. Mirrors `run_single`'s single-shot
+/// prefill so the first decode step sees the same logits the strict gate does.
+fn prefill(model: &mut LagunaModel, device: &Device, prompt: &[u32]) -> Result<(Vec<f32>, usize)> {
+    anyhow::ensure!(!prompt.is_empty(), "empty prompt");
+    let input = Tensor::new(prompt, device)?;
+    let logits = logits_to_host(&model.forward(&input, 0)?)?;
+    Ok((logits, prompt.len()))
+}
+
+/// `--greedy N`: free-run greedy decode, recording at each step the token
+/// produced (argmax) and the top-1/top-2 of the logits that produced it. Runs
+/// the full N steps regardless of EOG so the gate compares equal lengths.
+fn run_greedy(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, n: usize) -> Result<()> {
+    let tokens = parse_tokens(cli.tokens.as_deref().context("--tokens is required for --greedy")?)?;
+    let (mut logits, mut pos) = prefill(&mut model, device, &tokens)?;
+
+    let mut steps: Vec<Value> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (t1, t2) = top2(&logits);
+        let token = t1.0;
+        let (l2, nonfinite) = logit_scale(&logits);
+        steps.push(json!({
+            "token": token,
+            "top1": [t1.0, t1.1],
+            "top2": [t2.0, t2.1],
+            "l2": l2,
+            "nonfinite": nonfinite,
+        }));
+        // Skip the trailing forward: the logits after the last emitted token are
+        // never inspected.
+        if i + 1 < n {
+            let input = Tensor::new(&[token], device)?;
+            logits = logits_to_host(&model.forward(&input, pos)?)?;
+            pos += 1;
+        }
+    }
+
+    let dump = json!({
+        "kind": "greedy",
+        "model": cli.model.display().to_string(),
+        "prompt": cli.prompt,
+        "moe_impl": cli.moe_impl,
+        "provenance": provenance(&cli.moe_impl, tokens.len()),
+        "tokens": tokens,
+        "n_tokens": tokens.len(),
+        "vocab": vocab,
+        "steps": steps,
+    });
+    std::fs::write(&cli.output, serde_json::to_string(&dump)?)
+        .with_context(|| format!("writing {}", cli.output.display()))?;
+    eprintln!(
+        "wrote {} (greedy, {} prompt tokens, {} steps, runner {})",
+        cli.output.display(),
+        tokens.len(),
+        n,
+        cli.moe_impl
+    );
+    Ok(())
+}
+
+/// `--replay <greedy-dump>`: teacher-force the dump's step tokens, recording at
+/// each step THIS runner's own argmax (top-1/top-2) BEFORE forcing the
+/// reference token. The prompt is the greedy dump's prompt.
+fn run_replay(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, dump_path: &std::path::Path) -> Result<()> {
+    let text = std::fs::read_to_string(dump_path)
+        .with_context(|| format!("reading greedy dump {}", dump_path.display()))?;
+    let ref_dump: Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing greedy dump {}", dump_path.display()))?;
+    anyhow::ensure!(
+        ref_dump["kind"].as_str() == Some("greedy"),
+        "--replay expects a kind:\"greedy\" dump, got kind={:?}",
+        ref_dump["kind"]
+    );
+
+    let prompt: Vec<u32> = ref_dump["tokens"]
+        .as_array()
+        .context("greedy dump missing `tokens`")?
+        .iter()
+        .map(|x| {
+            let n = x.as_u64().context("non-integer prompt token")?;
+            u32::try_from(n).with_context(|| format!("prompt token {n} exceeds u32"))
+        })
+        .collect::<Result<_>>()?;
+    let ref_steps = ref_dump["steps"].as_array().context("greedy dump missing `steps`")?;
+
+    let (mut logits, mut pos) = prefill(&mut model, device, &prompt)?;
+
+    let mut steps: Vec<Value> = Vec::with_capacity(ref_steps.len());
+    for (i, step) in ref_steps.iter().enumerate() {
+        let forced_raw = step["token"].as_u64().with_context(|| format!("step {i} missing `token`"))?;
+        let forced = u32::try_from(forced_raw).with_context(|| format!("step {i} token {forced_raw} exceeds u32"))?;
+        let (t1, t2) = top2(&logits);
+        let (l2, nonfinite) = logit_scale(&logits);
+        steps.push(json!({
+            "top1": [t1.0, t1.1],
+            "top2": [t2.0, t2.1],
+            "forced_token": forced,
+            "l2": l2,
+            "nonfinite": nonfinite,
+        }));
+        // Force the reference token to keep the two sequences aligned. The
+        // trailing force is still executed only when another step follows.
+        if i + 1 < ref_steps.len() {
+            let input = Tensor::new(&[forced], device)?;
+            logits = logits_to_host(&model.forward(&input, pos)?)?;
+            pos += 1;
+        }
+    }
+
+    let dump = json!({
+        "kind": "replay",
+        "model": cli.model.display().to_string(),
+        "prompt": cli.prompt,
+        "moe_impl": cli.moe_impl,
+        "provenance": provenance(&cli.moe_impl, prompt.len()),
+        "tokens": prompt,
+        "n_tokens": prompt.len(),
+        "vocab": vocab,
+        "steps": steps,
+    });
+    std::fs::write(&cli.output, serde_json::to_string(&dump)?)
+        .with_context(|| format!("writing {}", cli.output.display()))?;
+    eprintln!(
+        "wrote {} (replay of {}, {} prompt tokens, {} steps, runner {})",
+        cli.output.display(),
+        dump_path.display(),
+        prompt.len(),
+        ref_steps.len(),
+        cli.moe_impl
     );
     Ok(())
 }

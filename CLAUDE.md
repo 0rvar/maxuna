@@ -71,11 +71,14 @@ trap documented here.
 ## The candle situation
 
 - Pinned by git rev `27f20fea…` in Cargo.toml (same rev as ../offload). The pin
-  freezes: the `kernel_mul_mv_id_*`/`kernel_mul_mm_id_*` Metal kernels (present
-  in candle's metallib with ZERO upstream Rust wiring — src/ops/ is our host
+  freezes: the baked `kernel_mul_mv_id_*` Metal kernels (decode path — present in
+  candle's metallib with ZERO upstream Rust wiring; src/ops/ is our host
   dispatch; candle's own FusedMoeGGUF/indexed_moe_forward PANIC on non-CUDA),
-  plus the public QStorage/MetalDevice surface ops relies on. Do not bump the
-  rev casually; re-verify those kernels and APIs if you do.
+  plus the public QStorage/MetalDevice/`new_library_with_source` surface both the
+  host dispatch and our vendored prefill kernels rely on. (candle's baked
+  `kernel_mul_mm_id_*` is NO LONGER used — prefill is our vendored two-pass
+  kernel; see below.) Do not bump the rev casually; re-verify those kernels and
+  APIs if you do.
 - Zero-copy invariant (gguf.rs `expert_stack`): the stacked expert tensor is
   uploaded ONCE via `QStorage::from_data`; the Buffer handle is cloned (objc
   retain) BEFORE the storage moves into `QTensor::new`, so ExpertStack.buffer
@@ -85,9 +88,22 @@ trap documented here.
 - `candle_metal_kernels::metal::Buffer` is the nameable buffer type; MTLSize is
   built via candle's `get_block_dims` factory. objc2-metal was deliberately NOT
   added (candle pins 0.3.2; a mismatched dep is a trap).
-- mm_id (prefill matmul) has a threadgroup-memory ceiling: `top_k × tokens ≤
-  6144` per dispatch (chunk 512 × top_k 10 = 5120 OK). mm_id accumulates in
-  half-precision tiles (~2e-4 rel); mv_id in f32 (~2e-7).
+- Prefill mm_id is now our VENDORED two-pass kernel (`src/ops/mm_id.metal`,
+  runtime-compiled via `src/ops/pipelines.rs` with `new_library_with_source`),
+  NOT candle's baked `kernel_mul_mm_id_*` (unusable at 256 experts — see Perf
+  state). map0 builds per-expert compacted token-slot lists + counts; mm reads
+  them so each expert's threadgroups cover only its rows. No `top_k × tokens`
+  threadgroup cap (the row map lives in device scratch appended to the dst
+  buffer, not smem). Runtime-selectable variants via `ops::MmVariant` (cached
+  env): tensor f16 tiles (`_t`, DEFAULT — Metal-4 `matmul2d`, ~2e-4 rel, needs
+  the L2 rescale guard); tensor f32 tiles (`_t_hp`, `LAGUNA_MM_ID_TENSOR_HP`,
+  ~2e-7 but slower); classic simdgroup f32 (`_hp`, `LAGUNA_MM_ID_CLASSIC`);
+  classic simdgroup f16 (`LAGUNA_MM_ID_F16`). `LAGUNA_NO_MM_ID` forces mv_id
+  everywhere. mm_id.metal unconditionally includes `<metal_tensor>` +
+  MetalPerformancePrimitives, so the whole library requires Metal-4 tensor
+  support to compile (fine per the M5-only mandate; the `tensor_matmul2d_probe`
+  test guards it). Decode stays on candle's baked `kernel_mul_mv_id_*` (f32
+  activations + f32 accumulate, ~2e-7 rel).
 
 ## Verification workflow
 
@@ -95,12 +111,18 @@ trap documented here.
   `tests/fixtures/parity-prompts.json` (code-short 58 / text-mixed 82 /
   long-swa 609 — the last exercises SWA-ring wraparound).
 - Pass criteria philosophy (learned in WP8): the Track B full-logit gate is the
-  real gate, and it is now TWO-TIER by expert kernel (see docs/parity.md §3b):
-  mv_id/decode holds the strict cos ≥ 0.999 + top-1 + top-5 ≥ 4/5; the tiled
-  mm_id prefill default holds a fork-equivalence gate (cos ≥ 0.995, top-5 ≥ 4/5,
-  top-1 matches or a reference near-tie < 0.5 logit) because its f32 tile
-  accumulation order drifts from the per-row oracle just as the fork's does.
-  Track A vs
+  real gate, and it is now THREE-TIER by change kind (`LAGUNA_PARITY_TIER`, see
+  docs/parity.md §3b): **strict** (mv_id/decode legacy full-logit) holds cos ≥
+  0.999 + top-1 + top-5 ≥ 4/5; **mm** (tiled mm_id prefill default) holds a
+  fork-equivalence gate (cos ≥ 0.995, top-5 ≥ 4/5, top-1 matches or a reference
+  near-tie < 0.5 logit) because its f32 tile accumulation order drifts from the
+  per-row oracle just as the fork's does; **decode** (decode-kernel changes)
+  can't use full-logit cosine at all — every remaining decode lever reorders f32
+  accumulation and strict passes at 0.999057 with zero headroom — so cosine is
+  DIAGNOSTIC-ONLY and the gate is greedy agreement vs the Reference oracle under
+  teacher-forced replay (`greedy_parity`: candidate argmax == reference token,
+  mismatches excused only at reference near-ties < 0.5 logit), plus a proposed
+  perplexity-delta bound (not yet implemented). Track A vs
   llama-eval-callback: judge by divergence CLIFF, not absolute thresholds —
   smooth drift to ~0.2 sampled rel-L2 by layer 47 is normal cross-kernel Q4
   noise. Greedy: divergences acceptable only at near-ties, gap < 0.15 logit
@@ -132,31 +154,35 @@ trap documented here.
 - The first forward folds in the one-time Metal weight upload — never report
   first-forward prefill numbers as steady-state.
 
-## Perf state (v1 final, 2026-07-21)
+## Perf state (2026-07-22)
 
 Warm steady-state, fused path, vs fork `llama-bench` on this machine:
 
-| | ours | fork | ratio |
-|---|---|---|---|
-| decode (512 ctx) | 13.0 tok/s | 18.1 (tg128) | 72% |
-| decode (4096 ctx) | 12.5 tok/s | — | |
-| prefill (512) | ~60 tok/s | 361 (pp512) | 17% |
-| prefill (4096) | ~59 tok/s | 328 (pp4096) | 18% |
+| | ours | fork |
+|---|---|---|
+| decode (512 ctx) | ~13.4 tok/s | 18.1 (tg128) |
+| prefill (925-tok chunk) | ~188 tok/s | 361 (pp512) |
+| prefill (4230-tok) | ~157 tok/s | 328 (pp4096) |
 
-Decode audit is clean: exactly one CPU↔GPU sync/token, routing on-GPU, no
-per-token contiguous copies, compute-per-buffer sweep flat (GPU-work bound).
-Bandwidth ceiling ≈ 95 tok/s.
+Prefill: the vendored two-pass mm_id kernel (tensor `matmul2d` default) took
+prefill ~60 → ~188 tok/s (3.1x). Decode: mv_id, unchanged (the rescale glue was
+removed from the default path — only the f16 mm_id prefill variants need it).
+Decode audit is clean: one CPU↔GPU sync/token, routing on-GPU, no per-token
+contiguous copies (the q/k/v/out transpose-contiguous copies are metadata
+reshapes at seq==1). Bandwidth ceiling ≈ 95 tok/s.
 
-Known remaining gaps (all kernel-level; see TODO.md):
-- **Prefill: candle's `kernel_mul_mm_id` is unusable at 256 experts** — every
-  threadgroup re-scans the ids buffer and the grid is sized for the worst case;
-  measured 2.2 tok/s naive, 29 tok/s with a grid fix (still < mv_id's 60, and
-  the fix dropped outputs). Prefill therefore uses per-token mv_id. Proper fix
-  is ggml's two-pass token→expert row-map kernel. Attempts were REVERTED —
-  dispatch.rs is the clean mv_id-geometry version.
-- Decode: mv_id occupancy at batch=1; gate/up dispatched as two kernels (fork
-  fuses them); ~8 elementwise dispatches/layer of parity-critical f16-overflow
-  rescale glue in the fused MoE path.
+Known remaining gaps (see TODO.md for numbers):
+- **Prefill (188 vs fork 361)**: the mm itself is 2 dispatches (map0 + matmul2d)
+  and well-amortized; the gap is the ~50 surrounding candle dispatches per
+  MoE+attention layer (route, L2 rescale glue, silu*mul, combine, shared expert,
+  attention chain) that ggml fuses, plus candle per-op overhead — NOT the matmul.
+- **Decode (13.4 vs fork 18.1)**: death-by-dispatch in attention — of 76.9
+  ms/token, attention (48 layers) is 50.9 ms but its sdpa core is only 2.3 ms;
+  the ~24 non-sdpa dispatches/layer (q/k/v/g projections, QK-norm, rope, f16
+  casts, softplus gate, o_proj) dominate. lm_head is ~6.5 ms (candle's Q6_K mv
+  geometry runs ~15x under bandwidth). Levers: fuse the attention per-layer
+  chain (bit-identical-to-candle, else it cascades through the MoE router);
+  vendor ggml's mv N_R0/N_SG geometry for lm_head + the routed gather.
 - `LAGUNA_BENCH` env var enables a warm-up forward for steady-state timing.
 
 ## DFlash (deferred, designed-for)

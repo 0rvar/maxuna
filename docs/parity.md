@@ -217,6 +217,62 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   (the f16 tiles land within ~2e-4 of the f32 default at model scale, the residual
   is the tiling itself), and the fork's own tensor-path prefill fails the strict
   0.999 gate the same way.
+- **decode-kernel changes (`LAGUNA_PARITY_TIER=decode`)** — full-logit cosine is
+  a *reported diagnostic, not a gate*. Every remaining decode lever (fusing the
+  attention chain, vendoring ggml's mv geometry) reorders f32 accumulation, and
+  the strict tier passes at cosine 0.999057 with essentially zero headroom, so no
+  such change can ever clear a 0.999 cosine even when it is correct. The gate for
+  decode-kernel work is instead **greedy agreement vs the frozen Reference oracle
+  under teacher-forced replay** (`greedy_parity`, below), plus a *proposed*
+  perplexity-delta bound (see "Perplexity gate", not yet implemented). Under the
+  decode tier `logit_parity` still hard-fails on input-token / logit-length
+  mismatch (a diagnostic on mismatched inputs is meaningless) but only *prints*
+  cosine / top-1 / top-5.
+
+  **Scale-sensitive hard checks (all tiers).** Cosine, top-1, and top-5 overlap
+  are all scale-INVARIANT — a candidate that is a uniform rescale of the reference
+  (`candidate = c · reference`) sails through them at cosine 1.0, and a NaN slips
+  past (`NaN < cos_min` is false). The decode tier's greedy gate is likewise
+  scale-invariant (it compares argmax). So `compare` adds two hard failures in
+  EVERY tier: (1) any non-finite candidate logit (or non-finite computed metric)
+  fails; (2) the candidate/reference L2-norm ratio must lie in
+  `[1/NORM_RATIO_MAX, NORM_RATIO_MAX]`. `NORM_RATIO_MAX` is `1.18`: measured across
+  every same-prompt dump pair in the parity dir (2026-07-22 — the code-short
+  mv_id/mm_id/strict configs), the worst norm ratio vs `reference.json` was
+  `1.0178` (a 1.78% drift; `ew_strict` 0.9907 on the low side), so ~10× headroom
+  over the 1.78% drift gives 1.18 (floor 1.05). This is a coarse guard against a
+  gross scale/NaN bug, not a precision gate — cosine/top-1 handle precision. The
+  proposed perplexity gate would be the other scale-sensitive layer for decode.
+
+  **Dump provenance + the mm tier.** The tier is caller-selected (`LAGUNA_PARITY_TIER`)
+  with no cross-check against how the dump was produced, so a decode/mv_id candidate
+  graded under the looser mm tier would mask a regression the strict tier would catch.
+  Every dump `logits-dump` writes now carries a `provenance` object (moe_impl, prefill
+  `seq_len`, active `mm_variant`, `no_mm_id`, and `mm_min_seq` = the seq threshold, all
+  from a single source in `src/ops`). Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE dump
+  must carry provenance proving the mm_id path was actually active — `moe_impl == "fused"`,
+  `seq_len >= mm_min_seq`, `no_mm_id == false` — else the gate hard-fails asking you to
+  regenerate the dump. The strict and decode tiers add no *candidate* provenance requirement
+  (strict over-rejects mm output, which is safe). **The reference side now requires provenance
+  in every tier**: `reference.json`'s `provenance.moe_impl` must be `"reference"`, or `compare`
+  hard-fails (a `reference.json` accidentally produced with `--moe-impl fused` would otherwise
+  make every tier a fused-vs-fused self-comparison that hides a regression). This is fail-closed
+  with no legacy exception, so **a long-lived `reference.json` that predates the provenance field
+  must be regenerated once with the current `logits-dump`** (`--moe-impl reference`) before the
+  gate will run.
+
+  **Why forced replay, not free-run.** Comparing two free-running greedy decodes
+  cascades at the first near-tie: the moment the two engines pick different
+  tokens their histories diverge and every subsequent position is incomparable
+  (WP8's long-swa free-run agreed for 9 post-prompt tokens, then split on a
+  0.079-logit near-tie and was uncomparable thereafter). Teacher-forcing keeps
+  every step comparable: the Reference runner free-runs greedy N tokens
+  (`--greedy N`, the reference dump), then the candidate (Fused runner) is forced
+  along that exact token sequence (`--replay`), recording its OWN argmax at each
+  step before being forced. A step passes when the candidate's argmax equals the
+  reference token; a mismatch is excused only when the *Reference's own*
+  top-1/top-2 margin at that step is `< 0.5` logit (same NEAR_TIE_MARGIN rule as
+  the mm tier — which token wins a sub-0.5 oracle tie is noise).
 
 Calibration (code-short fixture, 2026-07-22, full-logit vs the f32 `Reference`):
 
@@ -240,7 +296,64 @@ exact expert config so the near-identical numbers are distinguishable:
 On code-short the model genuinely can't separate 350 from 268 (0.319-logit
 reference margin), so the mm-tier top-1 there is unconstrained (268 and 350 both
 pass); mixed-text and long-text are decisive 350 and the default matches.
-`LAGUNA_MM_ID_F16=1` selects f16 tiles for A/B.
+
+The mm_id variant env toggles (`LAGUNA_MM_ID_F16` → f16 classic tiles;
+`LAGUNA_MM_ID_CLASSIC` → f32 classic `_hp`; `LAGUNA_MM_ID_TENSOR_HP` → f32 tensor
+`_t_hp`; `LAGUNA_NO_MM_ID` → force mv_id everywhere) are all **presence-based**:
+they are enabled by the variable merely being SET, whatever its value —
+`LAGUNA_MM_ID_F16=0` still selects f16 tiles. To disable one, UNSET it (do not set
+it to `0`). The candidate dump's `provenance.mm_variant` / `provenance.no_mm_id`
+record which path actually ran, and the mm tier hard-fails a candidate whose
+provenance shows the mm_id path was not active (see 3b provenance note below).
+
+**3c. Decode gate — greedy agreement (forced replay).** For decode-kernel
+changes (see §3b's decode tier). Two dumps per fixture, produced STRICTLY SERIAL
+(one 75GB model process at a time — `pgrep -fl "laguna|llama"` first). Default
+N = 64 decode steps per fixture; run all three fixtures. Use the `tokens` array
+from `tests/fixtures/parity-prompts.json` for `--tokens`.
+
+Note `--greedy N` records N steps but only invokes the decode kernel N−1 times:
+step 0's logits come from the prefill forward, and each subsequent step runs one
+decode forward. So **N must be ≥ 2 to exercise the decode kernel at all** (N = 1
+grades only prefill). The gate now also enforces, per side, runner provenance
+(the reference dump must be `moe_impl == "reference"`, the candidate replay must
+be `moe_impl == "fused"` — a forgotten `--moe-impl fused` on the candidate would
+otherwise self-compare the oracle and pass vacuously) and, per step, finiteness
+(no non-finite logits) plus a candidate/reference L2-norm ratio bound (the same
+`NORM_RATIO_MAX` = 1.18 as the full-logit gate — greedy argmax is scale-invariant,
+so a uniform rescale would agree on every token yet be wrong). Both require the
+`l2`/`nonfinite` per-step fields the current `logits-dump` writes; an older dump
+missing them is a hard fail (regenerate).
+
+```bash
+DIR=/tmp/decode-code-short
+mkdir -p "$DIR"
+TOKENS="2,1172,36668,..."   # the fixture's `tokens` array
+
+# reference side: Reference oracle, free-run greedy 64 tokens
+cargo run --release --bin logits-dump -- \
+  --model models/laguna-s-2.1-Q4_K_M.gguf \
+  --moe-impl reference --tokens "$TOKENS" --greedy 64 \
+  --output "$DIR/reference-greedy.json"
+
+# candidate side: Fused runner, teacher-forced along the reference dump
+cargo run --release --bin logits-dump -- \
+  --model models/laguna-s-2.1-Q4_K_M.gguf \
+  --moe-impl fused --replay "$DIR/reference-greedy.json" \
+  --output "$DIR/candidate-greedy.json"
+
+# run the gate (reads reference-greedy.json + candidate-greedy.json from $DIR)
+LAGUNA_PARITY_DIR="$DIR" LAGUNA_PARITY_TIER=decode \
+  cargo test --test parity greedy_parity -- --ignored --nocapture
+```
+
+`--replay` takes the prompt from the reference dump, so `--tokens` is not needed
+on the candidate side. `greedy_parity` prints a summary line (total steps,
+agreements, excused near-ties, non-excused mismatches) and fails on any
+non-excused mismatch, listing the step index, both tokens, and the reference
+margin. (`LAGUNA_PARITY_TIER=decode` is not read by `greedy_parity` itself; set
+it when running `logit_parity` for the diagnostic-only cosine report on the same
+dumps.)
 
 ## Pass criteria
 
@@ -257,10 +370,21 @@ pass); mixed-text and long-text are decisive 350 and the default matches.
   the Reference's top-1/top-2 margin is `< 0.5` logit — near-tie). Both tiers
   require identical input ids. The `logit_parity` test selects the tier via
   `LAGUNA_PARITY_TIER=strict|mm` (default `strict`).
-- Greedy: sequences must agree except at near-ties. A divergence is acceptable
-  when the logit gap between the two candidate tokens at the divergence point is
-  `< 0.15` — the empirical Q4_K_M cross-kernel noise floor is ~0.1 logit, so
-  demanding tighter (the original 1e-3) fails correct engines.
+- Decode-kernel changes: the gate is **greedy agreement vs the Reference oracle
+  under forced replay** (`greedy_parity`, §3c), across all three fixtures. Each
+  step passes when the candidate's argmax equals the reference token; a mismatch
+  is excused only at a reference near-tie (the Reference's own top-1/top-2 margin
+  at that step `< 0.5` logit — the same NEAR_TIE_MARGIN rule as the mm tier). Any
+  non-excused mismatch fails. The full-logit cosine is reported (via
+  `LAGUNA_PARITY_TIER=decode logit_parity`) but NOT gated — the strict 0.999
+  cosine passes with zero headroom and can't accept accumulation-reordering
+  decode changes. A perplexity-delta bound is proposed to complement this (see
+  below), not yet implemented.
+- Greedy vs the FORK (Track A style, distinct from the Reference-oracle decode
+  gate above): sequences must agree except at near-ties. A divergence is
+  acceptable when the logit gap between the two candidate tokens at the
+  divergence point is `< 0.15` — the empirical Q4_K_M cross-kernel noise floor is
+  ~0.1 logit, so demanding tighter (the original 1e-3) fails correct engines.
   (WP8 baseline, 2026-07-21: code-short agreed 107 tokens then split on a 0.015
   gap; text-mixed 16 tokens / 0.0053; long-swa 9 post-609-prompt tokens / 0.079.)
 
@@ -277,6 +401,33 @@ curl -s localhost:8080/completion -d '{
   "samplers": []
 }'
 ```
+
+## Perplexity gate (PROPOSED — not yet implemented, awaiting approval)
+
+Greedy agreement (§3c) catches token flips but is blind to how the decode kernel
+reshapes the *distribution* — a change that keeps every argmax but systematically
+sharpens or flattens the tails would pass. A perplexity-delta bound over a small
+held-out corpus complements it. This is a PROPOSAL for Orvar to approve; nothing
+below is built.
+
+- **Corpus**: an ~8k-token held-out mixed prose/code text checked into
+  `tests/fixtures`. Candidate source: the head of the wikitext-2-raw *test* split
+  (the standard LM-perplexity corpus; check in with attribution/license note).
+  Alternatives welcome — the only requirements are held-out (not the parity
+  prompts), mixed register (prose + code, to exercise both token regimes), and
+  ~8k tokens (enough positions to average the per-token NLL, small enough for one
+  forward under the 4096 max-ctx in a couple of chunks).
+- **Method**: `logits-dump` gains a mode that computes, per position, the
+  next-token log-probability (`log_softmax` over the full logits, gather the
+  actual next token) and emits only those scalars — the dumps stay tiny (no
+  all-position full-logit capture; note the current dumps are last-position-only,
+  see Limitations). Mean NLL = `-mean(logprob)` over all scored positions.
+- **Gate**: `|mean_NLL(fused) − mean_NLL(reference)| <= bound`, with `bound` set
+  calibrate-then-freeze: measure the current fused-vs-reference delta on the
+  frozen corpus, freeze `bound` at ~3x that delta with an absolute floor of
+  `0.002` nats (so a near-zero measured delta doesn't set an impossibly tight
+  bound). Both sides run the identical corpus; the reference side uses the
+  Reference runner.
 
 ## Limitations
 

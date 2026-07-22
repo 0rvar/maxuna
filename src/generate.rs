@@ -26,6 +26,9 @@ pub struct GenStats {
     pub prefill_secs: f64,
     pub decode_tokens: usize,
     pub decode_secs: f64,
+    /// True when generation stopped because the cancel poll returned true
+    /// (rather than hitting an EOG token or the max_tokens cap).
+    pub cancelled: bool,
 }
 
 impl GenStats {
@@ -43,8 +46,16 @@ impl Generator {
         Self { model, tokenizer, sampler }
     }
 
+    /// Longest prompt + generation budget the KV cache can hold. Callers can
+    /// use this to report context headroom or validate input sizes up front.
+    pub fn max_ctx(&self) -> usize {
+        self.model.max_ctx()
+    }
+
     /// Generate up to max_tokens from a rendered prompt, streaming text chunks
-    /// to `on_text`. Stops on any EOG token.
+    /// to `on_text`. Stops on any EOG token, or early when `should_stop`
+    /// returns true (polled once per prefill chunk and once per decoded token;
+    /// an early stop is reported via `GenStats::cancelled`).
     ///
     /// The prompt string is encoded as-is: BOS ownership lives with the caller
     /// (the chat template writes BOS as literal text; the raw-prompt CLI path
@@ -54,6 +65,7 @@ impl Generator {
         prompt: &str,
         max_tokens: usize,
         on_text: &mut dyn FnMut(&str),
+        should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<GenStats> {
         self.model.reset_cache()?;
         let device = self.model.device().clone();
@@ -88,9 +100,14 @@ impl Generator {
 
         // ---- Prefill: feed the prompt in chunks, advancing the absolute pos.
         let prefill_start = Instant::now();
+        let mut cancelled = false;
         let mut pos = 0usize;
         let mut logits = None;
         for chunk in tokens.chunks(PREFILL_CHUNK) {
+            if should_stop() {
+                cancelled = true;
+                break;
+            }
             let input = Tensor::new(chunk, &device)?;
             logits = Some(self.model.forward(&input, pos)?);
             pos += chunk.len();
@@ -99,13 +116,28 @@ impl Generator {
         // decode loop's per-token readback would otherwise absorb it).
         device.synchronize()?;
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
-        let mut logits = logits.expect("non-empty prompt produced logits");
+        let mut logits = match logits {
+            Some(logits) if !cancelled => logits,
+            // Cancelled during (or before) prefill: no logits to decode from.
+            _ => {
+                return Ok(GenStats {
+                    prefill_tokens: pos,
+                    prefill_secs,
+                    cancelled: true,
+                    ..GenStats::default()
+                });
+            }
+        };
 
         // ---- Decode: sample, stream, feed back, one token at a time.
         let decode_start = Instant::now();
         let mut stream = self.tokenizer.decode_stream();
         let mut decoded = 0usize;
         while decoded < max_tokens {
+            if should_stop() {
+                cancelled = true;
+                break;
+            }
             let token = self.sampler.sample(&logits)?;
             if self.sampler.is_eog(token) {
                 break;
@@ -129,6 +161,7 @@ impl Generator {
             prefill_secs,
             decode_tokens: decoded,
             decode_secs,
+            cancelled,
         })
     }
 }

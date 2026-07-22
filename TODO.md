@@ -83,6 +83,33 @@
     sdpa (2.3 ms) is fine — leave it. lm_head (6.5 ms) is a single vocab matmul,
     minor. mv_id routed gather (18.4 ms) — vendor ggml's mv_id N_R0/N_SG geometry
     — is the concrete FFN-side secondary.
+  - [x] **Vendored ggml mv geometry for the routed gather + lm_head — DONE, but
+    NO measurable decode gain (LESSON: the mv compute was not the bottleneck).**
+    Ported ggml's CURRENT `kernel_mul_mv_{id_,}q{4,6}_K_f32_impl` geometry
+    (N_R0=2, N_SG=2, `(r0*NSG+sgitg)*nr0` row fan-out, nr0 register-row f32
+    accumulate) into `src/ops/mv.metal` (separate library — no Metal-4 tensor
+    dep), host dispatch in `dispatch.rs` (`encode_mul_mv_id_vendored`,
+    `run_plain_mv`), default for q4_K/q6_K with `LAGUNA_MV_CLASSIC` kill-switch
+    reverting to candle's baked kernels. lm_head bypass at seq==1 over a retained
+    shared buffer (`gguf::qlinear_with_buffer`, same zero-copy trick as
+    ExpertStack). Correctness solid: greedy decode gate passes all three fixtures
+    (code-short 62/2 excused, text-mixed 64/0, long-swa 59/5 excused, 0
+    non-excused); decode-tier diagnostic cosine 0.99789 (top1 350=ref, top5 4/5;
+    the accumulation-reorder drop from classic's 0.99906 is expected per §3b).
+    BUT end-to-end decode is FLAT: 13.1 (vendored) vs 13.0 (classic) tok/s @512ctx,
+    256-tok warm bench. The premise that candle's mv "runs ~15x under bandwidth /
+    lm_head ~6.5 ms" does not reproduce in isolation: a `[100352x3072]` q6_K
+    matvec at seq==1 is 0.685 ms vendored vs 0.738 ms QMatMul (both near the
+    ~0.62 ms/250MB bandwidth floor; microbench `plain_mv_lmhead_bench`, ignored).
+    So both hot mv paths were already ~bandwidth-optimal in candle; the 6.5 ms
+    lm_head / 18.4 ms gather line items are per-dispatch LATENCY inside the full
+    decode pipeline, not mv compute — geometry can't recover them. The vendored
+    kernels are strictly not slower and are more fork-faithful (ggml's current
+    geometry), so kept as default, but the real decode prize remains the
+    attention per-layer dispatch chain (48.6 ms). DECISION FOR ORVAR: keep
+    vendored as default (marginally faster, drops the candle-baked-kernel
+    dependency for these two paths) or revert to classic default (fewer moving
+    parts, cosine 0.99906) — both correct.
 - [ ] **Track B dumps for text-mixed / long-swa** — the full-logit reference-vs-
   fused gate ran only on code-short (greedy covers the other two fixtures);
   generate the remaining dumps if fused ever changes.
@@ -132,3 +159,19 @@ implementation — never silently drop scope.
   `general.sampling.temp=0.7, top_p=0.9` while generation_config.json says
   temp 1.0 / top_k 20 / top_p 1.0. v1 follows generation_config; revisit if outputs
   seem off-distribution.
+- [ ] **Chat REPL display edge cases** (src/bin/laguna/repl.rs) — the raw-mode
+  editor repaints the input block relative to the cursor row, so (a) an input
+  taller than the terminal window glitches visually (buffer/submission stay
+  correct), and (b) a terminal resize that reflows already-printed rows can
+  misplace the repaint anchor until the next submit. Fine for chat-sized input;
+  fix = cap the visible block to a viewport (scroll within it) if it ever bites.
+  No persistent input history across sessions (in-memory only).
+- [ ] **mm_id-dispatch counter in dump provenance** — the greedy/full-logit gates
+  now enforce runner provenance, but `provenance` records the mm-*eligibility*
+  predicate (`moe_impl == "fused" && seq_len >= mm_min_seq && !no_mm_id`), not
+  whether the mm_id kernel actually dispatched at runtime. A checkpoint whose
+  dtype/top_k falls back to mv_id (via `supported()`) still reports the mm path as
+  "active", so a fused dump can pass the mm tier without any mm_id dispatch — a
+  residual false-pass. A runtime mm_id-dispatch counter surfaced into dump
+  provenance would close it. Deferred: the ops dispatch layer is under concurrent
+  rework, so touching it now would collide.

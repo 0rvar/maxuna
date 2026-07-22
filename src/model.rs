@@ -47,6 +47,12 @@ pub struct LagunaModel {
     caches: Vec<LayerCache>,
     output_norm: RmsNorm,
     lm_head: QLinear,
+    /// Retained handle to the lm_head weight's Metal buffer, shared with
+    /// `lm_head`'s QTensor (zero-copy). Present only on Metal for the vendored
+    /// q4_K/q6_K plain mat-vec; `None` off Metal or for an unsupported dtype, in
+    /// which case the decode path stays on `lm_head.forward`.
+    lm_head_buffer: Option<Arc<candle_metal_kernels::metal::Buffer>>,
+    lm_head_dtype: candle_core::quantized::GgmlDType,
     max_ctx: usize,
     tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
@@ -94,7 +100,7 @@ impl LagunaModel {
         }
 
         let output_norm = w.rms_norm("output_norm", cfg.rms_eps)?;
-        let lm_head = w.qlinear("output")?;
+        let (lm_head, lm_head_buffer, lm_head_dtype) = w.qlinear_with_buffer("output")?;
 
         warn_if_over_budget(&gguf, &cfg, max_ctx);
 
@@ -106,6 +112,8 @@ impl LagunaModel {
             caches,
             output_norm,
             lm_head,
+            lm_head_buffer,
+            lm_head_dtype,
             max_ctx,
             tap_enabled: false,
             taps: Vec::new(),
@@ -184,8 +192,27 @@ impl LagunaModel {
         // chunk. `result_norm` matches the fork, which captures it after the
         // last-position gather, so it is last-position-only too.
         let normed = self.output_norm.forward(&x)?;
-        let last = normed.narrow(0, seq - 1, 1)?; // [1, hidden]
-        let logits = self.lm_head.forward(&last)?; // [1, vocab]
+        let last = normed.narrow(0, seq - 1, 1)?.contiguous()?; // [1, hidden]
+        // Decode bypass: at one query position, run the vendored ggml-geometry
+        // plain mat-vec over the shared lm_head buffer (candle's baked Q6_K mv
+        // runs ~15x under bandwidth). Falls back to QMatMul for prefill (seq > 1),
+        // off Metal, an unsupported dtype, or under LAGUNA_MV_CLASSIC.
+        let logits = match &self.lm_head_buffer {
+            Some(buf)
+                if seq == 1
+                    && !crate::ops::mv_classic()
+                    && crate::ops::mv_vendored_supported(self.lm_head_dtype) =>
+            {
+                crate::ops::mul_mv(
+                    buf,
+                    self.lm_head_dtype,
+                    self.lm_head.out_dim,
+                    self.lm_head.in_dim,
+                    &last,
+                )? // [1, vocab]
+            }
+            _ => self.lm_head.forward(&last)?, // [1, vocab]
+        };
         let logits = logits.flatten_all()?; // [vocab]
         if self.tap_enabled {
             taps.push(("result_norm".to_string(), last));

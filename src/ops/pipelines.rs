@@ -15,6 +15,10 @@ use candle_metal_kernels::metal::{ComputePipeline, Device, Library};
 /// Vendored kernel source, compiled at runtime (candle's metallib carries no
 /// Rust wiring for these and cannot be extended at build time).
 const MM_ID_SOURCE: &str = include_str!("mm_id.metal");
+/// Vendored ggml-geometry mat-vec kernels (decode expert gather + lm_head).
+/// Deliberately separate from `mm_id.metal` so it carries no Metal-4 tensor
+/// dependency.
+const MV_SOURCE: &str = include_str!("mv.metal");
 
 struct Cache {
     /// One compiled library per (device registry id, source key).
@@ -75,4 +79,9 @@ fn compiled_pipeline(
 /// Pipeline for a `mm_id.metal` kernel (two-pass indexed matmul).
 pub(crate) fn mm_id_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, MM_ID_SOURCE, "mm_id", name)
+}
+
+/// Pipeline for a `mv.metal` kernel (vendored ggml-geometry mat-vec).
+pub(crate) fn mv_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, MV_SOURCE, "mv", name)
 }

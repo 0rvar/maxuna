@@ -3,6 +3,7 @@ use candle_core::Tensor;
 use candle_core::quantized::GgmlDType;
 
 use crate::gguf::ExpertStack;
+use crate::ops::MmVariant;
 use crate::ops::dispatch::{self, Mode};
 
 /// Quantized gather-matmul over a stacked expert tensor (prefill path):
@@ -14,11 +15,15 @@ pub fn mul_mm_id(stack: &ExpertStack, x: &Tensor, ids: &Tensor) -> Result<Tensor
     dispatch::run(stack, x, ids, Mode::Mm, crate::ops::mm_id_variant())
 }
 
-/// Whether the vendored two-pass mm_id kernels are instantiated for this dtype
-/// and top_k. `moe` gates the seq>=32 prefill branch on this and falls back to
-/// mv_id when a checkpoint uses an uninstantiated dtype/top_k.
-pub fn supported(dt: GgmlDType, top_k: usize) -> bool {
-    dispatch::mm_kernel_name(dt).is_ok() && dispatch::map0_kernel_name(top_k).is_ok()
+/// Whether the vendored two-pass mm_id kernels are instantiated for this dtype,
+/// top_k, and the ACTIVE variant. `moe` gates the seq>=MM_ID_MIN_SEQ prefill
+/// branch on this and falls back to mv_id when a checkpoint uses an uninstantiated
+/// dtype/top_k, or the selected variant lacks a kernel for that dtype (e.g.
+/// `_t_hp` on q8_0/q5_K). Variant-aware because `encode_mul_mm_id` appends the
+/// variant suffix to the kernel name, and an uninstantiated combo faults the
+/// pipeline lookup instead of gracefully falling back.
+pub(crate) fn supported(dt: GgmlDType, top_k: usize, variant: MmVariant) -> bool {
+    dispatch::mm_kernel_instantiated(dt, variant) && dispatch::map0_kernel_name(top_k).is_ok()
 }
 
 #[cfg(test)]
@@ -208,6 +213,112 @@ mod tests {
         }
     }
 
+    /// The variant-aware support matrix (`dispatch::mm_kernel_instantiated`,
+    /// consumed by `supported`) must exactly track the kernels actually
+    /// instantiated in mm_id.metal: for every (variant, dtype) it claims
+    /// supported there must be a matching `[[host_name("...")]]` line, or `moe`
+    /// would route to a kernel that faults at pipeline lookup instead of falling
+    /// back to mv_id. Cross-check the matrix against the source of truth.
+    /// Strip `/* ... */` block comments and `//` line comments from Metal source
+    /// so a commented-out `[[host_name(...)]]` instantiation cannot satisfy a
+    /// `contains` check. Byte-wise over the ASCII delimiters; retained bytes stay
+    /// valid UTF-8 (comment markers never fall inside a multi-byte sequence).
+    fn strip_metal_comments(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                i += 2;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// An instantiation is present iff a `[[host_name("<name>"...` line exists in
+    /// the (comment-stripped) source. Match only up to the closing quote, not the
+    /// closing `)]]`, because some instantiations pad the token (`"...ne20_1" )`);
+    /// the trailing quote already disambiguates prefixes (`..._1"` never matches
+    /// `..._10"`).
+    fn host_name_present(src: &str, name: &str) -> bool {
+        src.contains(&format!("host_name(\"{name}\""))
+    }
+
+    #[test]
+    fn instantiation_matrix_matches_metal() {
+        use crate::ops::MmVariant;
+        use crate::ops::dispatch::{map0_kernel_name, mm_kernel_instantiated, mm_kernel_name};
+
+        const METAL_SRC: &str = include_str!("mm_id.metal");
+        // Strip comments FIRST: a commented-out instantiation must not count as
+        // present, or the matrix could claim a kernel the compiler never emits.
+        let src = strip_metal_comments(METAL_SRC);
+
+        const VARIANTS: &[MmVariant] = &[
+            MmVariant::Tensor,
+            MmVariant::TensorHp,
+            MmVariant::ClassicHp,
+            MmVariant::ClassicF16,
+        ];
+        // The four base dtypes the mm path knows, plus dtypes with no mm kernel at
+        // all (to assert the matrix denies them under every variant).
+        const DTYPES: &[GgmlDType] = &[
+            GgmlDType::Q8_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q4_0,
+            GgmlDType::Q2K,
+        ];
+
+        for &variant in VARIANTS {
+            for &dt in DTYPES {
+                let claimed = mm_kernel_instantiated(dt, variant);
+                // The exact host name the encoder would dispatch: base + variant suffix.
+                let name = mm_kernel_name(dt).ok().map(|base| format!("{base}{}", variant.suffix()));
+                let present = name.as_ref().is_some_and(|n| host_name_present(&src, n));
+                assert_eq!(
+                    claimed, present,
+                    "support matrix disagrees with mm_id.metal for {dt:?}/{variant:?}: \
+                     mm_kernel_instantiated={claimed}, host_name present={present} (name={name:?})"
+                );
+            }
+        }
+
+        // map0 (the top_k dimension `supported()` also gates on): every top_k
+        // `map0_kernel_name` accepts must have a matching `map0_ne20_{top_k}`
+        // host_name, and every one it rejects must have none — else `moe` would
+        // route a top_k with no map0 pass into a faulting pipeline lookup.
+        const TOP_KS: &[usize] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16];
+        for &top_k in TOP_KS {
+            match map0_kernel_name(top_k) {
+                Ok(name) => assert!(
+                    host_name_present(&src, &name),
+                    "map0_kernel_name claims {name:?} for top_k={top_k}, but no host_name in mm_id.metal"
+                ),
+                Err(_) => {
+                    let ghost = format!("kernel_mul_mm_id_map0_ne20_{top_k}");
+                    assert!(
+                        !host_name_present(&src, &ghost),
+                        "map0_kernel_name denies top_k={top_k}, but mm_id.metal instantiates {ghost:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn shape_mismatch_errors() {
         // ids t disagreeing with x t must error rather than fault the GPU.
@@ -224,7 +335,10 @@ mod tests {
     /// Gates the tensor-path mm_id port: if this fails to compile, the port is a
     /// non-starter and the compiler error is the actionable output. Mirrors the
     /// fork's tile setup (NR0=64/NR1=32/NK=32, sc aliases sa, mm.run(sB,sA,cT)).
-    /// A=B=ones -> each C entry should be the K-sum = 32.
+    /// The store lands `C[r0][r1]` at `sc[r0*NR1 + r1]` (extents (NR0, NR1)); the
+    /// test drives it with per-index-constant operands so the output separates as
+    /// `C[r0][r1] = NK * a(r0) * b(r1)` — non-uniform in BOTH axes, so a transposed
+    /// store (`C[r1][r0]`) no longer matches (all-ones would hide that).
     const TENSOR_PROBE_SRC: &str = r#"
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -293,10 +407,33 @@ kernel void probe_matmul2d(
             .new_compute_pipeline_state_with_function(&func)
             .expect("probe pipeline builds");
 
-        // A [NK=32, NR0=64] and B [NR1=32, NK=32], both f16 ones.
-        let a = Tensor::ones((32, 64), DType::F16, &device).unwrap();
-        let b = Tensor::ones((32, 32), DType::F16, &device).unwrap();
-        let c = mdev.new_buffer(64 * 32, DType::F32, "probe_c").unwrap();
+        // Non-uniform, layout-sensitive operands. The probe runs ONE 32-wide
+        // matmul2d tile with a plain LINEAR tile load (not the production swizzle),
+        // so it is not a clean C=W·Xᵀ; empirically (and deterministically) the tile
+        // yields, at the stored linear position sc[r1*NR0 + r0]:
+        //     value(r0, r1) = NK * A1[r0 / 2] * B1[r1]
+        // where A1[k] (k in 0..NK) is A's value along its FIRST extent (held
+        // constant down the second) and B1[m] (m in 0..NR1) is B's value along its
+        // first extent (held constant down NK). (The `/2` and the `NK` factor are
+        // artifacts of one cooperative-tensor tile fed linearly loaded data; the
+        // PRODUCTION expert layout is validated against the oracle in
+        // `mm_matches_oracle_production_scale`.) Choosing A1 and B1 as distinct,
+        // non-constant small-integer patterns makes the output vary in BOTH r0 and
+        // r1, so a transposed store (extents (NR1, NR0) → sc[r0*NR1 + r1]) reorders
+        // the linear array and fails the exact comparison — which all-ones (every
+        // entry == NK) could not detect. Values are exact in f16, products exact in f32.
+        const NK: usize = 32;
+        const NR0: usize = 64;
+        const NR1: usize = 32;
+        let a1 = |k: usize| (1 + (k % 4)) as f32; // A first-extent pattern {1,2,3,4}
+        let b1 = |m: usize| (1 + (m % 5)) as f32; // B first-extent pattern {1,2,3,4,5}
+        // A [NK, NR0]: value depends only on the first extent k = i / NR0.
+        let a_vec: Vec<f32> = (0..NK * NR0).map(|i| a1(i / NR0)).collect();
+        // B [NR1, NK]: value depends only on the first extent m = i / NK.
+        let b_vec: Vec<f32> = (0..NR1 * NK).map(|i| b1(i / NK)).collect();
+        let a = Tensor::from_vec(a_vec, (NK, NR0), &device).unwrap().to_dtype(DType::F16).unwrap();
+        let b = Tensor::from_vec(b_vec, (NR1, NK), &device).unwrap().to_dtype(DType::F16).unwrap();
+        let c = mdev.new_buffer(NR0 * NR1, DType::F32, "probe_c").unwrap();
 
         let (a_g, a_l) = a.storage_and_layout();
         let Storage::Metal(a_s) = &*a_g else { unreachable!() };
@@ -326,12 +463,34 @@ kernel void probe_matmul2d(
         drop(a_g);
         drop(b_g);
 
-        let out = dispatch::output_tensor(c, mdev, 64 * 32, (64, 32));
+        let out = dispatch::output_tensor(c, mdev, NR0 * NR1, (NR0, NR1));
         let v = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(v.iter().all(|x| x.is_finite()), "probe output has non-finite values");
-        eprintln!(
-            "tensor-ops probe OK: compiled + ran. C[0..4]={:?} (K-sum of ones is 32)",
+
+        // Exact expected C[r0][r1] = NK * a(r0) * b(r1), laid out row-major over
+        // (NR0, NR1). Products/sums are small integers exact in f32, so compare
+        // exactly. A transposed store would place a(r1)*b(r0) here and fail.
+        // Exact expected, laid out exactly as the kernel stores it: linear index
+        // i = r1*NR0 + r0, value = NK * A1[r0/2] * B1[r1]. A transposed store would
+        // land a(r1)/b(r0)-shaped values here and fail. Products are small integers
+        // exact in f32, so compare exactly (tiny epsilon for the f16→f32 store).
+        let mut mismatches = 0usize;
+        for r1 in 0..NR1 {
+            for r0 in 0..NR0 {
+                let want = NK as f32 * a1(r0 / 2) * b1(r1);
+                let got = v[r1 * NR0 + r0];
+                if (got - want).abs() > 1e-3 {
+                    mismatches += 1;
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "tensor-ops probe: {mismatches} of {} entries mismatch the CPU value \
+             (NK*A1[r0/2]*B1[r1]); a transposed store would reorder them. C[0..4]={:?}",
+            NR0 * NR1,
             &v[0..4]
         );
+        eprintln!("tensor-ops probe OK: compiled, ran, and matched NK*A1[r0/2]*B1[r1] exactly");
     }
 }

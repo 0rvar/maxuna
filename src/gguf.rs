@@ -128,6 +128,54 @@ impl Weights {
         Ok(QLinear { inner: QMatMul::from_arc(qt)?, in_dim, out_dim })
     }
 
+    /// Loads a rank-2 weight `[out_dim, in_dim]` as a `QLinear`, additionally
+    /// returning a retained handle to its Metal buffer (or `None` off Metal) so a
+    /// caller can dispatch the vendored plain mat-vec kernel over the SAME
+    /// allocation the `QLinear` uses — no second upload. Same zero-copy
+    /// construction as `expert_stack`: read the quantized bytes ourselves, upload
+    /// once via `QStorage::from_data`, retain the buffer BEFORE the storage moves
+    /// into the `QTensor`. Used for the lm_head (q6_K) decode bypass; a non-Metal
+    /// device yields `buffer = None` and the caller stays on `QLinear::forward`.
+    pub fn qlinear_with_buffer(&self, name: &str) -> Result<(QLinear, Option<Arc<Buffer>>, GgmlDType)> {
+        let full = self.name(name);
+        let info = self
+            .src
+            .content
+            .tensor_infos
+            .get(&full)
+            .with_context(|| format!("tensor {full} not found"))?;
+        let dims = info.shape.dims().to_vec();
+        let [out_dim, in_dim] = dims[..] else {
+            bail!("{full} is not a rank-2 weight: {dims:?}");
+        };
+        let dtype = info.ggml_dtype;
+        let block = dtype.block_size();
+        let elems = out_dim * in_dim;
+        if !elems.is_multiple_of(block) {
+            bail!("{full}: {elems} elements not a multiple of {dtype:?} block size {block}");
+        }
+        let size_in_bytes = elems / block * dtype.type_size();
+        let tensor_start = self.src.content.tensor_data_offset + info.offset;
+
+        let mut raw = vec![0u8; size_in_bytes];
+        {
+            let mut file = self.src.file.lock().unwrap();
+            file.seek(SeekFrom::Start(tensor_start))
+                .with_context(|| format!("seeking to {full}"))?;
+            file.read_exact(&mut raw)
+                .with_context(|| format!("reading {full} ({size_in_bytes} bytes)"))?;
+        }
+
+        let storage = QStorage::from_data(std::borrow::Cow::Owned(raw), &self.src.device, dtype)?;
+        let buffer = match &storage {
+            QStorage::Metal(qms) => Some(Arc::new(qms.buffer().clone())),
+            _ => None,
+        };
+        let qtensor = Arc::new(QTensor::new(storage, (out_dim, in_dim))?);
+        let qlinear = QLinear { inner: QMatMul::from_arc(qtensor)?, in_dim, out_dim };
+        Ok((qlinear, buffer, dtype))
+    }
+
     pub fn rms_norm(&self, name: &str, eps: f64) -> Result<RmsNorm> {
         let w = self.dense_f32(name)?;
         Ok(RmsNorm::new(w, eps))

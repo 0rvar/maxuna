@@ -114,6 +114,25 @@ pub(crate) fn mm_kernel_name(dt: GgmlDType) -> Result<&'static str> {
     Ok(n)
 }
 
+/// Whether the vendored `kernel_mul_mm_id_<dtype>_f32<variant-suffix>` kernel is
+/// actually instantiated in mm_id.metal for this (dtype, variant) pair. The base
+/// dtype matrix (q8_0/q4_K/q5_K/q6_K) is `mm_kernel_name`; ON TOP of that, the
+/// `_t_hp` (`TensorHp`) variant is instantiated ONLY for the production q4_K/q6_K
+/// experts — the other three variants cover the full base matrix. A combo outside
+/// this matrix has no pipeline, so `moe` must fall back to mv_id rather than fault
+/// the pipeline lookup. Keep in lockstep with the `template [[host_name(...)]]`
+/// instantiations in mm_id.metal (the `mm_id::tests::instantiation_matrix_matches_metal`
+/// test cross-checks this against the source).
+pub(crate) fn mm_kernel_instantiated(dt: GgmlDType, variant: MmVariant) -> bool {
+    if mm_kernel_name(dt).is_err() {
+        return false;
+    }
+    match variant {
+        MmVariant::TensorHp => matches!(dt, GgmlDType::Q4K | GgmlDType::Q6K),
+        MmVariant::Tensor | MmVariant::ClassicHp | MmVariant::ClassicF16 => true,
+    }
+}
+
 /// The `kernel_mul_mm_id_map0` template is instantiated for these top_k values
 /// in mm_id.metal; a top_k outside the set has no map0 pass.
 pub(crate) fn map0_kernel_name(top_k: usize) -> Result<String> {
@@ -167,6 +186,144 @@ struct MmIdArgs {
     ne1: i32,
     r2: i16,
     r3: i16,
+}
+
+/// `ggml_metal_kargs_mul_mv` (ggml-metal-impl.h). Written to buffer(0) of the
+/// vendored plain mat-vec kernels (`kernel_mul_mv_<dtype>_f32_v`). `#[repr(C)]`
+/// matches the Metal `constant` struct layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MvArgs {
+    ne00: i32,
+    ne01: i32,
+    ne02: i32,
+    nb00: u64,
+    nb01: u64,
+    nb02: u64,
+    nb03: u64,
+    ne10: i32,
+    ne11: i32,
+    ne12: i32,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    ne0: i32,
+    ne1: i32,
+    nr0: i32,
+    r2: i16,
+    r3: i16,
+}
+
+/// `ggml_metal_kargs_mul_mv_id` (ggml-metal-impl.h). Written to buffer(0) of the
+/// vendored indexed mat-vec kernels (`kernel_mul_mv_id_<dtype>_f32_v`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MvIdArgs {
+    nei0: i32,
+    nei1: i32,
+    nbi1: u64,
+    ne00: i32,
+    ne01: i32,
+    ne02: i32,
+    nb00: u64,
+    nb01: u64,
+    nb02: u64,
+    ne10: i32,
+    ne11: i32,
+    ne12: i32,
+    ne13: i32,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    ne0: i32,
+    ne1: i32,
+    nb1: u64,
+    nr0: i32,
+}
+
+/// ggml's N_R0 * N_SG for the vendored q4_K/q6_K mat-vec kernels (both dtypes
+/// carry N_R0 = 2, N_SG = 2 in ggml-metal-impl.h). Rows are grouped into blocks
+/// of this many along the output dimension (grid.x), and each threadgroup runs
+/// N_SG simdgroups of 32 threads.
+const MV_NR0: usize = 2;
+const MV_NSG: usize = 2;
+
+/// True iff the vendored ggml-geometry mat-vec kernels exist for `dt` (only the
+/// q4_K experts and q6_K experts/lm_head are ported). Other dtypes stay on the
+/// candle baked path.
+pub fn mv_vendored_supported(dt: GgmlDType) -> bool {
+    matches!(dt, GgmlDType::Q4K | GgmlDType::Q6K)
+}
+
+fn mv_vendored_id_kernel_name(dt: GgmlDType) -> Result<&'static str> {
+    match dt {
+        GgmlDType::Q4K => Ok("kernel_mul_mv_id_q4_K_f32_v"),
+        GgmlDType::Q6K => Ok("kernel_mul_mv_id_q6_K_f32_v"),
+        other => bail!("no vendored kernel_mul_mv_id kernel for dtype {other:?}"),
+    }
+}
+
+fn mv_vendored_plain_kernel_name(dt: GgmlDType) -> Result<&'static str> {
+    match dt {
+        GgmlDType::Q4K => Ok("kernel_mul_mv_q4_K_f32_v"),
+        GgmlDType::Q6K => Ok("kernel_mul_mv_q6_K_f32_v"),
+        other => bail!("no vendored kernel_mul_mv kernel for dtype {other:?}"),
+    }
+}
+
+/// Encode the vendored `kernel_mul_mv_id_<dtype>_f32_v` (decode path). Same seam
+/// contract as `encode_mul_mv_id`, but dispatches our ggml-geometry kernel: each
+/// threadgroup covers `MV_NR0*MV_NSG` output rows across `MV_NSG` simdgroups, and
+/// grid.z enumerates every (token, slot) pair (the id wrapper decodes z). The
+/// argument struct goes to buffer(0) (ggml layout), matching the kernel signature.
+pub(crate) fn encode_mul_mv_id_vendored(
+    device: &MetalDevice,
+    ep: impl EncoderProvider,
+    dt: GgmlDType,
+    d: &IdDispatch,
+) -> Result<()> {
+    let name = mv_vendored_id_kernel_name(dt)?;
+    let pipeline = pipelines::mv_pipeline(device.device(), name)?;
+
+    let args = MvIdArgs {
+        nei0: d.top_k as i32,
+        nei1: d.t as i32,
+        nbi1: (d.top_k * DType::U32.size_in_bytes()) as u64,
+        ne00: d.k as i32,
+        ne01: d.n_out as i32,
+        ne02: d.n_expert as i32,
+        nb00: 0,
+        nb01: d.bytes_per_row as u64,
+        nb02: d.per_expert as u64,
+        ne10: d.k as i32,
+        ne11: d.x_per_row as i32,
+        ne12: d.t as i32,
+        ne13: 1,
+        nb10: DType::F32.size_in_bytes() as u64,
+        nb11: (d.k * DType::F32.size_in_bytes()) as u64,
+        nb12: (d.x_per_row * d.k * DType::F32.size_in_bytes()) as u64,
+        ne0: d.n_out as i32,
+        ne1: d.top_k as i32,
+        nb1: (d.n_out * DType::F32.size_in_bytes()) as u64,
+        nr0: MV_NR0 as i32,
+    };
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_bytes(0, &args);
+    encoder.set_input_buffer(1, Some(d.weights), 0);
+    encoder.set_input_buffer(2, Some(d.x), d.x_off);
+    encoder.set_output_buffer(3, Some(d.dst), 0);
+    encoder.set_input_buffer(4, Some(d.ids), d.ids_off);
+
+    // K-quant grid.x groups n_out rows into MV_NR0*MV_NSG-wide blocks; grid.z
+    // walks every (token, slot) pair; threads are MV_NSG simdgroups of 32.
+    let grid = mtl_size!(d.n_out.div_ceil(MV_NR0 * MV_NSG), 1, d.top_k * d.t);
+    let threads = mtl_size!(32, MV_NSG, 1);
+    encoder.dispatch_thread_groups(grid, threads);
+    Ok(())
 }
 
 /// Encode `kernel_mul_mv_id_<dtype>_f32` (decode path). Each threadgroup along z
@@ -391,8 +548,12 @@ pub(crate) fn output_tensor(
 /// Which id-kernel family to dispatch.
 #[derive(Clone, Copy)]
 pub(crate) enum Mode {
-    /// `kernel_mul_mv_id` — one matvec per (token, slot); decode path.
+    /// candle's baked `kernel_mul_mv_id` — one matvec per (token, slot); decode
+    /// path, older geometry. Kept as the `LAGUNA_MV_CLASSIC` fallback.
     Mv,
+    /// Vendored ggml-geometry `kernel_mul_mv_id_<dtype>_f32_v` — decode path,
+    /// current geometry (default for the supported q4_K/q6_K dtypes).
+    MvVendored,
     /// `kernel_mul_mm_id` — token-grouped matmul; prefill path.
     Mm,
 }
@@ -457,7 +618,7 @@ pub(crate) fn run(
     // resident, so the scratch shares its lifetime and the pool reuses it once
     // the tensor drops.
     let alloc_count = match mode {
-        Mode::Mv => out_count,
+        Mode::Mv | Mode::MvVendored => out_count,
         Mode::Mm => out_count + mm_scratch_elems(stack.n_expert, t),
     };
     let dst = mdev.new_buffer(alloc_count, DType::F32, "mul_id")?;
@@ -496,6 +657,7 @@ pub(crate) fn run(
         let cmd = mdev.command_encoder()?;
         match mode {
             Mode::Mv => encode_mul_mv_id(mdev, &cmd, dt, &d)?,
+            Mode::MvVendored => encode_mul_mv_id_vendored(mdev, &cmd, dt, &d)?,
             Mode::Mm => encode_mul_mm_id(mdev, &cmd, dt, &d, variant)?,
         }
     }
@@ -503,6 +665,99 @@ pub(crate) fn run(
     drop(ids_guard);
 
     Ok(output_tensor(dst, mdev, out_count, (t, top_k, stack.n_out)))
+}
+
+/// Plain (non-indexed) quantized mat-vec against the vendored ggml-geometry
+/// kernel — the lm_head bypass at seq==1. `weight` is a rank-2 `[n_out, k]`
+/// quantized tensor's raw device buffer; `x` is `[t, k]` f32 (t small, typically
+/// 1). Returns `[t, n_out]` f32. Only q4_K/q6_K are supported (the lm_head is
+/// q6_K); callers gate on `mv_vendored_supported` and fall back to QMatMul
+/// otherwise.
+pub(crate) fn run_plain_mv(
+    weight: &Buffer,
+    dt: GgmlDType,
+    n_out: usize,
+    k: usize,
+    x: &Tensor,
+) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("mul_mv requires x on a Metal device");
+    };
+    let (t, kx) = x.dims2().map_err(|e| anyhow::anyhow!("x must be rank-2 [t, k]: {e}"))?;
+    if x.dtype() != DType::F32 {
+        bail!("x must be f32, got {:?}", x.dtype());
+    }
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    if kx != k {
+        bail!("x k ({kx}) does not match weight k ({k})");
+    }
+    if !mv_vendored_supported(dt) {
+        bail!("no vendored plain mv kernel for dtype {dt:?}");
+    }
+
+    let block_size = dt.block_size();
+    if !k.is_multiple_of(block_size) {
+        bail!("weight k ({k}) is not a multiple of {dt:?} block size {block_size}");
+    }
+    let bytes_per_row = k / block_size * dt.type_size();
+
+    let out_count = t * n_out;
+    let dst = mdev.new_buffer(out_count, DType::F32, "mul_mv")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let x_buf = x_storage.buffer();
+    let x_off = x_layout.start_offset() * DType::F32.size_in_bytes();
+
+    let args = MvArgs {
+        ne00: k as i32,
+        ne01: n_out as i32,
+        ne02: 1,
+        nb00: 0,
+        nb01: bytes_per_row as u64,
+        nb02: (n_out * bytes_per_row) as u64,
+        nb03: (n_out * bytes_per_row) as u64,
+        ne10: k as i32,
+        ne11: t as i32,
+        ne12: 1,
+        nb10: DType::F32.size_in_bytes() as u64,
+        nb11: (k * DType::F32.size_in_bytes()) as u64,
+        nb12: (t * k * DType::F32.size_in_bytes()) as u64,
+        nb13: (t * k * DType::F32.size_in_bytes()) as u64,
+        ne0: n_out as i32,
+        ne1: t as i32,
+        nr0: MV_NR0 as i32,
+        r2: 1,
+        r3: 1,
+    };
+
+    let name = mv_vendored_plain_kernel_name(dt)?;
+    let pipeline = pipelines::mv_pipeline(mdev.device(), name)?;
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(weight), 0);
+        encoder.set_input_buffer(2, Some(x_buf), x_off);
+        encoder.set_output_buffer(3, Some(&dst), 0);
+
+        // K-quant grid.x = ceil(n_out / (MV_NR0*MV_NSG)); grid.y = one column per
+        // token row (nr1 == 1 for the quant mv path); threads MV_NSG simdgroups.
+        let grid = mtl_size!(n_out.div_ceil(MV_NR0 * MV_NSG), t, 1);
+        let threads = mtl_size!(32, MV_NSG, 1);
+        encoder.dispatch_thread_groups(grid, threads);
+    }
+    drop(x_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (t, n_out)))
 }
 
 #[cfg(test)]

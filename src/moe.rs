@@ -216,17 +216,18 @@ impl ExpertFfn for FusedExperts {
         // Prefill (many tokens) uses the two-pass token-grouped matmul so each
         // expert's rows are dequantized once for all the tokens routed to it;
         // decode (batch=1, and short chunks) stays on the per-token matvec, which
-        // wins at low token counts. 32 is ggml's mm_id break-even point.
+        // wins at low token counts. MM_ID_MIN_SEQ is ggml's mm_id break-even point.
         // `LAGUNA_NO_MM_ID` forces mv_id everywhere as a fallback; mm_id is also
-        // skipped (mv_id fallback) for any dtype/top_k the vendored kernels are
-        // not instantiated for, so other checkpoints still run. Note mm_id's
+        // skipped (mv_id fallback) for any dtype/top_k/variant the vendored kernels
+        // are not instantiated for, so other checkpoints still run. Note mm_id's
         // tiled f32 accumulation drifts a little further from the per-row f32
         // reference oracle than mv_id does (fork-equivalent tiled behavior; see
         // docs/parity.md §3b), so mv_id is the reference for the strict gate.
-        let mm_supported = mm_id::supported(self.gate.dtype, top_k)
-            && mm_id::supported(self.up.dtype, top_k)
-            && mm_id::supported(self.down.dtype, top_k);
-        let use_mm = seq >= 32 && !crate::ops::no_mm_id() && mm_supported;
+        let variant = crate::ops::mm_id_variant();
+        let mm_supported = mm_id::supported(self.gate.dtype, top_k, variant)
+            && mm_id::supported(self.up.dtype, top_k, variant)
+            && mm_id::supported(self.down.dtype, top_k, variant);
+        let use_mm = seq >= crate::ops::MM_ID_MIN_SEQ && !crate::ops::no_mm_id() && mm_supported;
         let matmul = |stack: &ExpertStack, x: &Tensor, ids: &Tensor| -> Result<Tensor> {
             if use_mm {
                 mm_id::mul_mm_id(stack, x, ids)
