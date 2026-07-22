@@ -4,15 +4,38 @@ use candle_core::quantized::GgmlDType;
 
 use crate::gguf::ExpertStack;
 use crate::ops::MmVariant;
-use crate::ops::dispatch::{self, Mode};
+use crate::ops::dispatch::{self, Map0Scratch, Mode};
 
 /// Quantized gather-matmul over a stacked expert tensor (prefill path):
 /// tokens are grouped per expert so each expert's rows are read once per chunk.
-/// Dispatches the vendored `kernel_mul_mm_id_<dtype>_f32[_hp]`.
+/// Dispatches the vendored `kernel_mul_mm_id_<dtype>_f32[_hp]`. Self-contained:
+/// runs its own map0 pass. The production MoE block instead shares one map0 across
+/// its three projections via `prepare_map0` + `mul_mm_id_shared`.
 ///
 /// Shapes as in `mv_id::mul_mv_id`; t is the prefill chunk length.
 pub fn mul_mm_id(stack: &ExpertStack, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
     dispatch::run(stack, x, ids, Mode::Mm, crate::ops::mm_id_variant())
+}
+
+/// Build the shared map0 scratch (per-expert token-slot map) for one MoE block's
+/// three projections, from the block's `ids`. The three projections use the SAME
+/// ids, so the map is identical for all of them; running it once here and passing
+/// the returned scratch to `mul_mm_id_shared` for gate/up/down replaces two of the
+/// three map0 passes. The caller keeps the scratch alive across all three mm calls.
+/// The returned `Map0Scratch` carries the geometry it was laid out for, so a
+/// consumer projection is validated against the producer before it reads the map.
+pub(crate) fn prepare_map0(n_expert: usize, ids: &Tensor) -> Result<Map0Scratch> {
+    dispatch::prepare_mm_id_map0(n_expert, ids)
+}
+
+/// One mm_id projection against a `prepare_map0` scratch, skipping the map0 pass.
+pub(crate) fn mul_mm_id_shared(
+    stack: &ExpertStack,
+    x: &Tensor,
+    ids: &Tensor,
+    scratch: &Map0Scratch,
+) -> Result<Tensor> {
+    dispatch::run_mm_shared(stack, x, ids, crate::ops::mm_id_variant(), scratch)
 }
 
 /// Whether the vendored two-pass mm_id kernels are instantiated for this dtype,
@@ -361,6 +384,56 @@ mod tests {
         let x = Tensor::from_vec(vec![0f32; 16 * 1 * 256], (16, 1, 256), &device).unwrap();
         let ids = Tensor::from_vec(vec![0u32; 8 * 2], (8, 2), &device).unwrap();
         assert!(mul_mm_id(&stack, &x, &ids).is_err());
+    }
+
+    /// The shared-map0 path (`prepare_map0` + `mul_mm_id_shared`, used by the
+    /// production MoE block to build the per-expert token-slot map once for
+    /// gate/up/down) must produce BITWISE-identical output to the self-contained
+    /// `mul_mm_id`, for both the gate/up (shared-row) and down (per-slot)
+    /// geometries. The scratch contents are identical; only its address differs.
+    #[test]
+    fn shared_map0_matches_self_contained() {
+        let device = metal_device().unwrap();
+        let (n_expert, n_out, k) = (32usize, 64usize, 256usize);
+        let (t, top_k) = (48usize, 10usize);
+        let (stack, _) = build_stack(&device, GgmlDType::Q4K, n_expert, n_out, k, 0x91).unwrap();
+        let ids = distinct_ids(t, top_k, n_expert, 0x92);
+        let ids_t = Tensor::from_vec(ids, (t, top_k), &device).unwrap();
+
+        let scratch = prepare_map0(n_expert, &ids_t).unwrap();
+
+        // Dispatch prepare_map0's consumers with NO readback in between: a readback
+        // here would sync the queue and mask an ordering bug between the map0 write
+        // and the shared mm reads. Every input tensor is kept alive (its buffer must
+        // stay resident until the command buffer that reads it executes on the first
+        // readback below).
+        let mut inputs = Vec::new();
+        let mut outs = Vec::new();
+        for x_per_row in [1usize, top_k] {
+            let x_vec = pseudo_random(t * x_per_row * k, 0x93 + x_per_row as u64, -1.0, 1.0);
+            let x = Tensor::from_vec(x_vec, (t, x_per_row, k), &device).unwrap();
+            let owned = mul_mm_id(&stack, &x, &ids_t).unwrap();
+            let shared = mul_mm_id_shared(&stack, &x, &ids_t, &scratch).unwrap();
+            inputs.push(x);
+            outs.push((x_per_row, owned, shared));
+        }
+
+        // Read everything back only now. The first readback forces the whole batch
+        // (prepare_map0 + every consumer) to execute at once; a missing ordering
+        // guarantee between the map0 write and the shared reads surfaces here.
+        for (x_per_row, owned, shared) in &outs {
+            let owned = owned.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let shared = shared.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(owned.len(), shared.len());
+            for (o, s) in owned.iter().zip(shared.iter()) {
+                assert_eq!(
+                    o.to_bits(),
+                    s.to_bits(),
+                    "shared-map0 output differs from self-contained (x_per_row={x_per_row})"
+                );
+            }
+        }
+        drop(inputs);
     }
 
     /// PHASE 3 PROBE: confirm ggml's Metal-4 cooperative tensor ops

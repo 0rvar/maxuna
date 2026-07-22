@@ -221,7 +221,12 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// model resolved at load ("f16" default, "f32" under LAGUNA_ATTN_F32) — the
 /// gate enforces it per side/tier, so a dump from a binary that predates the
 /// f16 attention path (and thus omits the field) cannot pass as current.
-/// Additive: readers that ignore it still parse older/newer dumps.
+/// `combine` records the routed-expert combine path: "reference" for the
+/// Reference-oracle runner (which never touches `ops::combine` — it combines via
+/// its own per-expert index_add), else "fused" (default) or "classic" (under
+/// LAGUNA_COMBINE_CLASSIC) for the fused runner. The gate enforces it per
+/// side/tier (like `attn_dtype`), so a dump predating the field cannot pass as
+/// current. Additive: readers that ignore it still parse older/newer dumps.
 fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
     let attn_dtype = match model.attn_dtype() {
         DType::F32 => "f32",
@@ -235,6 +240,15 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         "no_mm_id": laguna::ops::no_mm_id_forced(),
         "mm_min_seq": laguna::ops::MM_ID_MIN_SEQ,
         "attn_dtype": attn_dtype,
+        // Reference runner never dispatches ops::combine, so it is neither
+        // "fused" nor "classic" — mirror how moe_impl distinguishes reference.
+        "combine": if matches!(moe_impl, "reference" | "ref") {
+            "reference"
+        } else if laguna::ops::combine_classic() {
+            "classic"
+        } else {
+            "fused"
+        },
     })
 }
 

@@ -33,6 +33,11 @@ const MV_SOURCE: &str = include_str!("mv.metal");
 /// `mv.metal` (attention-critical vs MoE-decode-critical: neither library can
 /// break the other).
 const F16_SOURCE: &str = include_str!("f16.metal");
+/// Vendored fused MoE weighted-combine kernels (the routed-expert combine tail).
+/// Own library (no Metal-4 dependency); compiled with FP contraction disabled so
+/// its per-op rounding stays bit-identical to the candle broadcast/affine/sum
+/// chain it replaces (see combine.metal).
+const COMBINE_SOURCE: &str = include_str!("combine.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -122,4 +127,9 @@ pub(crate) fn mv_pipeline(device: &Device, name: &str) -> Result<ComputePipeline
 /// Pipeline for an `f16.metal` kernel (vendored f16-weight attention matmul).
 pub(crate) fn f16_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, F16_SOURCE, "f16", name)
+}
+
+/// Pipeline for a `combine.metal` kernel (vendored fused MoE weighted combine).
+pub(crate) fn combine_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, COMBINE_SOURCE, "combine", name)
 }

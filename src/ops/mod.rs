@@ -1,9 +1,11 @@
+pub mod combine;
 mod dispatch;
 pub mod f16;
 pub mod mm_id;
 pub mod mv_id;
 mod pipelines;
 
+pub use combine::combine;
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
 pub use mm_id::mul_mm_id;
@@ -34,6 +36,19 @@ pub(crate) fn no_mm_id() -> bool {
 /// Public view of the cached `LAGUNA_NO_MM_ID` switch, for dump provenance.
 pub fn no_mm_id_forced() -> bool {
     no_mm_id()
+}
+
+/// `LAGUNA_COMBINE_CLASSIC=1` reverts the routed-expert weighted combine from the
+/// vendored fused kernel (`ops::combine`) back to candle's broadcast/affine/sum
+/// chain. The fused kernel is bit-identical to that chain by construction, so this
+/// is a safety kill-switch and provenance anchor, not a correctness tier.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling MoE switches
+/// (`no_mm_id`, `mv_classic`): any value enables it — only leaving it unset keeps
+/// the fused path.
+pub fn combine_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_COMBINE_CLASSIC").is_some())
 }
 
 /// The active mm_id kernel variant's provenance name (e.g. `"tensor"`), for

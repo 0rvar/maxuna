@@ -199,11 +199,21 @@ struct FusedExperts {
 
 impl FusedExperts {
     fn new(w: &Weights) -> Result<Self> {
-        Ok(Self {
-            gate: w.expert_stack("ffn_gate_exps")?,
-            up: w.expert_stack("ffn_up_exps")?,
-            down: w.expert_stack("ffn_down_exps")?,
-        })
+        let gate = w.expert_stack("ffn_gate_exps")?;
+        let up = w.expert_stack("ffn_up_exps")?;
+        let down = w.expert_stack("ffn_down_exps")?;
+        // The shared map0 pass is built once from `gate.n_expert` and reused for
+        // all three projections; a stack disagreeing on n_expert would read the
+        // ids-map at the wrong offset. (run_mm_shared re-validates per dispatch,
+        // but a mismatch here is a malformed checkpoint — fail at load.)
+        anyhow::ensure!(
+            gate.n_expert == up.n_expert && gate.n_expert == down.n_expert,
+            "MoE expert stacks disagree on n_expert: gate={}, up={}, down={}",
+            gate.n_expert,
+            up.n_expert,
+            down.n_expert
+        );
+        Ok(Self { gate, up, down })
     }
 }
 
@@ -228,11 +238,20 @@ impl ExpertFfn for FusedExperts {
             && mm_id::supported(self.up.dtype, top_k, variant)
             && mm_id::supported(self.down.dtype, top_k, variant);
         let use_mm = seq >= crate::ops::MM_ID_MIN_SEQ && !crate::ops::no_mm_id() && mm_supported;
+
+        // One map0 pass (per-expert token-slot map) shared by gate/up/down: the
+        // three projections route by the SAME ids, so their maps are byte-identical.
+        // Built once here and held for the whole forward — the down projection reads
+        // it after silu/rescale — replacing two of the three per-projection passes.
+        let map0 = if use_mm {
+            Some(mm_id::prepare_map0(self.gate.n_expert, ids)?)
+        } else {
+            None
+        };
         let matmul = |stack: &ExpertStack, x: &Tensor, ids: &Tensor| -> Result<Tensor> {
-            if use_mm {
-                mm_id::mul_mm_id(stack, x, ids)
-            } else {
-                mv_id::mul_mv_id(stack, x, ids)
+            match &map0 {
+                Some(scratch) => mm_id::mul_mm_id_shared(stack, x, ids, scratch),
+                None => mv_id::mul_mv_id(stack, x, ids),
             }
         };
 
@@ -260,6 +279,10 @@ impl ExpertFfn for FusedExperts {
         // reference oracle also uses. See docs/parity.md §3b and TODO.md.
         let act = (silu(&gate)? * up)?; // [seq, top_k, expert_ff]
 
+        // Routing weights, f32 [seq, top_k]; the fused combine takes this shape,
+        // the classic candle chain reshapes to [seq, top_k, 1] for broadcasting.
+        let w = weights.to_dtype(DType::F32)?;
+
         if needs_rescale {
             // Per-column L2 rescale keeps the f16-tile down cast in range; the
             // factor divides back out afterwards (a per-column identity). 32768
@@ -272,16 +295,25 @@ impl ExpertFfn for FusedExperts {
                 .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
             let act_s = (&act * f16_safe)?.broadcast_div(&col_l2)?;
             let down = matmul(&self.down, &act_s, ids)?; // [seq, top_k, hidden]
-            let down = (down.broadcast_mul(&col_l2)? * (1.0 / f16_safe))?;
-            let w = weights.to_dtype(DType::F32)?.reshape((seq, top_k, 1))?;
-            return Ok(down.broadcast_mul(&w)?.sum(1)?);
+            // Undo the L2 scale, apply routing weights, sum over top_k. The fused
+            // kernel does all three in one pass over `down`, bit-identically to the
+            // candle chain; LAGUNA_COMBINE_CLASSIC keeps the candle chain.
+            if crate::ops::combine_classic() {
+                let down = (down.broadcast_mul(&col_l2)? * (1.0 / f16_safe))?;
+                let w = w.reshape((seq, top_k, 1))?;
+                return Ok(down.broadcast_mul(&w)?.sum(1)?);
+            }
+            return crate::ops::combine(&down, Some(&col_l2), &w);
         }
 
         // Default: f32 down projection (mv_id or mm_id-hp) — no f16 cast, so the
         // activation feeds the down matmul directly, no rescale needed.
         let down = matmul(&self.down, &act, ids)?; // [seq, top_k, hidden]
-        let w = weights.to_dtype(DType::F32)?.reshape((seq, top_k, 1))?;
-        Ok(down.broadcast_mul(&w)?.sum(1)?)
+        if crate::ops::combine_classic() {
+            let w = w.reshape((seq, top_k, 1))?;
+            return Ok(down.broadcast_mul(&w)?.sum(1)?);
+        }
+        crate::ops::combine(&down, None, &w)
     }
 }
 
@@ -1098,6 +1130,266 @@ mod tests {
                  {N_DISTINCT} distinct MoE layers looped {PASSES}x (SLC caveat as in \
                  moe_decode_ffn_bench)"
             );
+        }
+
+        // --- prefill-isolation benches (seq=512) ---------------------------
+        //
+        // Each isolates one dispatch group of the production MoE block at
+        // prefill width so the per-layer prefill budget can be attributed to a
+        // category (routing glue / mm_id expert matmuls / silu+rescale glue /
+        // weighted combine / shared expert / norm+residual). Synthetic weights
+        // at production geometry — never load a model file.
+        // `prefill_moe_block_bench` runs the whole production `MoeBlock::forward`
+        // (mm_id prefill path) and is the sum-check for the isolated parts.
+        // Run one at a time, e.g.
+        // `cargo test --release prefill_route_bench -- --ignored --nocapture`.
+
+        /// Prefill chunk length the isolation benches share, so their numbers
+        /// are directly comparable (same seq everywhere, top_k 10, hidden 3072,
+        /// expert_ff 1024, 256 experts).
+        const PREFILL_SEQ: usize = 512;
+
+        /// A [seq, hidden] prefill activation with residual-stream conditioning
+        /// (RMS ~1, like a well-behaved ffn_norm output).
+        fn prefill_input(seed: u64, dev: &Device) -> Tensor {
+            det_tensor(&[PREFILL_SEQ, HIDDEN], seed, 1.7).to_device(dev).unwrap()
+        }
+
+        /// Routing glue alone (`MoeBlock::route`): the router matmul plus the
+        /// ~10-dispatch decision chain (sigmoid, bias add, top-k argsort,
+        /// narrow/contiguous, gather, sum, clamp, div, scale) over x=[512,3072].
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_route_bench() {
+            let dev = metal();
+            let (_ffn_norm, moe) = build_moe_layer(0, &dev);
+            let x = prefill_input(0x4242, &dev);
+            bench(
+                &format!(
+                    "prefill routing glue, seq={PREFILL_SEQ} \
+                     (router matmul + sigmoid + bias + top-k argsort + gather/normalize/scale)"
+                ),
+                || {
+                    let (_ids, w) = moe.route(&x).unwrap();
+                    read_scalar(&w)
+                },
+            );
+        }
+
+        /// The three expert mm_id dispatches (gate/up/down) at prefill width,
+        /// each timed on its own. gate/up read one shared activation per token
+        /// (x=[512,1,3072] -> [512,10,1024]); down reads a per-slot activation
+        /// (act=[512,10,1024] -> [512,10,3072]). Real top-10 selections from the
+        /// production router drive the per-expert row grouping, so the
+        /// token-to-expert distribution matches a real chunk. Default `_t`
+        /// tensor variant (seq >= MM_ID_MIN_SEQ).
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_mm_id_bench() {
+            let dev = metal();
+            let (_ffn_norm, moe) = build_moe_layer(0, &dev);
+            let x = prefill_input(0x4242, &dev);
+            let (ids, _w) = moe.route(&x).unwrap();
+
+            let gate = tiled_stack(&dev, EXPERT_FF, HIDDEN, 0x9001);
+            let up = tiled_stack(&dev, EXPERT_FF, HIDDEN, 0x9002);
+            let down = tiled_stack(&dev, HIDDEN, EXPERT_FF, 0x9003);
+            let x_g = x.reshape((PREFILL_SEQ, 1, HIDDEN)).unwrap();
+            let act = det_tensor(&[PREFILL_SEQ, TOP_K, EXPERT_FF], 0x9004, 0.5)
+                .to_device(&dev)
+                .unwrap();
+
+            // gate/up/down are identical-cost matmuls, but timing them in three
+            // SEPARATE bench() calls let the first (gate) catch the DVFS boost clock
+            // and read low while the later ones ran on the clamped sustained clock.
+            // One shared warmup then a single interleaved loop with per-projection
+            // timers keeps all three on the same (sustained) clock state; each
+            // read_scalar still flushes so the per-projection numbers stay isolated.
+            let (warm, iters) = iter_counts();
+            let mut sink = 0f32;
+            for _ in 0..warm {
+                sink += read_scalar(&crate::ops::mul_mm_id(&gate, &x_g, &ids).unwrap());
+                sink += read_scalar(&crate::ops::mul_mm_id(&up, &x_g, &ids).unwrap());
+                sink += read_scalar(&crate::ops::mul_mm_id(&down, &act, &ids).unwrap());
+            }
+            let mut gate_t = Vec::with_capacity(iters);
+            let mut up_t = Vec::with_capacity(iters);
+            let mut down_t = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t = Instant::now();
+                sink += read_scalar(&crate::ops::mul_mm_id(&gate, &x_g, &ids).unwrap());
+                gate_t.push(t.elapsed().as_secs_f64() * 1e3);
+                let t = Instant::now();
+                sink += read_scalar(&crate::ops::mul_mm_id(&up, &x_g, &ids).unwrap());
+                up_t.push(t.elapsed().as_secs_f64() * 1e3);
+                let t = Instant::now();
+                sink += read_scalar(&crate::ops::mul_mm_id(&down, &act, &ids).unwrap());
+                down_t.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let report = |name: &str, times: &[f64]| {
+                let mean = times.iter().sum::<f64>() / times.len() as f64;
+                let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+                eprintln!(
+                    "{name}: mean {mean:.3} ms/iter, min {min:.3} ms/iter ({iters} iters, sink {sink:.1})"
+                );
+            };
+            report(
+                &format!("prefill mm_id gate matmul, seq={PREFILL_SEQ} (x[512,1,3072] -> [512,10,1024])"),
+                &gate_t,
+            );
+            report(
+                &format!("prefill mm_id up matmul, seq={PREFILL_SEQ} (x[512,1,3072] -> [512,10,1024])"),
+                &up_t,
+            );
+            report(
+                &format!("prefill mm_id down matmul, seq={PREFILL_SEQ} (act[512,10,1024] -> [512,10,3072])"),
+                &down_t,
+            );
+        }
+
+        /// The silu*mul + per-column L2 rescale glue over [512,10,1024], the
+        /// default `_t` tensor variant's activation path: it stages the down
+        /// input as f16, so it runs the L2 guard (moe.rs FusedExperts::forward).
+        /// Mirrors that exact chain — silu(gate)*up, then column L2, scale up by
+        /// f16's safe headroom and divide out — with synthetic gate/up inputs.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_silu_rescale_bench() {
+            let dev = metal();
+            let gate = det_tensor(&[PREFILL_SEQ, TOP_K, EXPERT_FF], 0xA001, 0.5)
+                .to_device(&dev)
+                .unwrap();
+            let up = det_tensor(&[PREFILL_SEQ, TOP_K, EXPERT_FF], 0xA002, 0.5)
+                .to_device(&dev)
+                .unwrap();
+            let f16_safe = 32768.0_f64;
+            bench(
+                &format!("prefill silu*mul + L2 rescale glue, seq={PREFILL_SEQ} over [512,10,1024]"),
+                || {
+                    let act = (silu(&gate).unwrap() * up.clone()).unwrap();
+                    let col_l2 = act
+                        .sqr()
+                        .unwrap()
+                        .sum_keepdim(2)
+                        .unwrap()
+                        .sqrt()
+                        .unwrap()
+                        .clamp(1e-8_f32, 1e30_f32)
+                        .unwrap();
+                    let act_s = (&act * f16_safe).unwrap().broadcast_div(&col_l2).unwrap();
+                    read_scalar(&act_s)
+                },
+            );
+        }
+
+        /// The weighted-combine tail of the rescale branch over [512,10,3072]:
+        /// undo the per-column L2 scale, apply the routing weights, sum over the
+        /// top-k experts to [512,3072] — the production `ops::combine` fused kernel
+        /// (rescale variant), which reads `down` once. Synthetic down / col_l2 /
+        /// weights at production shapes.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_combine_bench() {
+            let dev = metal();
+            let down = det_tensor(&[PREFILL_SEQ, TOP_K, HIDDEN], 0xB001, 0.5)
+                .to_device(&dev)
+                .unwrap();
+            // col_l2 is a positive per-column norm; keep it strictly > 0.
+            let col_l2 = det_tensor(&[PREFILL_SEQ, TOP_K, 1], 0xB002, 0.5)
+                .abs()
+                .unwrap()
+                .affine(1.0, 0.1)
+                .unwrap()
+                .to_device(&dev)
+                .unwrap();
+            let weights = det_tensor(&[PREFILL_SEQ, TOP_K], 0xB003, 0.25)
+                .to_device(&dev)
+                .unwrap();
+            bench(
+                &format!("prefill weighted combine (fused), seq={PREFILL_SEQ} over [512,10,3072] -> [512,3072]"),
+                || read_scalar(&crate::ops::combine(&down, Some(&col_l2), &weights).unwrap()),
+            );
+        }
+
+        /// The always-on shared-expert SwiGLU (q4_K QLinear gate/up/down) at
+        /// prefill width, through the production `SharedExpert::forward`.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_shared_expert_bench() {
+            let dev = metal();
+            let (_ffn_norm, moe) = build_moe_layer(0, &dev);
+            let x = prefill_input(0x4242, &dev);
+            bench(
+                &format!("prefill shared expert SwiGLU (q4_K), seq={PREFILL_SEQ}"),
+                || read_scalar(&moe.shared.forward(&x).unwrap()),
+            );
+        }
+
+        /// The per-layer norm/residual glue model.rs wraps each block with:
+        /// attn_norm -> +attn, ffn_norm -> +moe — 2 rms_norm + 2 adds at
+        /// [512,3072]. Synthetic block outputs stand in for the attention and
+        /// MoE contributions; only the norm+add dispatch cost is being priced.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_norm_residual_bench() {
+            let dev = metal();
+            let attn_norm = norm(HIDDEN, 0xC001, &dev);
+            let ffn_norm = norm(HIDDEN, 0xC002, &dev);
+            let x0 = prefill_input(0x4242, &dev);
+            let attn_out = prefill_input(0xC003, &dev);
+            let moe_out = prefill_input(0xC004, &dev);
+            bench(
+                &format!("prefill norm+residual glue, seq={PREFILL_SEQ} (2 rms_norm + 2 adds at [512,3072])"),
+                || {
+                    let _attn_normed = attn_norm.forward(&x0).unwrap();
+                    let x = (&x0 + &attn_out).unwrap();
+                    let _ffn_normed = ffn_norm.forward(&x).unwrap();
+                    let x = (&x + &moe_out).unwrap();
+                    read_scalar(&x)
+                },
+            );
+        }
+
+        /// Whole synthetic MoE block at prefill width through the production
+        /// `MoeBlock::forward`: ffn_norm -> route -> mm_id experts (default
+        /// tensor variant, seq >= MM_ID_MIN_SEQ) -> silu*mul + rescale ->
+        /// weighted combine -> +shared expert. The sum-check for the isolated
+        /// parts above; prints a 10-iter-group time series so the boost ->
+        /// sustained plateau is visible.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_moe_block_bench() {
+            let dev = metal();
+            let (ffn_norm, moe) = build_moe_layer(0, &dev);
+            let x0 = prefill_input(0x4242, &dev);
+            let (warm, iters) = iter_counts();
+            let step = || -> f32 {
+                let normed = ffn_norm.forward(&x0).unwrap();
+                read_scalar(&moe.forward(&normed).unwrap())
+            };
+            let mut sink = 0f32;
+            for _ in 0..warm {
+                sink += step();
+            }
+            let mut times = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t = Instant::now();
+                sink += step();
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+            eprintln!(
+                "prefill MoE block (ffn_norm + route + mm_id experts + silu/rescale + combine + \
+                 shared), seq={PREFILL_SEQ}: mean {mean:.3} ms/iter, min {min:.3} ms/iter \
+                 ({iters} iters, sink {sink:.1})"
+            );
+            let chunk = (iters / 10).max(1);
+            let series: Vec<String> = times
+                .chunks(chunk)
+                .map(|c| format!("{:.2}", c.iter().sum::<f64>() / c.len() as f64))
+                .collect();
+            eprintln!("time series (means of {chunk}-iter groups, ms): [{}]", series.join(", "));
         }
     }
 }

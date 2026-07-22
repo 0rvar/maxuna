@@ -29,14 +29,33 @@
    modes (18.2/18.5 LPM, 38.6/39.2 full); fork's historical bench figures were
    LPM; prefill gap is mode-independent 0.42-0.49x (2×2 matrix + traps in
    docs/log.md power-calibration entry).
-2. **MoE route+glue+combine fusion** (prefill; ours is 0.42-0.49x the fork's
-   pp512 in BOTH power modes — 174 vs 354 LPM, 415 vs 990 full — and the gap
-   is surrounding dispatch overhead, not the matmul). Now fusable INTO the
-   owned mv.metal/mm_id kernels — the strategic payoff of vendoring.
-3. **mmap + no-copy model load** (see ledger item below) — dev-velocity
+2. **MoE combine fusion + shared map0** (prefill; ours is 0.42-0.49x the
+   fork's pp512 in BOTH power modes — 174 vs 354 LPM, 415 vs 990 full).
+   RESCOPED 2026-07-22 by the measured prefill budget (docs/log.md P2-phase-0
+   entry; `prefill_*` benches in moe.rs/attention.rs): the ~10-dispatch
+   routing glue is only ~0.6 ms/layer (~1% of prefill) — routing-glue fusion
+   DEMOTED (folded into the encoder-takeover ledger item); the COMBINE chain
+   (3 broadcast_muls + sum(1) over the [512,10,3072]/63MB expert output) is
+   ~14.8 ms/layer ≈ 23% of prefill, ~9x its bandwidth floor — candle's
+   broadcast ops take slow strided paths. Do now: (a) one fused combine
+   kernel, `sum_i(down_i × col_l2 × 1/32768 × w_i)` reading the expert output
+   once, f32 accumulation mirroring candle's reduce order, kill-switch + gated
+   like every owned kernel; (b) compute the mm_id map0 row-map ONCE per MoE
+   block instead of 3x (bit-identical by construction; the fork recomputes
+   too, so it's an absolute win over it — and the gate 3.0 vs up 7.9 ms
+   anomaly on identical shapes needs explaining first). Expected ~25% prefill.
+3. **Attention block cost, prefill edition** — the prefill budget puts
+   attention at 23.6 (full) / 30.1 (SWA) ms/layer ≈ 46% of the whole forward:
+   the single biggest prefill category, ahead of everything MoE. Subsumes the
+   old P1(b) decode glue fusion (~6 ms sustained: QK-norm, rope, softplus,
+   transpose/contiguous copies, sdpa casts + mask materialization) — attack
+   both seq regimes together.
+4. **MoE-block encoder takeover** (ledger item below) — concurrency +
+   range-tracked barriers; now also owns the demoted routing-glue fusion.
+5. **mmap + no-copy model load** (see ledger item below) — dev-velocity
    multiplier: every parity/bench cycle pays ~30 s/load today.
-4. **DFlash speculative decoding** — multiplies whatever decode speed exists,
-   so it lands after P1.
+6. **DFlash speculative decoding** — multiplies whatever decode speed exists,
+   so it lands last.
 
 - [x] **Prefill mm_id kernel (biggest perf item)** — DONE. Vendored ggml's
   two-pass token→expert row-map kernels (`src/ops/mm_id.metal`, runtime-compiled
@@ -79,8 +98,8 @@
     argsort/gather, the ~6-op L2 rescale glue, silu*mul, combine, shared expert,
     and the attention chain) that ggml fuses into far fewer, plus candle per-op
     overhead. The rescale glue is NOT the bottleneck (tensor-hp has none yet is
-    slower). Next lever: fuse the MoE route+glue+combine (bit-identical-to-candle
-    constraint from the router-cascade lesson) and/or reduce candle dispatch count.
+    slower). 2026-07-22 measured budget re-attributed this gap: combine chain
+    ~23%, attention ~46%, routing glue only ~1% — see priority items 2-4.
 - [ ] **Decode kernel work** — 12.5 -> 13.5 tok/s after glue removal; fork is
   18.1 @512ctx. Per-token budget (2026-07-22, ~512 ctx). FFN sweep (80.0 ms
   total): routed mv_id gate/up/down gather 18.4 ms; routing+combine 4.3 ms;
@@ -156,6 +175,22 @@
     attention per-layer dispatch chain (48.6 ms). DECIDED (Orvar, 2026-07-22):
     vendored stays the default — insulates these two paths from upstream candle
     kernel changes; `LAGUNA_MV_CLASSIC` remains the escape hatch.
+- [ ] **MoE-block encoder takeover: concurrency + range-tracked barriers**
+  (deferred follow-up to P2, decided 2026-07-22) — the fork's 2x prefill edge on
+  Metal is NOT fusion (it has no Metal topk_moe kernel; ~30 dispatches/block)
+  but scheduling: one compute encoder with concurrent dispatch where a memory
+  barrier is inserted ONLY when a dispatch's buffer ranges overlap a pending
+  write (ggml-metal-ops.cpp mem_ranges :150-210), graph reorder into concurrent
+  sets (ggml-metal-common.cpp:209/375), and multi-threaded command-buffer
+  encoding (ggml-metal-context.m:550, up to 8 threads). Candle's eager op-per-
+  encoder submission serializes all of it — e.g. the shared expert and the tiny
+  routing kernels could overlap the heavy expert GEMMs but don't. Taking over
+  encoding of the whole MoE block inside our dispatch layer (all ops between
+  ffn_norm and the residual add issued into one concurrent encoder with
+  ggml-style range tracking) is the remaining big prefill lever after routing-
+  glue fusion + map0 sharing land. Requires every op in the block to be an
+  owned kernel (or a candle op we re-encode) — the strategic endgame of
+  vendoring.
 - [ ] **Track B dumps for text-mixed / long-swa** — the full-logit reference-vs-
   fused gate ran only on code-short (greedy covers the other two fixtures);
   generate the remaining dumps if fused ever changes.
@@ -248,3 +283,13 @@ implementation — never silently drop scope.
   prefill gemm (src/ops/f16.metal) uses the classic simdgroup path; the fork on M5
   would take the cooperative-tensor mul_mm for f16×f32. Potential prefill perf
   follow-up; correctness unaffected.
+- [x] **Combine-library reassociation hardening — RESOLVED via source pragma**
+  (2026-07-22). The fused combine kernels' bit-identity to candle's chain rests
+  on the rescale multiply chain (`r1 = d*l; r2 = r1*2^-15; r3 = r2*ww`) NOT
+  being reassociated; `fp contract(off)` alone doesn't cover that. The
+  MTLCompileOptions route is impossible at the pinned candle rev (no re-export
+  of `objc2_metal`, no factory returning options — adding objc2-metal is the
+  documented trap), so combine.metal carries `#pragma clang fp reassociate(off)`
+  at file scope instead. clang REJECTS unknown `fp` pragma options, so the
+  library compiling (it does — `fused_matches_candle_bitwise` passes) proves the
+  pragma is honored. Revisit only if a candle bump ever exposes compile options.

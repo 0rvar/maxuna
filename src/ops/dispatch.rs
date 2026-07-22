@@ -264,6 +264,33 @@ struct MvIdArgs {
     nr0: i32,
 }
 
+/// Matches the Metal `combine_args` struct (src/ops/combine.metal). `#[repr(C)]`
+/// pins the layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CombineArgs {
+    top_k: i32,
+    n_out: i32,
+}
+
+/// candle's `fast_sum` threadgroup width for a `top_k`-wide reduction:
+/// `min(pipeline_max, next_pow2(top_k/2))`. The combine kernels reproduce it so
+/// the simd_sum lane partition matches candle's reduction order bit-for-bit, but
+/// they fold only ONE 32-lane simdgroup (see combine.metal), so a width above 32
+/// would silently drop lanes 32.. — `run_combine` bails when this exceeds 32.
+fn combine_reduction_width(top_k: usize) -> usize {
+    (top_k / 2).next_power_of_two()
+}
+
+/// Whether the combine kernel's i32 index math (`down_base = s*top_k*n_out + c`,
+/// plus the strided `k*n_out` loads) stays within i32 for the whole grid. The
+/// largest flat index into `down` approaches `seq*top_k*n_out`; computed in i64
+/// so the check itself cannot overflow. `run_combine` bails when this is false
+/// rather than let the kernel wrap to a negative offset.
+fn combine_index_fits_i32(seq: usize, top_k: usize, n_out: usize) -> bool {
+    (seq as i64) * (top_k as i64) * (n_out as i64) <= i32::MAX as i64
+}
+
 /// The fork's host-side mv/mm break-even for the float-family mul_mat path
 /// (ggml-metal-ops.cpp `ne11_mm_min`): the tiled matmul kernel is dispatched
 /// when the token count EXCEEDS this, the gemv otherwise. `run_matmul_f16`
@@ -449,89 +476,109 @@ pub(crate) fn mm_scratch_elems(n_expert: usize, t: usize) -> usize {
     n_expert + n_expert * t
 }
 
-/// Encode the two-pass indexed matmul (prefill path) against the vendored
-/// `mm_id.metal` kernels. Pass 1 (`map0`) builds, per expert, the compacted list
-/// of token-slots routed to it plus a count; pass 2 (`mul_mm_id`) does the
-/// token-grouped quantized matmul, with each expert's threadgroups covering only
-/// its own rows. The two scratch regions live at the tail of `d.dst`.
+/// The live-field subset needed to encode the map0 pass. map0's output (per-expert
+/// token count + compacted token-slot list) depends ONLY on the ids and
+/// t/top_k/n_expert — the expert count comes from the dispatched thread count and
+/// the other `Map0Args` fields (ne10/ne11/nb11/nb12) are not read by the kernel —
+/// so ONE map0 pass serves every projection of a MoE block regardless of each
+/// projection's k / x_per_row (they differ between gate/up and down).
+struct Map0Dispatch<'a> {
+    ids: &'a Buffer,
+    ids_off: usize,
+    n_expert: usize,
+    top_k: usize,
+    t: usize,
+}
+
+/// Byte width of one scratch entry (tpe counts and ids-map slots are both i32).
+const MM_SCRATCH_ENTRY_BYTES: usize = 4;
+
+/// Encode the map0 pass: one thread per expert builds that expert's compacted
+/// token-slot list (`ids-map`, written at `ids_map_off`) and its token-slot count
+/// (`tpe`, written at `tpe_off`) into `scratch`. `tpe` is `n_expert` i32; `ids-map`
+/// is `n_expert*t` i32 (see `mm_scratch_elems`). The dead `Map0Args` fields
+/// (ne10/ne11/nb11/nb12) are zeroed — the kernel never reads them.
+fn encode_map0(
+    device: &MetalDevice,
+    ep: impl EncoderProvider,
+    m: &Map0Dispatch,
+    scratch: &Buffer,
+    tpe_off: usize,
+    ids_map_off: usize,
+) -> Result<()> {
+    let map0_name = map0_kernel_name(m.top_k)?;
+    let map0 = pipelines::mm_id_pipeline(device.device(), &map0_name)?;
+
+    // map0 runs one thread per expert; the ids scratch it reads into holds
+    // n_expert * top_k u16 entries.
+    let map0_smem = m.n_expert * m.top_k * std::mem::size_of::<u16>();
+    if map0_smem > MAX_THREADGROUP_SMEM {
+        bail!(
+            "kernel_mul_mm_id_map0 needs {map0_smem} bytes of threadgroup memory for \
+             n_expert={} top_k={}, over the {MAX_THREADGROUP_SMEM}-byte limit",
+            m.n_expert,
+            m.top_k
+        );
+    }
+    if m.n_expert > map0.max_total_threads_per_threadgroup() {
+        bail!(
+            "kernel_mul_mm_id_map0 dispatches {} threads/threadgroup, over the pipeline max {}",
+            m.n_expert,
+            map0.max_total_threads_per_threadgroup()
+        );
+    }
+
+    let map0_args = Map0Args {
+        ne02: m.n_expert as i32,
+        ne10: 0,
+        ne11: 0,
+        nb11: 0,
+        nb12: 0,
+        ne21: m.t as i32,
+        ne20: m.top_k as i32,
+        nb21: (m.top_k * DType::U32.size_in_bytes()) as u64,
+    };
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    // buffers: 0=args, 1=ids, 2=tpe out, 3=ids-map out.
+    encoder.set_compute_pipeline_state(&map0);
+    encoder.set_bytes(0, &map0_args);
+    encoder.set_input_buffer(1, Some(m.ids), m.ids_off);
+    encoder.set_output_buffer(2, Some(scratch), tpe_off);
+    encoder.set_output_buffer(3, Some(scratch), ids_map_off);
+    encoder.set_threadgroup_memory_length(0, map0_smem);
+    encoder.dispatch_thread_groups(mtl_size!(1, 1, 1), mtl_size!(m.n_expert, 1, 1));
+    Ok(())
+}
+
+/// Encode the token-grouped matmul pass: each expert's threadgroups cover only
+/// its own rows, read from the `tpe`/`ids-map` regions of `scratch` that a prior
+/// `encode_map0` wrote. Writes the `[t, top_k, n_out]` result to `d.dst`.
 ///
 /// `variant` picks the mm_id kernel family (tensor `_t` / classic `_hp` / classic
 /// f16), threaded in from the single cached read in `ops::mm_id_variant`, never
 /// re-read here. It sets the kernel host-name suffix and the tile smem.
 ///
-/// Ordering: `map0` marks tpe/ids-map as write outputs and `mul_mm_id` reads
-/// them back as inputs on the same buffer, so candle's encoder auto-inserts the
-/// RAW memory barrier between the two dispatches (its `Output`-mark hazard
-/// tracking); no explicit barrier is needed.
-pub(crate) fn encode_mul_mm_id(
+/// Ordering: `encode_map0` marked tpe/ids-map as outputs and this pass reads them
+/// as inputs on the same buffer, so candle inserts the RAW barrier automatically
+/// (its Output-mark hazard tracking within an encoder, or the per-encoder fence
+/// wait across encoders when the two passes are submitted separately).
+fn encode_mm(
     device: &MetalDevice,
     ep: impl EncoderProvider,
     dt: GgmlDType,
     d: &IdDispatch,
     variant: MmVariant,
+    scratch: &Buffer,
+    tpe_off: usize,
+    ids_map_off: usize,
 ) -> Result<()> {
     let mm_name = format!("{}{}", mm_kernel_name(dt)?, variant.suffix());
-    let map0_name = map0_kernel_name(d.top_k)?;
-
-    // Scratch offsets on the dst buffer, in bytes (i32-wide entries throughout).
-    const I32_BYTES: usize = 4;
-    let tpe_off = d.t * d.top_k * d.n_out * DType::F32.size_in_bytes();
-    let ids_map_off = tpe_off + d.n_expert * I32_BYTES;
-
-    let map0 = pipelines::mm_id_pipeline(device.device(), &map0_name)?;
     let mm = pipelines::mm_id_pipeline(device.device(), &mm_name)?;
-
-    // map0 runs one thread per expert; the ids scratch it reads into holds
-    // n_expert * top_k u16 entries.
-    let map0_smem = d.n_expert * d.top_k * std::mem::size_of::<u16>();
-    if map0_smem > MAX_THREADGROUP_SMEM {
-        bail!(
-            "kernel_mul_mm_id_map0 needs {map0_smem} bytes of threadgroup memory for \
-             n_expert={} top_k={}, over the {MAX_THREADGROUP_SMEM}-byte limit",
-            d.n_expert,
-            d.top_k
-        );
-    }
-    if d.n_expert > map0.max_total_threads_per_threadgroup() {
-        bail!(
-            "kernel_mul_mm_id_map0 dispatches {} threads/threadgroup, over the pipeline max {}",
-            d.n_expert,
-            map0.max_total_threads_per_threadgroup()
-        );
-    }
 
     let nb11 = (d.k * DType::F32.size_in_bytes()) as u64;
     let nb12 = (d.x_per_row * d.k * DType::F32.size_in_bytes()) as u64;
-    let nb21 = (d.top_k * DType::U32.size_in_bytes()) as u64;
 
-    let encoder = ep.encoder();
-    let encoder: &ComputeCommandEncoder = encoder.as_ref();
-
-    // ---- Pass 1: map0 (buffers: 0=args, 1=ids, 2=tpe out, 3=ids-map out).
-    let map0_args = Map0Args {
-        ne02: d.n_expert as i32,
-        ne10: d.k as i32,
-        ne11: d.x_per_row as i32,
-        nb11,
-        nb12,
-        ne21: d.t as i32,
-        ne20: d.top_k as i32,
-        nb21,
-    };
-    encoder.set_compute_pipeline_state(&map0);
-    encoder.set_bytes(0, &map0_args);
-    encoder.set_input_buffer(1, Some(d.ids), d.ids_off);
-    encoder.set_output_buffer(2, Some(d.dst), tpe_off);
-    encoder.set_output_buffer(3, Some(d.dst), ids_map_off);
-    encoder.set_threadgroup_memory_length(0, map0_smem);
-    encoder.dispatch_thread_groups(mtl_size!(1, 1, 1), mtl_size!(d.n_expert, 1, 1));
-
-    // No explicit barrier needed: map0 marked tpe/ids-map as outputs, and pass 2
-    // reads them back as inputs on the same buffer, so candle's encoder inserts
-    // the RAW barrier automatically (Output-mark hazard tracking, verified in
-    // candle's vendored auto_barrier).
-
-    // ---- Pass 2: mul_mm_id (0=args, 1=weights, 2=x, 3=tpe, 4=ids-map, 5=dst).
     let mm_args = MmIdArgs {
         ne00: d.k as i32,
         ne02: d.n_expert as i32,
@@ -550,18 +597,48 @@ pub(crate) fn encode_mul_mm_id(
         r2: 1,
         r3: 1,
     };
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    // buffers: 0=args, 1=weights, 2=x, 3=tpe, 4=ids-map, 5=dst.
     encoder.set_compute_pipeline_state(&mm);
     encoder.set_bytes(0, &mm_args);
     encoder.set_input_buffer(1, Some(d.weights), 0);
     encoder.set_input_buffer(2, Some(d.x), d.x_off);
-    encoder.set_input_buffer(3, Some(d.dst), tpe_off);
-    encoder.set_input_buffer(4, Some(d.dst), ids_map_off);
+    encoder.set_input_buffer(3, Some(scratch), tpe_off);
+    encoder.set_input_buffer(4, Some(scratch), ids_map_off);
     encoder.set_output_buffer(5, Some(d.dst), 0);
     encoder.set_threadgroup_memory_length(0, variant.tile_smem());
 
     // grid: 32-wide token-slot columns, 64-wide n_out rows, one z-slab per expert.
     let grid = mtl_size!(d.t.div_ceil(32), d.n_out.div_ceil(64), d.n_expert);
     encoder.dispatch_thread_groups(grid, mtl_size!(128, 1, 1));
+    Ok(())
+}
+
+/// Encode the self-contained two-pass indexed matmul (standalone prefill path):
+/// map0 then mm, with both scratch regions living at the tail of `d.dst` (offsets
+/// past the `[t, top_k, n_out]` output). The returned tensor keeps the whole
+/// allocation resident, so the scratch shares its lifetime instead of racing the
+/// buffer pool. The shared-map0 production path (`prepare_mm_id_map0` +
+/// `run_mm_shared`) uses a dedicated scratch buffer instead.
+pub(crate) fn encode_mul_mm_id(
+    device: &MetalDevice,
+    ep: impl EncoderProvider + Copy,
+    dt: GgmlDType,
+    d: &IdDispatch,
+    variant: MmVariant,
+) -> Result<()> {
+    let tpe_off = d.t * d.top_k * d.n_out * DType::F32.size_in_bytes();
+    let ids_map_off = tpe_off + d.n_expert * MM_SCRATCH_ENTRY_BYTES;
+    let m = Map0Dispatch {
+        ids: d.ids,
+        ids_off: d.ids_off,
+        n_expert: d.n_expert,
+        top_k: d.top_k,
+        t: d.t,
+    };
+    encode_map0(device, ep, &m, d.dst, tpe_off, ids_map_off)?;
+    encode_mm(device, ep, dt, d, variant, d.dst, tpe_off, ids_map_off)?;
     Ok(())
 }
 
@@ -594,6 +671,30 @@ pub(crate) enum Mode {
     Mm,
 }
 
+/// A shared map0 scratch (`prepare_mm_id_map0`) plus the geometry it was laid out
+/// for. The producer wrote `tpe` (n_expert i32 @ 0) then the `ids-map` at
+/// `n_expert * MM_SCRATCH_ENTRY_BYTES` using ITS n_expert/t/top_k; a consumer that
+/// recomputed that offset from a different stack's n_expert would read the wrong
+/// region. Carrying the geometry lets `run_mm_shared` validate each consuming
+/// projection against the producer before it reads the map.
+pub(crate) struct Map0Scratch {
+    buffer: Arc<Buffer>,
+    n_expert: usize,
+    t: usize,
+    top_k: usize,
+}
+
+/// Where `Mode::Mm` reads its map0 scratch from.
+enum MmScratch<'a> {
+    /// Self-contained: map0 runs here and both scratch regions live at the tail of
+    /// the freshly allocated dst (the returned tensor keeps them resident).
+    Owned,
+    /// Shared: map0 already ran into this dedicated scratch (`prepare_mm_id_map0`),
+    /// so only the mm pass runs here, reading tpe @ 0 and ids-map @ n_expert*4 —
+    /// after validating this projection's geometry against the producer's.
+    Shared(&'a Map0Scratch),
+}
+
 /// Validate the seam shapes, resolve every operand to a device buffer, and encode
 /// the requested id kernel. Returns the `[t, top_k, n_out]` output tensor.
 /// `variant` is only consulted for `Mode::Mm` (which mm_id kernel family);
@@ -605,6 +706,31 @@ pub(crate) fn run(
     ids: &Tensor,
     mode: Mode,
     variant: MmVariant,
+) -> Result<Tensor> {
+    run_inner(stack, x, ids, mode, variant, MmScratch::Owned)
+}
+
+/// Run one `Mode::Mm` projection against a shared map0 scratch (`prepare_mm_id_map0`),
+/// skipping the map0 pass. Used by `FusedExperts::forward` so the block's three
+/// projections build the token-slot map once. `scratch` must stay alive until this
+/// dispatch is submitted (the caller holds it across gate/up/down).
+pub(crate) fn run_mm_shared(
+    stack: &ExpertStack,
+    x: &Tensor,
+    ids: &Tensor,
+    variant: MmVariant,
+    scratch: &Map0Scratch,
+) -> Result<Tensor> {
+    run_inner(stack, x, ids, Mode::Mm, variant, MmScratch::Shared(scratch))
+}
+
+fn run_inner(
+    stack: &ExpertStack,
+    x: &Tensor,
+    ids: &Tensor,
+    mode: Mode,
+    variant: MmVariant,
+    scratch: MmScratch,
 ) -> Result<Tensor> {
     let cdev = x.device().clone();
     let Device::Metal(mdev) = &cdev else {
@@ -649,13 +775,13 @@ pub(crate) fn run(
     };
 
     let out_count = t * top_k * stack.n_out;
-    // Mm over-allocates the dst buffer to hold the two-pass scratch (tpe +
+    // Owned Mm over-allocates the dst buffer to hold the two-pass scratch (tpe +
     // ids-map) at its tail; the returned tensor keeps the whole allocation
     // resident, so the scratch shares its lifetime and the pool reuses it once
-    // the tensor drops.
-    let alloc_count = match mode {
-        Mode::Mv | Mode::MvVendored => out_count,
-        Mode::Mm => out_count + mm_scratch_elems(stack.n_expert, t),
+    // the tensor drops. Shared Mm and the Mv paths write no scratch tail.
+    let alloc_count = match (mode, &scratch) {
+        (Mode::Mm, MmScratch::Owned) => out_count + mm_scratch_elems(stack.n_expert, t),
+        _ => out_count,
     };
     let dst = mdev.new_buffer(alloc_count, DType::F32, "mul_id")?;
 
@@ -691,16 +817,69 @@ pub(crate) fn run(
     };
     {
         let cmd = mdev.command_encoder()?;
-        match mode {
-            Mode::Mv => encode_mul_mv_id(mdev, &cmd, dt, &d)?,
-            Mode::MvVendored => encode_mul_mv_id_vendored(mdev, &cmd, dt, &d)?,
-            Mode::Mm => encode_mul_mm_id(mdev, &cmd, dt, &d, variant)?,
+        match (mode, &scratch) {
+            (Mode::Mv, _) => encode_mul_mv_id(mdev, &cmd, dt, &d)?,
+            (Mode::MvVendored, _) => encode_mul_mv_id_vendored(mdev, &cmd, dt, &d)?,
+            (Mode::Mm, MmScratch::Owned) => encode_mul_mm_id(mdev, &cmd, dt, &d, variant)?,
+            (Mode::Mm, MmScratch::Shared(s)) => {
+                // The producer laid the ids-map out at `s.n_expert *
+                // MM_SCRATCH_ENTRY_BYTES` and sized `tpe`/`ids-map` for its
+                // t/top_k; a projection with a different geometry would read the
+                // wrong region. Validate before using the producer's n_expert for
+                // the offset (guaranteed == stack.n_expert once this passes).
+                if s.n_expert != stack.n_expert || s.t != t || s.top_k != top_k {
+                    bail!(
+                        "shared map0 scratch geometry (n_expert={}, t={}, top_k={}) does not match \
+                         this projection (n_expert={}, t={}, top_k={}); the ids-map offset would be wrong",
+                        s.n_expert, s.t, s.top_k, stack.n_expert, t, top_k
+                    );
+                }
+                encode_mm(mdev, &cmd, dt, &d, variant, &s.buffer, 0, s.n_expert * MM_SCRATCH_ENTRY_BYTES)?
+            }
         }
     }
     drop(x_guard);
     drop(ids_guard);
 
     Ok(output_tensor(dst, mdev, out_count, (t, top_k, stack.n_out)))
+}
+
+/// Allocate the shared map0 scratch for one MoE block and encode the single map0
+/// pass from `ids`. The returned buffer holds `tpe` (n_expert i32 @ 0) then the
+/// `ids-map` (n_expert*t i32 @ n_expert*4); all three projections read it via
+/// `run_mm_shared`. map0's output depends only on ids/t/top_k/n_expert, so one
+/// pass serves gate/up/down despite their differing k / x_per_row. The caller
+/// keeps the returned buffer alive until the down projection's mm is submitted;
+/// candle's per-encoder fences order the mm reads after this write.
+pub(crate) fn prepare_mm_id_map0(n_expert: usize, ids: &Tensor) -> Result<Map0Scratch> {
+    let cdev = ids.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("prepare_mm_id_map0 requires ids on a Metal device");
+    };
+    let (t, top_k) = ids.dims2().map_err(|e| anyhow::anyhow!("ids must be rank-2 [t, top_k]: {e}"))?;
+    if ids.dtype() != DType::U32 {
+        bail!("ids must be u32, got {:?}", ids.dtype());
+    }
+    if !ids.is_contiguous() {
+        bail!("ids must be contiguous");
+    }
+
+    let scratch = mdev.new_buffer(mm_scratch_elems(n_expert, t), DType::F32, "mm_id_map0")?;
+
+    let (ids_guard, ids_layout) = ids.storage_and_layout();
+    let Storage::Metal(ids_storage) = &*ids_guard else {
+        bail!("ids is not on a Metal device");
+    };
+    let ids_buf = ids_storage.buffer();
+    let ids_off = ids_layout.start_offset() * DType::U32.size_in_bytes();
+
+    let m = Map0Dispatch { ids: ids_buf, ids_off, n_expert, top_k, t };
+    {
+        let cmd = mdev.command_encoder()?;
+        encode_map0(mdev, &cmd, &m, &scratch, 0, n_expert * MM_SCRATCH_ENTRY_BYTES)?;
+    }
+    drop(ids_guard);
+    Ok(Map0Scratch { buffer: scratch, n_expert, t, top_k })
 }
 
 /// Plain (non-indexed) quantized mat-vec against the vendored ggml-geometry
@@ -946,6 +1125,191 @@ pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
     drop(x_guard);
 
     Ok(output_tensor(dst, mdev, out_count, (t, n_out)))
+}
+
+/// Fused MoE weighted combine against the vendored `combine.metal` kernels —
+/// the routed-expert combine tail of `FusedExperts::forward`. Reads `down`
+/// (`[seq, top_k, n_out]` f32 contiguous) once and returns `[seq, n_out]` f32:
+///   - `col_l2` = `None`  (rescale-free): `dst[s,c] = Σ_k down[s,k,c] * w[s,k]`
+///   - `col_l2` = `Some`  (`[seq, top_k, 1]` f32): the per-column L2 rescale is
+///     undone in the same pass — `dst[s,c] = Σ_k down[s,k,c]*col_l2[s,k]*2^-15*w[s,k]`.
+/// `weights` is `[seq, top_k]` f32. The launch geometry and per-op rounding
+/// mirror candle's strided `sum(1)` exactly, so the result is bit-identical to
+/// the candle broadcast/affine/sum chain (see combine.metal / the combine.rs test).
+pub(crate) fn run_combine(
+    down: &Tensor,
+    col_l2: Option<&Tensor>,
+    weights: &Tensor,
+) -> Result<Tensor> {
+    let cdev = down.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("combine requires down on a Metal device");
+    };
+
+    let (seq, top_k, n_out) = down
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("down must be rank-3 [seq, top_k, n_out]: {e}"))?;
+    if down.dtype() != DType::F32 {
+        bail!("down must be f32, got {:?}", down.dtype());
+    }
+    if !down.is_contiguous() {
+        bail!("down must be contiguous");
+    }
+    if weights.dims2().map_err(|e| anyhow::anyhow!("weights must be rank-2 [seq, top_k]: {e}"))?
+        != (seq, top_k)
+    {
+        bail!("weights shape {:?} must be [seq, top_k] = [{seq}, {top_k}]", weights.dims());
+    }
+    if weights.dtype() != DType::F32 {
+        bail!("weights must be f32, got {:?}", weights.dtype());
+    }
+    if !weights.is_contiguous() {
+        bail!("weights must be contiguous");
+    }
+    if let Some(l2) = col_l2 {
+        if l2.dims3().map_err(|e| anyhow::anyhow!("col_l2 must be rank-3 [seq, top_k, 1]: {e}"))?
+            != (seq, top_k, 1)
+        {
+            bail!("col_l2 shape {:?} must be [seq, top_k, 1] = [{seq}, {top_k}, 1]", l2.dims());
+        }
+        if l2.dtype() != DType::F32 {
+            bail!("col_l2 must be f32, got {:?}", l2.dtype());
+        }
+        if !l2.is_contiguous() {
+            bail!("col_l2 must be contiguous");
+        }
+    }
+
+    // The reduction is a single simd_sum over one 32-lane simdgroup, so the
+    // candle-matching threadgroup width must not exceed 32 (see combine.metal);
+    // a wider width would leave lanes 32.. in a second simdgroup whose partials
+    // are never folded in. This is an error, not a fallback — production top_k is
+    // 10 (width 8); a top_k needing width > 32 (i.e. >= 66) is out of contract.
+    let width_hint = combine_reduction_width(top_k);
+    if width_hint > 32 {
+        bail!(
+            "combine top_k={top_k} needs threadgroup width {width_hint} > 32; the single-simdgroup \
+             simd_sum reduction would silently drop lanes 32.."
+        );
+    }
+    // The kernels address `down` with i32 index math; a grid whose flat element
+    // count exceeds i32::MAX would wrap to a negative offset.
+    if !combine_index_fits_i32(seq, top_k, n_out) {
+        bail!(
+            "combine index math overflows i32: seq={seq} top_k={top_k} n_out={n_out} \
+             (seq*top_k*n_out = {} exceeds i32::MAX)",
+            (seq as i64) * (top_k as i64) * (n_out as i64)
+        );
+    }
+
+    let name = if col_l2.is_some() {
+        "kernel_moe_combine_rescale"
+    } else {
+        "kernel_moe_combine"
+    };
+    let pipeline = pipelines::combine_pipeline(mdev.device(), name)?;
+
+    let out_length = seq * n_out;
+    let dst = mdev.new_buffer(out_length, DType::F32, "combine")?;
+
+    // Resolve operand buffers. `storage_and_layout` guards must outlive the encode.
+    let (down_guard, down_layout) = down.storage_and_layout();
+    let Storage::Metal(down_storage) = &*down_guard else {
+        bail!("down is not on a Metal device");
+    };
+    let down_buf = down_storage.buffer();
+    let down_off = down_layout.start_offset() * DType::F32.size_in_bytes();
+
+    let (w_guard, w_layout) = weights.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("weights is not on a Metal device");
+    };
+    let w_buf = w_storage.buffer();
+    let w_off = w_layout.start_offset() * DType::F32.size_in_bytes();
+
+    // The optional col_l2 guard is bound for the whole encode when present.
+    let l2_resolved = match col_l2 {
+        Some(l2) => {
+            let (guard, layout) = l2.storage_and_layout();
+            let off = layout.start_offset() * DType::F32.size_in_bytes();
+            Some((guard, off))
+        }
+        None => None,
+    };
+
+    let args = CombineArgs {
+        top_k: top_k as i32,
+        n_out: n_out as i32,
+    };
+    // candle's `fast_sum_f32_strided` launch: out_length threadgroups, block_dim
+    // = min(pipeline max, next_pow2(top_k/2)); reproduced so the simd_sum lane
+    // partition (and thus the reduction order) is identical. The width guard
+    // above pins `combine_reduction_width(top_k)` <= 32, so this stays within one
+    // simdgroup.
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        combine_reduction_width(top_k),
+    );
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(down_buf), down_off);
+        if let Some((l2_guard, l2_off)) = &l2_resolved {
+            let Storage::Metal(l2_storage) = &**l2_guard else {
+                bail!("col_l2 is not on a Metal device");
+            };
+            encoder.set_input_buffer(2, Some(l2_storage.buffer()), *l2_off);
+            encoder.set_input_buffer(3, Some(w_buf), w_off);
+            encoder.set_output_buffer(4, Some(&dst), 0);
+        } else {
+            encoder.set_input_buffer(2, Some(w_buf), w_off);
+            encoder.set_output_buffer(3, Some(&dst), 0);
+        }
+        encoder.dispatch_thread_groups(mtl_size!(out_length, 1, 1), mtl_size!(width, 1, 1));
+    }
+    drop(down_guard);
+    drop(w_guard);
+    drop(l2_resolved);
+
+    Ok(output_tensor(dst, mdev, out_length, (seq, n_out)))
+}
+
+#[cfg(test)]
+mod combine_guard_tests {
+    use super::{combine_index_fits_i32, combine_reduction_width};
+
+    /// The i32 index guard: the combine kernels address `down` with i32 math
+    /// (`down_base = s*top_k*n_out + c`), so the grid's flat element count must
+    /// stay within i32. Tested directly — the overflowing case (seq ≈ 70k at
+    /// top_k=10 / n_out=3072) is a ~8.6TB tensor that cannot be allocated.
+    #[test]
+    fn index_guard_rejects_i32_overflow() {
+        // Production decode/prefill geometry stays well within i32.
+        assert!(combine_index_fits_i32(1, 10, 3072));
+        assert!(combine_index_fits_i32(4096, 10, 3072)); // 125.8M < 2.1B
+        // Just under and just over i32::MAX with a top_k=10 / n_out=3072 row.
+        let per_seq = 10 * 3072; // 30720 elements per seq row
+        let max_ok = i32::MAX as usize / per_seq; // largest seq that still fits
+        assert!(combine_index_fits_i32(max_ok, 10, 3072));
+        assert!(!combine_index_fits_i32(max_ok + 1, 10, 3072));
+    }
+
+    /// The single-simdgroup width guard threshold: `next_pow2(top_k/2)` must stay
+    /// <= 32. Production top_k=10 gives width 8; top_k=66 is the first that needs
+    /// width 64 (66/2=33 → next_pow2 64).
+    #[test]
+    fn reduction_width_threshold() {
+        assert_eq!(combine_reduction_width(10), 8);
+        assert_eq!(combine_reduction_width(64), 32); // 64/2=32, still one simdgroup
+        assert_eq!(combine_reduction_width(65), 32); // 65/2=32
+        assert_eq!(combine_reduction_width(66), 64); // 66/2=33 → 64, over the limit
+        assert!(combine_reduction_width(66) > 32);
+        assert!(combine_reduction_width(10) <= 32);
+    }
 }
 
 #[cfg(test)]

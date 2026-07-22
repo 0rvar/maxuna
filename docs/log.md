@@ -4,6 +4,49 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-22 — P2 phase-0: prefill budget kills routing-glue fusion (~1%), promotes combine fusion (~23%); fork's Metal edge is scheduling, not fusion
+
+**Context.** P2 was scoped as "fuse MoE route+glue+combine — the prefill gap
+is surrounding dispatch overhead." Before writing kernels: map both engines'
+per-layer dispatch streams, then measure a category budget (the P1 phase-0
+playbook).
+
+**Maps (explore agents, both engines).** Ours: ~69 dispatches/MoE layer at
+seq=512, only 11 owned (5 attn projections + 6 mm_id incl. 3 REDUNDANT map0
+passes over identical ids); routing is 10 candle dispatches; combine
+materializes [512,10,3072]/63MB then reduces; shared expert rides candle
+QMatMul. Fork: ~30 dispatches/block — and NO Metal routing fusion exists in
+ggml (topk_moe is CUDA/Vulkan/SYCL-only). The fork's 2x edge is SCHEDULING:
+one concurrent-dispatch encoder with memory barriers only on real buffer-range
+overlap (ggml-metal-ops.cpp mem_ranges :150-210), graph reorder into
+concurrent sets (ggml-metal-common.cpp:209/375), multi-threaded command-buffer
+encode (context.m:550), plus modest fusions (ADD-chain, RMSNorm+mul, one
+dedicated single-dispatch bitonic top-k). Its routing tail is nearly as chatty
+as ours — it just overlaps the heavy GEMMs instead of serializing.
+
+**Budget (new `prefill_*` isolation benches, moe.rs/attention.rs, synthetic
+weights, seq=512, 100-iter plateau means, LPM).** Per MoE layer: attention
+23.6 (full) / 30.1 (SWA) ≈ 46% of the forward; mm_id matmuls 19.8; COMBINE
+14.8 (~23% — ~9x its ~1.6 ms bandwidth floor; candle broadcast_mul over
+[512,10,3072] takes slow strided paths); silu+L2-rescale 4.1; shared expert
+1.8; norms+residuals 0.8; ROUTING GLUE 0.61 (~1%). Sum of parts ≈ whole block
+bench ≈ end-to-end within ~10% → execution is fully serial (no overlap), and
+the categories are trustworthy. Anomaly flagged: mm_id up 7.9 vs gate 3.0
+ms on identical shapes — unexplained, investigate during map0 sharing.
+
+**Verdict — RESCOPED (Orvar agreed).** Routing-glue fusion demoted (~1%;
+death-by-dispatch refuted a SECOND time, now for prefill — ten tiny dispatches
+are cheap even serialized). Do now: (a) fused combine kernel
+`sum_i(down_i × col_l2 × 1/32768 × w_i)`, one read of the 63MB expert output,
+f32 accumulation mirroring candle's reduce order, kill-switch + gate; (b)
+map0 computed once per block (bit-identical; the fork recomputes 3x too — an
+absolute win over it). Expected ~25% prefill. Attention (46%) and the
+encoder takeover (concurrency) hold the rest of the 2x; both promoted in
+TODO.md's priority order. Lesson: the dispatch-COUNT map alone argued for
+routing fusion; only the ms-budget exposed that the expensive dispatches are
+the big-tensor broadcast/reduce ops, not the many tiny ones. Count dispatches
+to find candidates, measure milliseconds to pick targets.
+
 ## 2026-07-22 — same-mode power calibration: decode parity CONFIRMED both modes; fork's historical numbers were LPM
 
 **Context.** Every prior "ours vs fork" comparison carried an asterisk: our

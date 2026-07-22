@@ -106,6 +106,12 @@ struct Provenance {
     /// that (a stale binary's dumps are otherwise indistinguishable from
     /// current ones).
     attn_dtype: Option<String>,
+    /// Routed-expert combine path: "reference" (Reference oracle — never touches
+    /// `ops::combine`), "classic" (`LAGUNA_COMBINE_CLASSIC`, the candle chain), or
+    /// "fused" (the shipped vendored kernel). `None` for dumps predating the combine
+    /// provenance field — the gate hard-fails on that per side (same reasoning as
+    /// `attn_dtype`).
+    combine: Option<String>,
 }
 
 impl Provenance {
@@ -153,6 +159,12 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
             // on that later, per side); present-but-not-a-string is malformed.
             attn_dtype: match p.get("attn_dtype") {
                 Some(d) => Some(d.as_str().context("provenance `attn_dtype` is not a string")?.to_string()),
+                None => None,
+            },
+            // Absent in dumps predating the combine provenance field (the gate
+            // hard-fails on that later, per side); present-but-not-a-string is malformed.
+            combine: match p.get("combine") {
+                Some(d) => Some(d.as_str().context("provenance `combine` is not a string")?.to_string()),
                 None => None,
             },
         })),
@@ -413,6 +425,29 @@ fn check_attn_dtype(p: &Provenance, side: &str, want: &str) -> Result<()> {
     }
 }
 
+/// Enforce the routed-expert combine path recorded in one side's provenance.
+/// `want` is "reference" for the Reference-oracle side (which never dispatches
+/// `ops::combine`), "classic" for strict-tier candidates (produced under
+/// `LAGUNA_COMBINE_CLASSIC=1`, the candle chain the strict anchor was blessed
+/// with), and "fused" for the mm/decode/ppl candidates that grade the shipped
+/// vendored combine. A provenance MISSING the field came from a `logits-dump`
+/// binary that predates the combine provenance field — hard fail, because such a
+/// dump is otherwise indistinguishable from a current one and the gate would pass
+/// vacuously.
+fn check_combine(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    match p.combine.as_deref() {
+        Some(c) if c == want => Ok(()),
+        Some(other) => bail!(
+            "{side} provenance.combine is {other:?}, expected {want:?}; regenerate the dump \
+             under the environment its gate prescribes (see docs/parity.md §3)"
+        ),
+        None => bail!(
+            "{side} provenance has no combine (dump predates the combine provenance field); \
+             rebuild logits-dump and regenerate the dump"
+        ),
+    }
+}
+
 fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
@@ -425,8 +460,12 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     match &reference.provenance {
         // The oracle also pins f32 attention compute (`LAGUNA_ATTN_F32=1`, see
         // parity-gate.ts referenceEnv()); an f16 or field-less reference would
-        // silently move the strict tier's anchor.
-        Some(p) if p.moe_impl == "reference" => check_attn_dtype(p, "reference dump", "f32")?,
+        // silently move the strict tier's anchor. The Reference runner never
+        // dispatches `ops::combine`, so its combine provenance must be "reference".
+        Some(p) if p.moe_impl == "reference" => {
+            check_attn_dtype(p, "reference dump", "f32")?;
+            check_combine(p, "reference dump", "reference")?;
+        }
         Some(p) => bail!(
             "reference dump provenance.moe_impl is {:?}, expected \"reference\": the reference side \
              must be a Reference-oracle run. Regenerate reference.json with the current `logits-dump` \
@@ -524,6 +563,21 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             ),
             Some(_) => {}
         }
+    }
+
+    // EVERY tier also pins the CANDIDATE's routed-expert combine path (like
+    // attn_dtype): strict grades the classic candle combine (candidate produced
+    // under LAGUNA_COMBINE_CLASSIC=1 → "classic"), mm/decode grade the shipped
+    // vendored combine ("fused"). Placed after the mm_active / strict-fused runner
+    // checks above, so a reference dump misused as a candidate fails on moe_impl
+    // there, not here. Candidate provenance is already proven Some by the
+    // attn_dtype check above.
+    let want_combine = match tier {
+        Tier::Strict => "classic",
+        Tier::Mm | Tier::Decode => "fused",
+    };
+    if let Some(p) = &candidate.provenance {
+        check_combine(p, "candidate dump", want_combine)?;
     }
 
     // Non-finite candidate logits are a hard failure in EVERY tier: a NaN/Inf
@@ -770,8 +824,12 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
     // a hard fail (regenerate), not a legacy exemption.
     match &reference.provenance {
         // The oracle side additionally pins f32 attention compute
-        // (`LAGUNA_ATTN_F32=1`, parity-gate.ts referenceEnv()).
-        Some(p) if p.moe_impl == "reference" => check_attn_dtype(p, "reference-greedy.json", "f32")?,
+        // (`LAGUNA_ATTN_F32=1`, parity-gate.ts referenceEnv()) and combine
+        // "reference" (the Reference runner never dispatches ops::combine).
+        Some(p) if p.moe_impl == "reference" => {
+            check_attn_dtype(p, "reference-greedy.json", "f32")?;
+            check_combine(p, "reference-greedy.json", "reference")?;
+        }
         Some(p) => bail!(
             "reference-greedy.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate \
              it with the current `logits-dump` (--moe-impl reference --greedy N)",
@@ -784,8 +842,12 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
     }
     match &candidate.provenance {
         // The decode gate grades the SHIPPED path, which computes attention in
-        // f16; an f32 (or field-less) candidate ran some other build/env.
-        Some(p) if p.moe_impl == "fused" => check_attn_dtype(p, "candidate-greedy.json", "f16")?,
+        // f16 and uses the fused combine; an f32/classic (or field-less) candidate
+        // ran some other build/env.
+        Some(p) if p.moe_impl == "fused" => {
+            check_attn_dtype(p, "candidate-greedy.json", "f16")?;
+            check_combine(p, "candidate-greedy.json", "fused")?;
+        }
         Some(p) => bail!(
             "candidate-greedy.json (replay) provenance.moe_impl is {:?}, expected \"fused\"; the \
              candidate must be the Fused runner. Regenerate it with the current `logits-dump` \
@@ -999,8 +1061,12 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
 
     match &reference.provenance {
         // The oracle side additionally pins f32 attention compute
-        // (`LAGUNA_ATTN_F32=1`, parity-gate.ts referenceEnv()).
-        Some(p) if p.moe_impl == "reference" => check_attn_dtype(p, "reference-ppl.json", "f32")?,
+        // (`LAGUNA_ATTN_F32=1`, parity-gate.ts referenceEnv()) and combine
+        // "reference" (the Reference runner never dispatches ops::combine).
+        Some(p) if p.moe_impl == "reference" => {
+            check_attn_dtype(p, "reference-ppl.json", "f32")?;
+            check_combine(p, "reference-ppl.json", "reference")?;
+        }
         Some(p) => bail!(
             "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
              with the current `logits-dump` (--moe-impl reference --ppl ...)",
@@ -1012,8 +1078,12 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
         ),
     }
     match &candidate.provenance {
-        // The ppl gate grades the SHIPPED path, which streams f16 attention weights.
-        Some(p) if p.moe_impl == "fused" => check_attn_dtype(p, "candidate-ppl.json", "f16")?,
+        // The ppl gate grades the SHIPPED path, which streams f16 attention weights
+        // and uses the fused combine.
+        Some(p) if p.moe_impl == "fused" => {
+            check_attn_dtype(p, "candidate-ppl.json", "f16")?;
+            check_combine(p, "candidate-ppl.json", "fused")?;
+        }
         Some(p) => bail!(
             "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
              be the Fused runner. Regenerate it with the current `logits-dump` (--moe-impl fused --ppl ...)",
@@ -1104,9 +1174,11 @@ fn ppl_parity() -> Result<()> {
 // `cargo test --test parity` (no `--ignored`), unlike the model-fed gate tests.
 
 /// A `provenance` object with the given runner and otherwise-inert fields. The
-/// attention dtype matches how the gate script produces each side: the
-/// Reference oracle runs under `LAGUNA_ATTN_F32=1` (f32), fused candidates run
-/// the shipped f16 default. Tests perturb the fields to hit rejection paths.
+/// attention dtype and combine path match how the gate script produces each side:
+/// the Reference oracle runs under `LAGUNA_ATTN_F32=1` (f32) and records combine
+/// "reference"; fused candidates run the shipped f16 default with the fused
+/// combine. Strict-tier candidate tests override `attn_dtype`/`combine` to the
+/// f32/classic path strict grades. Tests perturb the fields to hit rejection paths.
 fn prov(moe_impl: &str) -> Provenance {
     Provenance {
         moe_impl: moe_impl.to_string(),
@@ -1115,6 +1187,7 @@ fn prov(moe_impl: &str) -> Provenance {
         no_mm_id: false,
         mm_min_seq: 32,
         attn_dtype: Some(if moe_impl == "reference" { "f32" } else { "f16" }.to_string()),
+        combine: Some(if moe_impl == "reference" { "reference" } else { "fused" }.to_string()),
     }
 }
 
@@ -1201,6 +1274,27 @@ fn greedy_gate_rejects_missing_attn_dtype() {
     c.provenance.as_mut().unwrap().attn_dtype = None;
     let err = greedy_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
+}
+
+#[test]
+fn greedy_gate_rejects_wrong_or_missing_combine() {
+    // The decode gate grades the shipped fused combine; a candidate replay
+    // produced under LAGUNA_COMBINE_CLASSIC=1 ran the classic candle chain.
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().combine = Some("classic".to_string());
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("combine"), "unexpected error: {err}");
+    // A candidate provenance missing the combine field predates it — hard fail.
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().combine = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no combine"), "unexpected error: {err}");
+    // The Reference oracle must record combine "reference"; a stale/missing field
+    // (the oracle never dispatches ops::combine) is a hard fail.
+    let (mut r, c) = valid_pair();
+    r.provenance.as_mut().unwrap().combine = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no combine"), "unexpected error: {err}");
 }
 
 /// A one-step reference/candidate pair for the near-tie excuse tests: the
@@ -1437,6 +1531,54 @@ fn compare_pins_candidate_attn_dtype_per_tier() {
 }
 
 #[test]
+fn compare_requires_reference_combine() {
+    let candidate = tiny_dump(Some(prov("fused")));
+    // A reference whose combine is not "reference" (the Reference runner never
+    // dispatches ops::combine) came from a wrong build/env → hard fail every tier.
+    let mut wrong = prov("reference");
+    wrong.combine = Some("fused".to_string());
+    let err = compare(&candidate, &tiny_dump(Some(wrong)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("combine"), "unexpected error: {err}");
+    // A reference from a binary predating the combine field must also hard-fail.
+    let mut stale = prov("reference");
+    stale.combine = None;
+    let err = compare(&candidate, &tiny_dump(Some(stale)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("no combine"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_pins_candidate_combine_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // strict grades the classic candle combine: a fused candidate on the default
+    // fused combine (LAGUNA_COMBINE_CLASSIC forgotten) must be rejected. It must
+    // first clear the strict fused/no_mm_id + f32-attn checks to reach the combine pin.
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    p.no_mm_id = true;
+    // combine defaults to "fused" — wrong for strict.
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("combine"), "unexpected error: {err}");
+
+    // mm/decode grade the fused combine: a "classic" candidate ran the wrong path.
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq; // mm-active
+    p.combine = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("combine"), "unexpected error: {err}");
+    let mut p = prov("fused");
+    p.combine = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("combine"), "unexpected error: {err}");
+
+    // A candidate provenance missing only the combine field is stale (predates it).
+    let mut p = prov("fused");
+    p.combine = None;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no combine"), "unexpected error: {err}");
+}
+
+#[test]
 fn compare_strict_requires_fused_no_mm_id_candidate() {
     let reference = tiny_dump(Some(prov("reference")));
 
@@ -1560,6 +1702,22 @@ fn ppl_gate_rejects_wrong_or_missing_attn_dtype() {
     r.provenance.as_mut().unwrap().attn_dtype = None;
     let err = ppl_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_wrong_or_missing_combine() {
+    // The ppl gate grades the shipped fused combine; a candidate produced under
+    // LAGUNA_COMBINE_CLASSIC=1 ran the classic candle chain instead.
+    let (r, mut c) = valid_ppl_pair();
+    c.provenance.as_mut().unwrap().combine = Some("classic".to_string());
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("combine"), "unexpected error: {err}");
+    // A reference from a binary predating the combine field must hard-fail (the
+    // oracle records combine "reference"; the field proves it).
+    let (mut r, c) = valid_ppl_pair();
+    r.provenance.as_mut().unwrap().combine = None;
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no combine"), "unexpected error: {err}");
 }
 
 #[test]

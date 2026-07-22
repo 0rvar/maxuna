@@ -1402,6 +1402,79 @@ pub(crate) mod tests {
                 many - few
             );
         }
+
+        // --- prefill-isolation attention bench (seq=512) -------------------
+
+        /// Prefill chunk length (matches the MoE prefill benches in moe.rs so the
+        /// two halves' numbers are directly comparable).
+        const PREFILL_SEQ: usize = 512;
+
+        /// One SHIPPED f16 attention block at `il`'s geometry: f16 projection
+        /// weights (`Proj::DenseF16`, the production prefill default) consumed by
+        /// the vendored mixed-dtype kernels, with the same QK-norm/rope/head
+        /// counts the real layer uses. Built directly so the bench runs the
+        /// production f16 path rather than the dequant-f32 `QMatMul` one the
+        /// decode benches build.
+        fn build_f16_block(dev: &Device, il: usize, rope: Arc<Rope>) -> AttnBlock {
+            let h = n_head_of(il);
+            let s = il as u64 * 100;
+            let f16w = |rows: usize, cols: usize, seed: u64| {
+                dense(rows, cols, seed, dev).to_dtype(DType::F16).unwrap()
+            };
+            AttnBlock {
+                q_proj: Proj::DenseF16(f16w(h * HEAD_DIM, HIDDEN, s + 1)),
+                k_proj: Proj::DenseF16(f16w(N_KV * HEAD_DIM, HIDDEN, s + 2)),
+                v_proj: Proj::DenseF16(f16w(N_KV * HEAD_DIM, HIDDEN, s + 3)),
+                g_proj: Proj::DenseF16(f16w(h, HIDDEN, s + 4)),
+                o_proj: Proj::DenseF16(f16w(HIDDEN, h * HEAD_DIM, s + 5)),
+                q_norm: RmsNorm::new(norm_w(HEAD_DIM, s + 6, dev), 1e-6),
+                k_norm: RmsNorm::new(norm_w(HEAD_DIM, s + 7, dev), 1e-6),
+                rope,
+                n_head: h,
+                n_kv_head: N_KV,
+                head_dim: HEAD_DIM,
+            }
+        }
+
+        /// Prices the full attention chain (projections + QK-norm + rope + sdpa
+        /// + softplus gate + o_proj) at a 512-token prefill chunk, pos 0, timed
+        /// separately for the two per-layer variants the model interleaves: a
+        /// FULL-attention layer (48 Q heads, YaRN partial rotary 64/128 dims)
+        /// and an SWA layer (72 Q heads, plain rope over all 128 dims, window
+        /// 512). Each iter runs one block forward over a fresh pos-0 cache and
+        /// ends in a small readback. `#[ignore]`d; run e.g.
+        /// `cargo test --release prefill_attn_chain_bench -- --ignored --nocapture`.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_chain_bench() {
+            let dev = metal();
+            let cfg = prod_cfg();
+            let (rope_full, rope_swa) = build_ropes(&dev);
+            eprintln!(
+                "building 2 synthetic f16 attention blocks (full-attn + SWA) at seq={PREFILL_SEQ}..."
+            );
+            // il 0 is full-attention (il % 4 == 0), il 1 is SWA.
+            let full_block = build_f16_block(&dev, 0, rope_full);
+            let swa_block = build_f16_block(&dev, 1, rope_swa);
+            let mut full_cache = LayerCache::new(&cfg, 0, MAX_CTX, &dev).unwrap();
+            let mut swa_cache = LayerCache::new(&cfg, 1, MAX_CTX, &dev).unwrap();
+            let x = dense(PREFILL_SEQ, HIDDEN, 4242, &dev);
+
+            bench(
+                &format!("prefill attn FULL block (48 heads, YaRN partial rope), seq={PREFILL_SEQ}"),
+                || {
+                    full_cache.reset();
+                    read_scalar(&full_block.forward(&x, &mut full_cache, 0).unwrap())
+                },
+            );
+            bench(
+                &format!("prefill attn SWA block (72 heads, plain rope, window 512), seq={PREFILL_SEQ}"),
+                || {
+                    swa_cache.reset();
+                    read_scalar(&swa_block.forward(&x, &mut swa_cache, 0).unwrap())
+                },
+            );
+        }
     }
 
     /// Test 5: both per-layer query-head widths produce correct end-to-end shapes.
