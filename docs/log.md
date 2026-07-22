@@ -4,6 +4,51 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-22 — same-mode power calibration: decode parity CONFIRMED both modes; fork's historical numbers were LPM
+
+**Context.** Every prior "ours vs fork" comparison carried an asterisk: our
+numbers were Low Power Mode sustained, the fork's 361/328/18.1
+(pp512/pp4096/tg128) were recorded in an unknown mode. Orvar toggled power
+modes so both engines could be benched in each mode (2×2 matrix): our
+630-ctx/256-tok sustained bench + fork `llama-bench -p 512,4096 -n 128`.
+
+**Result (pmset-verified modes).**
+
+| | ours LPM | fork LPM | ours full | fork full |
+|---|---|---|---|---|
+| decode | 18.2 (17.2 re-run) | 18.5 ± 0.5 | 38.6 | 39.2 ± 1.2 |
+| prefill short | 174 (156 re-run) | 354 ± 30 | 411-415 | 990 ± 26 |
+| prefill 4k | 150-160 | 348 ± 11 | 345 | 793 ± 18 |
+
+- **Fork's historical figures were LPM**: measured fork-LPM 354/348/18.5 vs
+  the recorded 361/328/18.1 — same numbers within noise. Our LPM decode-parity
+  claim was same-mode all along.
+- **Decode parity holds in BOTH modes**: 0.98x fork (18.2/18.5 LPM, 38.6/39.2
+  full). The f16-attention result is real, not a mode artifact.
+- **Prefill gap is mode-independent**: 0.42-0.49x fork in both modes (slightly
+  worse at full power — as expected if part of the overhead is CPU-side
+  dispatch that doesn't speed up with GPU clocks). Fork full-power prefill is
+  ~990 pp512; that is the size of the P2 prize.
+- **LPM clamp re-measured**: ~2.1x decode (ours 18.2→38.6, fork 18.5→39.2),
+  ~2.3-2.8x prefill. Phase-0's ~1.7x estimate (below) was low — it was derived
+  from within-run burst-vs-plateau decay, not a mode A/B.
+- **Thermal ordering matters at full power**: the fork benched ~6% higher on a
+  cool chip (41.4/1105/819) than after three of our 75GB runs (39.2/990/793);
+  our decode read 30.6 hot vs 38.6 cool. Full-power numbers are ±10% by
+  thermal history; LPM ±5% run-to-run (17.2-18.2 same-day). Don't compare
+  numbers across thermal states; bench cool-first or report the ordering.
+
+**Traps hit.**
+- A "LPM" leg benched at full power: the System Settings Energy Mode toggle is
+  PER POWER SOURCE (Battery vs Power Adapter tabs) — a flip on the wrong tab
+  silently does nothing while plugged in. Caught because fork pp512 read 1105,
+  ABOVE the known full-power 990. Fix, now protocol: every bench chain guards
+  and logs `pmset -g | awk '/lowpowermode/{print $2}'` (1 = LPM) at start and
+  end — runs self-certify their mode, intent doesn't count.
+- llama-bench pp512 reps are ~0.5 s — short enough to partially ride the LPM
+  burst window (±30 t/s rep noise at LPM). tg128 (multi-second) can't
+  burst-cheat; trust it to arbitrate mode questions.
+
 ## 2026-07-22 — f16 divergence hunt: accumulator hypothesis DEAD; operand convention is the gap
 
 **Context.** The hybrid restructure (entry below) re-gated: ppl best-ever

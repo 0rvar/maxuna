@@ -183,20 +183,31 @@ trap documented here.
 ## Perf state (2026-07-22)
 
 POWER MODE CAVEAT: this machine runs in macOS Low Power Mode during dev
-sessions (owner's choice — high-perf mode = coil whine + fans). The low-power
-governor allows a ~1 s GPU burst then clamps ~1.7x (bandwidth ~540 → ~315
-GB/s), so all "ours" numbers below are low-power sustained figures; the fork
-column's power mode is unrecorded. Ratios/budget shares transfer across modes;
-absolute cross-mode comparisons do not (see docs/log.md phase-0 entry). Bench
-long enough to hit the plateau — first-second numbers are burst fiction.
+sessions (owner's choice — full power = coil whine + fans). Same-mode 2×2
+calibration (2026-07-22) measured the LPM clamp at ~2.1x on decode
+(bandwidth-bound) and ~2.3-2.8x on prefill (compute-bound) — bigger than the
+~1.7x phase-0 estimate. VERIFY the active mode before labeling any number:
+`pmset -g | awk '/lowpowermode/{print $2}'` (1 = LPM) — the System Settings
+Energy Mode toggle is per-power-source (Battery vs Power Adapter tabs) and has
+already silently failed to apply once. Ratios/budget shares transfer across
+modes; absolute cross-mode comparisons do not (docs/log.md power-calibration
+entry). Bench long enough to hit the plateau — first-second numbers are burst
+fiction (even llama-bench pp512 reps are short enough to ride the LPM burst
+window: ±30 t/s rep noise). Full-power numbers swing ~±10% with chip temp
+(cool-first runs read high); LPM run-to-run is ~±5%.
 
-Warm steady-state, fused path, vs fork `llama-bench` on this machine:
+Warm steady-state, fused path, vs fork `llama-bench`, pmset-verified 2×2
+(2026-07-22; the fork's older 361/328/18.1 figures were LPM — confirmed):
 
-| | ours | fork |
-|---|---|---|
-| decode (630 ctx, 256-tok sustained, LPM) | ~18.2 tok/s | 18.1 (tg128, mode unknown) |
-| prefill (925-tok chunk) | ~174 tok/s | 361 (pp512) |
-| prefill (4230-tok) | ~150-160 tok/s | 328 (pp4096) |
+| | ours LPM | fork LPM | ours full | fork full |
+|---|---|---|---|---|
+| decode (256-tok sustained / tg128) | ~18.2 tok/s | 18.5 | ~38.6 | 39.2 |
+| prefill short (630-925 tok / pp512) | ~174 tok/s | 354 | ~415 | 990 |
+| prefill 4k (4007 tok / pp4096) | ~150-160 tok/s | 348 | ~345 | 793 |
+
+Decode is at parity with the fork in BOTH modes (0.98x). The prefill gap is
+mode-independent: 0.42-0.49x fork in both modes — it's dispatch/glue overhead,
+not clocks.
 
 Prefill: the vendored two-pass mm_id kernel (tensor `matmul2d` default) took
 prefill ~60 → ~188 tok/s (3.1x; ~174 re-measured 2026-07-22 in LPM). Decode:
@@ -214,13 +225,14 @@ One CPU↔GPU sync/token, routing on-GPU, transpose-contiguous copies are
 metadata reshapes at seq==1.
 
 Known remaining gaps (see TODO.md priority list for the plan):
-- **Prefill (~174 vs fork 361)**: surrounding candle dispatches per MoE+attn
-  layer (route, silu*mul, combine, shared expert) that ggml fuses, plus candle
-  per-op overhead — NOT the matmul. P2: fuse route+glue+combine into the owned
-  kernels.
-- **Decode (18.2 vs fork 18.1, modes possibly unequal)**: remaining levers are
-  the MoE mv_id gather (~14 ms sustained vs ~7 ms bandwidth floor), attention
-  glue fusion (~6 ms sustained), then DFlash.
+- **Prefill (0.42-0.49x fork, both modes)**: surrounding candle dispatches per
+  MoE+attn layer (route, silu*mul, combine, shared expert) that ggml fuses,
+  plus candle per-op overhead — NOT the matmul. P2: fuse route+glue+combine
+  into the owned kernels.
+- **Decode (parity with fork in both modes — 18.2 vs 18.5 LPM, 38.6 vs 39.2
+  full)**: remaining levers to PASS the fork are the MoE mv_id gather (~14 ms
+  sustained vs ~7 ms bandwidth floor), attention glue fusion (~6 ms
+  sustained), then DFlash.
 - `LAGUNA_BENCH` env var enables a warm-up forward for steady-state timing.
   Bench ≥ 256 decode tokens — sub-second runs report boost-clock fiction.
 

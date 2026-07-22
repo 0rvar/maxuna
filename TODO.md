@@ -24,13 +24,15 @@
    kill-switch; strict tier + reference dumps pin it.
    (b) fuse the remaining attention glue (~6 ms sustained: QK-norm, rope,
    softplus, casts around sdpa) — NEXT; (c) MoE mv_id gather latency (~14 ms
-   sustained vs ~7 ms bandwidth floor) folds into P2. NOTE: decode now matches
-   the fork's tg128 number (18.2 vs 18.1) but power modes may differ
-   (CLAUDE.md LPM caveat) — same-mode calibration pair still pending, needs
-   Orvar present (fan noise).
-2. **MoE route+glue+combine fusion** (prefill; the ~188 vs 361 pp512 gap is
-   surrounding dispatch overhead). Now fusable INTO the owned mv.metal/mm_id
-   kernels — the strategic payoff of vendoring.
+   sustained vs ~7 ms bandwidth floor) folds into P2. Same-mode power
+   calibration DONE 2026-07-22: decode parity vs fork CONFIRMED in both power
+   modes (18.2/18.5 LPM, 38.6/39.2 full); fork's historical bench figures were
+   LPM; prefill gap is mode-independent 0.42-0.49x (2×2 matrix + traps in
+   docs/log.md power-calibration entry).
+2. **MoE route+glue+combine fusion** (prefill; ours is 0.42-0.49x the fork's
+   pp512 in BOTH power modes — 174 vs 354 LPM, 415 vs 990 full — and the gap
+   is surrounding dispatch overhead, not the matmul). Now fusable INTO the
+   owned mv.metal/mm_id kernels — the strategic payoff of vendoring.
 3. **mmap + no-copy model load** (see ledger item below) — dev-velocity
    multiplier: every parity/bench cycle pays ~30 s/load today.
 4. **DFlash speculative decoding** — multiplies whatever decode speed exists,
