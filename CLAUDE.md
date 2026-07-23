@@ -98,6 +98,16 @@ trap documented here.
 - Known candle-at-this-rev trap: Metal `Tensor::copy()`/`try_clone` is a
   SHALLOW Arc clone — it copies NO data (CUDA's does). Any "copy this
   tensor to new storage" logic built on it is a silent no-op on Metal.
+- Second candle-at-this-rev trap (cost a full red-herring debugging tour):
+  the Metal QUANTIZED matmul rebuilds its input layout from the SHAPE
+  (`quantized/metal.rs` `call_quantized_matmul_mm_t`) and so silently drops
+  the input's storage start_offset — feeding a dim-0 `narrow` view to a
+  QMatMul multiplies the WRONG rows, and `.contiguous()` can't fix it (an
+  offset-only view still passes the contiguity check and no-ops). Our
+  `QLinear::forward` (gguf.rs) materializes such inputs (zeros_like +
+  slice_set — see trap above for why not `.copy()`); never call a raw
+  candle QMatMul with a view that might carry an offset. Regression test:
+  `gguf::tests::qlinear_forward_honors_row_offset_views`.
 - Weight load is mmap + no-copy BY DEFAULT (2026-07-23, gguf.rs
   `MmapSource`): one read-only mmap of the GGUF; each expert stack and
   attention-f16 plane gets its own page-floored `newBufferWithBytesNoCopy`
@@ -304,10 +314,26 @@ Known remaining gaps (see TODO.md priority list for the plan):
 - `LAGUNA_BENCH` env var enables a warm-up forward for steady-state timing.
   Bench ≥ 256 decode tokens — sub-second runs report boost-clock fiction.
 
-## DFlash (deferred, designed-for)
+## DFlash (SHIPPED 2026-07-23)
 
-The drafter (`models/laguna-s-2.1-DFlash-BF16.gguf`, already downloaded) reads
-residual-stream taps from the target: model.rs's tap capture (`h_nextn`,
-per-layer `l_out`) is the attachment point. Fork implementation:
-`src/models/dflash.cpp` + `common/speculative.cpp` (laguna drafters use CAUSAL
-attention, generic DFlash non-causal).
+Speculative decoding via the block-diffusion drafter
+(`models/laguna-s-2.1-DFlash-BF16.gguf`): `laguna generate --draft <gguf>`
+(defaults `--draft-max 15 --draft-p-min 0.5`). Structure: `src/dflash.rs` is
+the self-contained drafter (dense f32, plain candle ops, own cache — never
+references LagunaModel; borrows the target's embeddings/lm_head via
+`embed_ids`/`lm_head` accessors); generate.rs owns the round loop; kv_cache.rs
+does verify rollback (full layers truncate; SWA rings snapshot/restore the
+clobbered slots). Gotchas with teeth:
+- `dflash.target_layers` are layer-INPUT ids — use
+  `DflashConfig::spec_tap_layers()` (the enforced −1 translation to `l_out`
+  indices); wiring them raw is off-by-one and drops the 48 sentinel.
+- Drafts read from noise rows 1..n (each MASK predicts ITS OWN slot). Not the
+  causal-LM convention.
+- Greedy spec-on output is BYTE-IDENTICAL to spec-off (regression anchor);
+  acceptance is at fork parity (13.1% vs llama-server's 13.7%, same config).
+- Perf (LPM): code-gen 25.5 vs 18.4 tok/s base (1.39x, temp 1.0); prose is
+  NET NEGATIVE (~15.2 vs 17.9) — don't "fix" that by tuning knobs, the
+  ledger levers are drafter-forward perf + acceptance auto-disable.
+- The fork's `speculative-simple` does NOT support DFlash (no ctx_other →
+  segfault after load); the reference driver is llama-server, which ignores
+  per-request `speculative.n_max` (restart with `--spec-draft-n-max`).

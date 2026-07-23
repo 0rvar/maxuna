@@ -212,7 +212,22 @@ pub struct QLinear {
 
 impl QLinear {
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        self.inner.forward(x)
+        // candle's Metal quantized matmul rebuilds the input layout from its
+        // SHAPE (quantized/metal.rs, call_quantized_matmul_mm_t) and so silently
+        // drops any storage start_offset — a dim-0 narrowed view reads the wrong
+        // rows. `.contiguous()` cannot repair that (an offset-only view still
+        // passes the contiguity check and no-ops), so genuinely materialize such
+        // inputs via the zeros_like + slice_set blit (Tensor::copy is a shallow
+        // Arc clone on Metal — see CLAUDE.md).
+        let x = if !x.is_contiguous() { x.contiguous()? } else { x.clone() };
+        let x = if x.layout().start_offset() != 0 {
+            let out = x.zeros_like()?;
+            out.slice_set(&x, 0, 0)?;
+            out
+        } else {
+            x
+        };
+        self.inner.forward(&x)
     }
 
     /// Wraps an already-loaded rank-2 weight `[out_dim, in_dim]` as a linear layer,
@@ -686,6 +701,35 @@ mod tests {
                 ((s >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
             })
             .collect()
+    }
+
+    /// QLinear::forward must read the RIGHT rows from an offset view: candle's
+    /// Metal quantized matmul drops the input's storage start_offset (it rebuilds
+    /// the layout from the shape), so a dim-0 `narrow` fed straight through would
+    /// silently multiply the wrong rows. The guard materializes such views; this
+    /// asserts narrow(0, 1, n) == the same rows copied into fresh storage.
+    #[test]
+    fn qlinear_forward_honors_row_offset_views() {
+        let device = metal_device().unwrap();
+        let (out_dim, in_dim, rows) = (16usize, 256usize, 4usize);
+
+        let w = Tensor::from_vec(fill(out_dim * in_dim, 0xA7), (out_dim, in_dim), &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&w.to_device(&device).unwrap(), GgmlDType::Q8_0).unwrap();
+        let lin = QLinear::from_qtensor(Arc::new(qt)).unwrap();
+
+        let x = Tensor::from_vec(fill(rows * in_dim, 0xB3), (rows, in_dim), &device).unwrap();
+        let tail_view = x.narrow(0, 1, rows - 1).unwrap();
+        // Genuinely materialized copy of the same rows (offset 0 storage).
+        let tail_rows = Tensor::from_vec(
+            x.to_device(&Device::Cpu).unwrap().to_vec2::<f32>().unwrap()[1..].concat(),
+            (rows - 1, in_dim),
+            &device,
+        )
+        .unwrap();
+
+        let via_view = lin.forward(&tail_view).unwrap().to_device(&Device::Cpu).unwrap().to_vec2::<f32>().unwrap();
+        let via_copy = lin.forward(&tail_rows).unwrap().to_device(&Device::Cpu).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(via_view, via_copy, "offset view multiplied different rows than its materialized copy");
     }
 
     /// The fused expert stack must load as ONE device allocation shared with its

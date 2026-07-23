@@ -99,8 +99,10 @@
    CLOSED (same-state A/B dead even) — cost: candle is now VENDORED at
    vendor/candle with a ~30-line residency-set patch (upstream PR
    planned). All six gates pass at the exact anchors.
-6. **DFlash speculative decoding** — multiplies whatever decode speed exists,
-   so it lands last.
+6. **DFlash speculative decoding — DONE 2026-07-23** (ledger item below):
+   correct + fork-parity acceptance; code-gen decode 18.4 → 25.5 tok/s
+   (1.39x LPM, temp 1.0, p_min 0.5); prose currently net-negative —
+   drafter-forward perf + auto-disable are the deferred levers.
 
 - [x] **Prefill mm_id kernel (biggest perf item)** — DONE. Vendored ggml's
   two-pass token→expert row-map kernels (`src/ops/mm_id.metal`, runtime-compiled
@@ -498,10 +500,33 @@
 Items deliberately out of v1 scope. Append as new deferrals come up during
 implementation — never silently drop scope.
 
-- [ ] **DFlash speculative decoding** — trained drafter at `poolside/Laguna-S-2.1-DFlash`
-  (BF16 GGUF already in `models/`). Drafter consumes residual-stream taps from target
-  layers (`t_layer_inp[il]`, `t_h_nextn` in the fork's laguna.cpp); `model.rs` keeps
-  per-layer residual capture hooks feasible for this. Biggest post-v1 perf lever.
+- [x] **DFlash speculative decoding — DONE 2026-07-23.** `src/dflash.rs`
+  (drafter: config, dense-f32 BF16 load, encoder / KV-inject / noise-block
+  forwards, own cache) + spec taps / embed_ids / lm_head accessors /
+  kv_checkpoint+kv_rollback (SWA-ring slot snapshot, ~2.4MB/round) in
+  model.rs+kv_cache.rs + the orchestration loop and CLI (`--draft`,
+  `--draft-max` 15, `--draft-p-min` 0.5) in generate.rs. Greedy spec-on
+  output is BYTE-IDENTICAL to spec-off; acceptance parity with the fork
+  confirmed (ours 13.1% vs fork llama-server 13.7% on the same prose
+  prompt at p_min 0). Measured (LPM, temp 1.0, p_min 0.5): code-gen
+  25.5 tok/s vs 18.4 base (**1.39x**, 80% acceptance); prose is still net
+  NEGATIVE (~15.2 vs 17.9 — acceptance too low to pay for the verify).
+  Landed during the arc: QLinear::forward now materializes offset views
+  (candle's Metal quantized matmul silently drops the input
+  start_offset — the 0%-acceptance bug; regression test
+  `qlinear_forward_honors_row_offset_views`).
+  Deferred follow-ups:
+  - [ ] **Drafter forward perf** — WP-D1 is deliberately naive (dense f32
+    candle ops, ~4.4GB resident, CPU logits readback per round). Levers:
+    f16 weights, single fused draft readback (GPU argmax; full-vocab
+    softmax only needed for p_min), drop the redundant row-0 lm_head.
+    Would lift the all-prompt-kinds break-even, not just code.
+  - [ ] **Auto-disable spec on low acceptance** (prose regresses ~15%):
+    track a running acceptance EMA and fall back to plain decode when the
+    round economics go negative.
+  - [ ] **Candle upstream**: the quantized-matmul start_offset drop is an
+    upstream bug (quantized/metal.rs rebuilds the input layout from its
+    shape) — worth folding into the residency-set PR conversation.
 - [ ] **HTTP server** (OpenAI-compatible /v1/chat/completions) so coding agents can
   connect; v1 is CLI-only per scope decision.
 - [ ] **Self-quantized Q5/Q6 tier** — official GGUF repo only ships Q4_K_M (75.2GB),

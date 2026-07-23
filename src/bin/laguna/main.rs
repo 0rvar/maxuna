@@ -7,7 +7,8 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use laguna::chat::{ChatOptions, Message, build_prompt};
-use laguna::generate::Generator;
+use laguna::dflash::DflashDrafter;
+use laguna::generate::{Generator, SpecParams};
 use laguna::gguf;
 use laguna::model::LagunaModel;
 use laguna::ops::ExpertRunner;
@@ -50,6 +51,35 @@ impl SamplingArgs {
     }
 }
 
+/// DFlash speculative-decode knobs. Passing `--draft <gguf>` turns speculation
+/// on; without it, generation runs the plain single-token decode loop.
+#[derive(Parser)]
+struct DraftArgs {
+    /// Path to a DFlash drafter GGUF. Enables speculative decoding when set.
+    #[arg(long)]
+    draft: Option<PathBuf>,
+    /// Max draft tokens proposed per verify round (clamped to block_size-1).
+    #[arg(long, default_value_t = 15)]
+    draft_max: usize,
+    /// Discard a round's whole draft if fewer than this many are collected.
+    #[arg(long, default_value_t = 0)]
+    draft_min: usize,
+    /// Stop drafting at the first token whose full-vocab softmax prob is below
+    /// this. Adaptive draft length; 0.5 measured best across prompt kinds.
+    #[arg(long, default_value_t = 0.5)]
+    draft_p_min: f32,
+}
+
+impl DraftArgs {
+    fn params(&self) -> SpecParams {
+        SpecParams {
+            draft_max: self.draft_max,
+            draft_min: self.draft_min,
+            draft_p_min: self.draft_p_min,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Dump GGUF metadata and tensor listing.
@@ -78,6 +108,8 @@ enum Cmd {
         stats: bool,
         #[command(flatten)]
         sampling: SamplingArgs,
+        #[command(flatten)]
+        draft: DraftArgs,
     },
     /// Interactive chat REPL.
     Chat {
@@ -107,13 +139,17 @@ fn expert_runner(name: &str) -> Result<ExpertRunner> {
     }
 }
 
-/// Load the model + tokenizer + sampler and assemble a Generator on Metal.
+/// Load the model + tokenizer + sampler and assemble a Generator on Metal. When
+/// `draft` carries a `--draft` path, the DFlash drafter is loaded on the SAME
+/// Metal device (its ops interleave with the target's shared embeddings/lm_head,
+/// so they must share a device) and attached for speculative decoding.
 fn build_generator(
     model: &PathBuf,
     tokenizer: &PathBuf,
     moe_impl: &str,
     max_ctx: usize,
     sampling: SamplerOptions,
+    draft: Option<&DraftArgs>,
 ) -> Result<Generator> {
     let runner = expert_runner(moe_impl)?;
     let device = gguf::metal_device()?;
@@ -126,7 +162,18 @@ fn build_generator(
     let model = LagunaModel::load(gguf, runner, max_ctx)?;
     eprintln!("laguna: model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
-    Ok(Generator::new(model, tok, sampler))
+    let mut generator = Generator::new(model, tok, sampler);
+
+    if let Some(draft) = draft.filter(|d| d.draft.is_some()) {
+        let path = draft.draft.as_ref().unwrap();
+        let draft_start = std::time::Instant::now();
+        let dgguf = gguf::open(path, &device)?;
+        let drafter = DflashDrafter::load(&dgguf, &device, max_ctx)?;
+        generator.attach_drafter(drafter, draft.params())?;
+        eprintln!("laguna: drafter loaded in {:.1}s", draft_start.elapsed().as_secs_f64());
+    }
+
+    Ok(generator)
 }
 
 fn main() -> Result<()> {
@@ -150,9 +197,10 @@ fn main() -> Result<()> {
             raw,
             stats,
             sampling,
+            draft,
         } => {
             let mut generator =
-                build_generator(&model, &tokenizer, &moe_impl, max_ctx, sampling.options())?;
+                build_generator(&model, &tokenizer, &moe_impl, max_ctx, sampling.options(), Some(&draft))?;
 
             // BOS ownership: the chat template writes it as literal text; raw
             // mode prepends it here so generate() itself never injects a BOS.
@@ -184,12 +232,21 @@ fn main() -> Result<()> {
                     gstats.decode_secs,
                     gstats.decode_tps(),
                 );
+                if let Some(spec) = &gstats.spec {
+                    eprintln!(
+                        "spec:    {} rounds, {} drafted, {} accepted ({:.1}% acceptance)",
+                        spec.rounds,
+                        spec.drafted,
+                        spec.accepted,
+                        spec.acceptance_rate() * 100.0,
+                    );
+                }
             }
             Ok(())
         }
         Cmd::Chat { model, tokenizer, max_tokens, moe_impl, max_ctx, show_thinking, sampling } => {
             let mut generator =
-                build_generator(&model, &tokenizer, &moe_impl, max_ctx, sampling.options())?;
+                build_generator(&model, &tokenizer, &moe_impl, max_ctx, sampling.options(), None)?;
             repl::run(&mut generator, max_tokens, show_thinking)
         }
     }

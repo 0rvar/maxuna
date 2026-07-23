@@ -4,6 +4,88 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — DFlash speculative decoding SHIPPED: fork-parity acceptance, code-gen decode 18.4 → 25.5 tok/s; the 0%-acceptance bug was candle's quantized matmul dropping the input start_offset
+
+**What DFlash is.** The drafter (`models/laguna-s-2.1-DFlash-BF16.gguf`, 1.1B
+dense, 6 Laguna-style layers: 72Q/8KV hd128, QK-norm before rope, per-head
+softplus attn gate, SwiGLU, plain NEOX rope θ=500k all dims, no SWA) drafts a
+whole block per forward — `[id_last, MASK×n]`, each MASK slot predicting the
+token AT its own position (diffusion convention: drafts come from rows 1..n,
+NOT the causal-LM row i→i+1 reading). It has no embeddings or lm_head (borrows
+the target's) and no prompt understanding of its own: context arrives by KV
+INJECTION — six target residual taps per token (`dflash.target_layers`
+[2,11,20,30,39,48] = layer INPUTS, i.e. our `l_out` of [1,10,19,29,38,47]; the
+48 sentinel is pre-final-norm = l_out(47)), each RMS-normed against a per-tap
+`aux_norm` row, concatenated (18432), projected by `fc` to 3072, then a
+no-attention pass writes just K/V into the drafter cache at the token's
+position. Verification: ONE batched target forward over `[anchor, drafts…]`;
+the real sampler draws per position in order and drafts are accepted while
+they exactly match — so committed output IS target-sampled, and with a seeded
+sampler spec-on greedy output came out BYTE-IDENTICAL to spec-off.
+
+**Structure.** `src/dflash.rs` — self-contained drafter (dense f32 weights,
+plain candle ops, own f32 full-attention cache; pure function of its weights,
+never references LagunaModel; `DflashConfig::spec_tap_layers()` owns the
+enforced target_layers→l_out −1 translation). model.rs — lightweight spec taps
+(Arc-bump handles, zero cost off), `embed_ids`/`lm_head` accessors,
+`kv_checkpoint`/`kv_rollback`. kv_cache.rs — full layers truncate by length;
+SWA-512 rings snapshot the ≤16 slots a verify will clobber (~2.4MB/round, real
+blit via zeros_like+slice_set — Tensor::copy is the shallow-clone trap) and
+restore the rejected suffix; bitwise-tested across wrap regimes. generate.rs —
+the round loop (draft → checkpoint → forward_all_logits verify → sequential
+sampler acceptance → rollback → inject committed-prefix taps) + CLI
+(`--draft`, `--draft-max` 15, `--draft-min` 0, `--draft-p-min` 0.5).
+
+**The 0%-acceptance bug (a full red-herring tour).** First light-up: 165
+drafts, 0 accepted, drafts "one slot late" — draft[1] reliably equaled the
+token the target actually sampled. Hypotheses burned: rope off-by-one
+(refuted by a ±1 block-shift experiment — predictions barely moved), tap
+position/content shift (protocol traced identical to the fork thrice),
+anchor-blindness (refuted by round-0 evidence). Actual cause, found from the
+drafts being byte-identical to lm_head of hidden rows 0..: **candle's Metal
+quantized matmul rebuilds the input layout from its SHAPE**
+(`quantized/metal.rs`, `call_quantized_matmul_mm_t` builds
+`Layout::contiguous(dims)` and passes ITS start_offset — always 0), silently
+discarding the caller's storage offset. `hidden.narrow(0,1,n)` before lm_head
+therefore multiplied rows 0..n-1. `.contiguous()` CANNOT fix it — a dim-0
+narrow keeps row-major strides, `is_contiguous()` is true, and `contiguous()`
+returns a clone with the offset intact. Fix: `QLinear::forward` materializes
+offset/non-contiguous inputs (zeros_like + slice_set blit), so every
+quantized-matmul consumer is guarded; regression test
+`qlinear_forward_honors_row_offset_views` pins it. Upstream candle bug —
+noted for the residency-set PR conversation.
+
+**Numbers (LPM, 2×2-unverified single runs, ±5%).** Acceptance parity with
+the fork: same prose prompt greedy p_min 0 draft-max 15 — ours 13.1%/9.1
+tok/s, fork llama-server 13.7%/9.2 (fork base ~18.5: DFlash at full blocks is
+a net LOSS in the fork too). Acceptance is text- and confidence-gated:
+`p_min` (drafter stops at its first low-confidence token) dominates fixed
+block caps. Code-gen 192 tok: base 18.4-18.6; p_min 0 caps 15/6 → 17.3/19.1;
+p_min 0.3/0.5/0.7 → 21.5/23.7/23.9 tok/s (50/68/86% acceptance). Temp 1.0
+(real config): **25.5 vs 18.4 = 1.39x at 79.7% acceptance** — sampling costs
+nothing on code. Prose: p_min 0.5 → 15.2 vs 17.9 base — still ~15% net
+negative (≈2.6 committed/round can't pay for drafter overhead + verify).
+Default shipped: draft-max 15 + p_min 0.5. Deferred (ledger): drafter-forward
+perf (naive dense-f32, CPU readbacks — the prose break-even lever) and an
+acceptance-EMA auto-disable. Fork driver quirks learned: `speculative-simple`
+does NOT support DFlash (never sets ctx_other; segfaults after load) — use
+llama-server; the server ignores per-request `speculative.n_max`.
+
+**Review round (Claude + GLM) on the orchestration delta.** Both cleared the
+QLinear guard, span math, ctx clamp, tap drains, and RNG order; the real
+findings were one shared design gap — `accept_drafts` was blind to EOG and the
+token budget: it drew sampler RNG past an accepted-EOG draft and past the
+max_tokens cap (latent — greedy unaffected, ArgMax draws no RNG, and no reused
+stochastic-generator spec path exists yet), `-n 0` sampled+emitted a token
+plain decode wouldn't, and a terminal round left EOG/over-cap tokens in the
+caches. Unified fix: the walk stops before drawing once `budget` commits are
+collected and right after committing an EOG, and the KV keep-count is
+uniformly `committed.len()` — provably matching plain decode's exit state
+(all emitted tokens except the last are forwarded) across mismatch / bonus /
+mid-block-EOG / budget-stop cases. +4 pure tests (108 total green);
+post-fix smoke: greedy spec output still byte-identical, 24.2 vs 19.0 tok/s
+at the shipped defaults.
+
 ## 2026-07-23 — mmap + no-copy load, part 2: the ~10% sustained-prefill deficit was GPU residency; candle vendored + patched (queue-attached residency set), gap closed
 
 **The deficit.** The freshly-shipped mmap loader benched clean on decode and

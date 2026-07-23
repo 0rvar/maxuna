@@ -7,7 +7,7 @@ use candle_nn::RmsNorm;
 use crate::attention::{AttnBlock, AttnWeights, PrefillMask};
 use crate::config::LagunaConfig;
 use crate::gguf::{GgufFile, QLinear, Weights};
-use crate::kv_cache::{LayerCache, MaskKind};
+use crate::kv_cache::{KvCheckpoint, LayerCache, LayerCheckpoint, MaskKind};
 use crate::moe::{DenseMlp, MoeBlock};
 use crate::ops::ExpertRunner;
 use crate::rope::Rope;
@@ -67,6 +67,15 @@ pub struct LagunaModel {
     max_ctx: usize,
     tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
+    /// DFlash spec-decode residual-stream taps: the `l_out` layer indices the
+    /// drafter reads (e.g. `[1,10,19,29,38,47]`), or `None` (default). Separate
+    /// from the heavyweight parity `taps` above — a single `Option` check per
+    /// layer when unset, and only the configured layers' handles are cloned when
+    /// set (a cheap Arc bump each, no dtype conversion).
+    spec_tap_layers: Option<Vec<usize>>,
+    /// The most recent forward's spec taps, in configured order, drained by
+    /// `take_spec_taps`.
+    spec_taps: Vec<Tensor>,
     /// Keeps the GGUF mapping (and its Metal view buffers' residency set) alive
     /// for the model's lifetime on the mmap alias load: the aliased attention
     /// f16 planes are plain `Tensor`s that cannot carry the mapping themselves,
@@ -178,6 +187,8 @@ impl LagunaModel {
             max_ctx,
             tap_enabled: false,
             taps: Vec::new(),
+            spec_tap_layers: None,
+            spec_taps: Vec::new(),
             _weights_mmap: gguf.mmap_source().cloned(),
         })
     }
@@ -214,7 +225,11 @@ impl LagunaModel {
     /// and `forward_all_logits` (which keeps every position). Advances the KV
     /// caches, so callers feeding chunks must pass a monotonically increasing
     /// `pos`.
-    fn run_stack(&mut self, tokens: &Tensor, pos: usize) -> Result<(Tensor, Vec<(String, Tensor)>)> {
+    fn run_stack(
+        &mut self,
+        tokens: &Tensor,
+        pos: usize,
+    ) -> Result<(Tensor, Vec<(String, Tensor)>, Vec<(usize, Tensor)>)> {
         let seq = tokens.elem_count();
         ensure!(
             pos + seq <= self.max_ctx,
@@ -223,13 +238,18 @@ impl LagunaModel {
             self.max_ctx
         );
 
-        // Embedding lookup, upcast to the f32 residual stream.
-        let tokens = tokens.to_dtype(DType::U32)?;
-        let mut x = self.embed.index_select(&tokens, 0)?.to_dtype(DType::F32)?; // [seq, hidden]
+        // Embedding lookup, upcast to the f32 residual stream (shared with the
+        // drafter via `embed_ids`).
+        let mut x = self.embed_tokens(tokens)?; // [seq, hidden] f32
 
         // Taps are collected into a local vec (no self-borrow tangle with the
         // per-layer cache mutation) and published by the caller when enabled.
         let mut taps: Vec<(String, Tensor)> = Vec::new();
+        // Lightweight spec-decode taps: cloned per configured layer only. Read
+        // the config into a local so the per-layer cache mutation below does not
+        // tangle with the immutable borrow of `self.spec_tap_layers`.
+        let spec_layers = self.spec_tap_layers.clone();
+        let mut spec_captured: Vec<(usize, Tensor)> = Vec::new();
         macro_rules! tap {
             ($name:expr, $il:expr, $t:expr) => {
                 if self.tap_enabled {
@@ -299,6 +319,15 @@ impl LagunaModel {
 
             x = (&ffn_inp + &ffn_out)?;
             tap!("l_out", il, x);
+
+            // Spec-decode capture: the same post-FFN-residual `l_out` value, held
+            // as a cheap Arc clone (f32 already — the residual stream never leaves
+            // f32 on the fused path). Ordered into configured order by the caller.
+            if let Some(layers) = &spec_layers {
+                if layers.contains(&il) {
+                    spec_captured.push((il, x.clone()));
+                }
+            }
         }
 
         // Pre-final-norm residual stream (DFlash drafter's last capture point).
@@ -307,14 +336,15 @@ impl LagunaModel {
         }
 
         let normed = self.output_norm.forward(&x)?; // [seq, hidden]
-        Ok((normed, taps))
+        Ok((normed, taps, spec_captured))
     }
 
     /// tokens: [seq] u32 at absolute position pos. Returns last-position
     /// logits [vocab] f32.
     pub fn forward(&mut self, tokens: &Tensor, pos: usize) -> Result<Tensor> {
         let seq = tokens.elem_count();
-        let (normed, mut taps) = self.run_stack(tokens, pos)?;
+        let (normed, mut taps, spec_captured) = self.run_stack(tokens, pos)?;
+        self.publish_spec_taps(spec_captured);
 
         // Final norm over the full sequence, then the lm head on the LAST
         // position only — never run the vocab matmul over the whole prefill
@@ -339,7 +369,7 @@ impl LagunaModel {
                     &last,
                 )? // [1, vocab]
             }
-            _ => self.lm_head.forward(&last)?, // [1, vocab]
+            _ => self.lm_head(&last)?, // [1, vocab] — shared raw projection
         };
         let logits = logits.flatten_all()?; // [vocab]
         if self.tap_enabled {
@@ -363,8 +393,9 @@ impl LagunaModel {
     /// `forward`/`generate` are unaffected. Advances the KV caches like
     /// `forward`, so a chunked continuous pass must feed a monotonic `pos`.
     pub fn forward_all_logits(&mut self, tokens: &Tensor, pos: usize) -> Result<Tensor> {
-        let (normed, _taps) = self.run_stack(tokens, pos)?;
-        Ok(self.lm_head.forward(&normed)?) // [seq, vocab]
+        let (normed, _taps, spec_captured) = self.run_stack(tokens, pos)?;
+        self.publish_spec_taps(spec_captured);
+        self.lm_head(&normed) // [seq, vocab] — QMatMul path (seq > 1)
     }
 
     /// Enable capture of named intermediate tensors (parity bisection).
@@ -379,6 +410,113 @@ impl LagunaModel {
         std::mem::take(&mut self.taps)
     }
 
+    /// Configure the lightweight spec-decode taps: `Some(layers)` captures each
+    /// listed layer's `l_out` residual on subsequent forwards (in the given
+    /// order); `None` disables capture and drops any pending taps. Unset is the
+    /// default and costs a single `Option` check per layer.
+    ///
+    /// Indices are `l_out` (post-FFN residual) layer indices and must be in
+    /// range — note the drafter's `dflash.target_layers` names layer INPUTS,
+    /// so use `DflashConfig::spec_tap_layers()` for the `t - 1` translation
+    /// rather than wiring `target_layers` through raw.
+    pub fn set_spec_taps(&mut self, layers: Option<Vec<usize>>) {
+        if let Some(layers) = &layers {
+            for &il in layers {
+                assert!(
+                    il < self.layers.len(),
+                    "spec tap layer {il} out of range (model has {} layers); \
+                     dflash target_layers must be translated via DflashConfig::spec_tap_layers()",
+                    self.layers.len()
+                );
+            }
+        }
+        self.spec_tap_layers = layers;
+        // Unconditional: a Some -> Some reconfigure must not leave the old
+        // config's tensors readable until the next forward.
+        self.spec_taps.clear();
+    }
+
+    /// Drain the most recent forward's spec taps, one `f32 [seq, hidden]` tensor
+    /// per configured layer, in the order `set_spec_taps` was given. Empty if no
+    /// forward has run since taps were configured (or if taps are unset).
+    pub fn take_spec_taps(&mut self) -> Vec<Tensor> {
+        std::mem::take(&mut self.spec_taps)
+    }
+
+    /// Reorder a forward's loop-captured spec taps into the configured order and
+    /// stash them for `take_spec_taps`. No-op when taps are unset.
+    fn publish_spec_taps(&mut self, captured: Vec<(usize, Tensor)>) {
+        let ordered = match &self.spec_tap_layers {
+            Some(cfg) => order_spec_taps(cfg, captured),
+            None => return,
+        };
+        self.spec_taps = ordered;
+    }
+
+    /// Gather token embeddings for `ids`, upcast to the f32 residual stream —
+    /// `[ids.len(), hidden]`. The drafter shares the target's embeddings through
+    /// this; identical to the lookup `run_stack` runs at the top of a forward.
+    pub fn embed_ids(&self, ids: &[u32]) -> Result<Tensor> {
+        let tokens = Tensor::new(ids, &self.device)?;
+        self.embed_tokens(&tokens)
+    }
+
+    /// The embedding lookup `run_stack` uses: gather rows and upcast to f32.
+    fn embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
+        let tokens = tokens.to_dtype(DType::U32)?;
+        Ok(self.embed.index_select(&tokens, 0)?.to_dtype(DType::F32)?)
+    }
+
+    /// The RAW output projection: `[seq, hidden] -> [seq, vocab]`, no final norm
+    /// (the caller applies `output_norm` itself). This is the QMatMul/dequant
+    /// path `forward` uses for a prefill chunk and `forward_all_logits` uses for
+    /// every position; the drafter shares the target's lm_head through it. The
+    /// decode-only vendored mat-vec bypass stays inline in `forward` (a perf
+    /// path, numerically equivalent).
+    pub fn lm_head(&self, h: &Tensor) -> Result<Tensor> {
+        // Offset/non-contiguous views are materialized inside QLinear::forward
+        // (the Metal quantized matmul silently drops the input start_offset).
+        Ok(self.lm_head.forward(h)?)
+    }
+
+    /// Snapshot the KV caches BEFORE a `span`-token verify forward, so a partial
+    /// accept can roll back to the committed prefix. `span` must be >= 1 and fit
+    /// the remaining context. See `kv_rollback`.
+    pub fn kv_checkpoint(&self, span: usize) -> Result<KvCheckpoint> {
+        ensure!(span >= 1, "kv_checkpoint: span must be >= 1");
+        let len0 = self.caches.first().map(LayerCache::len).unwrap_or(0);
+        ensure!(
+            len0 + span <= self.max_ctx,
+            "kv_checkpoint: len {len0} + span {span} exceeds max_ctx {}",
+            self.max_ctx
+        );
+        let layers: Vec<LayerCheckpoint> =
+            self.caches.iter().map(|c| c.checkpoint(span)).collect::<Result<_>>()?;
+        Ok(KvCheckpoint::new(len0, span, layers))
+    }
+
+    /// Roll the KV caches back to `len0 + commit` (0 <= commit <= the
+    /// checkpoint's span), where `len0` is the length captured by `kv_checkpoint`.
+    /// After this the caches are byte-identical to ones that only ever advanced
+    /// over the committed tokens, so decode/prefill from here is bit-exact.
+    pub fn kv_rollback(&mut self, ckpt: &KvCheckpoint, commit: usize) -> Result<()> {
+        ensure!(
+            commit <= ckpt.span(),
+            "kv_rollback: commit {commit} exceeds span {}",
+            ckpt.span()
+        );
+        ensure!(
+            ckpt.layers.len() == self.caches.len(),
+            "kv_rollback: checkpoint covers {} layers, model has {}",
+            ckpt.layers.len(),
+            self.caches.len()
+        );
+        for (cache, lc) in self.caches.iter_mut().zip(&ckpt.layers) {
+            cache.rollback(lc, ckpt.len0, ckpt.span, commit)?;
+        }
+        Ok(())
+    }
+
     pub fn reset_cache(&mut self) -> Result<()> {
         for cache in &mut self.caches {
             cache.reset();
@@ -389,6 +527,17 @@ impl LagunaModel {
     pub fn device(&self) -> &Device {
         &self.device
     }
+}
+
+/// Reorder the forward's loop-captured `(layer, l_out)` spec taps (captured in
+/// ascending layer order) into the caller's configured order. A configured layer
+/// with no capture is skipped (it never happens — every configured layer runs
+/// every forward); a repeated layer yields the same handle again.
+fn order_spec_taps(config: &[usize], captured: Vec<(usize, Tensor)>) -> Vec<Tensor> {
+    config
+        .iter()
+        .filter_map(|&il| captured.iter().find(|(c, _)| *c == il).map(|(_, t)| t.clone()))
+        .collect()
 }
 
 /// Sum the resident bytes (weights + KV cache) and warn if it clears the budget.
@@ -425,5 +574,47 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &LagunaConfig, max_ctx: usize) {
             gb(total),
             gb(MEMORY_WARN_BYTES)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(id: usize) -> Tensor {
+        // Distinct 1x3 f32 tensor per layer id, so ordering is observable.
+        Tensor::from_vec(vec![id as f32, id as f32 + 0.5, id as f32 + 0.25], (1, 3), &Device::Cpu)
+            .unwrap()
+    }
+
+    fn first(t: &Tensor) -> f32 {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0]
+    }
+
+    /// The captured `(layer, tensor)` pairs arrive in ascending layer order (loop
+    /// order); `order_spec_taps` re-emits them in the caller's configured order,
+    /// including a non-ascending config and a subset of the run layers.
+    #[test]
+    fn spec_taps_follow_configured_order() {
+        // Forward captured layers 1, 10, 19, 38, 47 (ascending, as the loop runs).
+        let captured: Vec<(usize, Tensor)> =
+            [1, 10, 19, 38, 47].iter().map(|&il| (il, probe(il))).collect();
+
+        // Configured out of order and as a subset.
+        let cfg = vec![47usize, 1, 38];
+        let ordered = order_spec_taps(&cfg, captured);
+        let got: Vec<usize> = ordered.iter().map(|t| first(t) as usize).collect();
+        assert_eq!(got, vec![47, 1, 38]);
+    }
+
+    /// A configured layer with no matching capture is skipped (defensive — every
+    /// configured layer runs in practice), and a repeated layer repeats its tap.
+    #[test]
+    fn spec_taps_skip_missing_and_repeat() {
+        let captured: Vec<(usize, Tensor)> = [1usize, 2].iter().map(|&il| (il, probe(il))).collect();
+        let cfg = vec![2usize, 99, 2];
+        let ordered = order_spec_taps(&cfg, captured);
+        let got: Vec<usize> = ordered.iter().map(|t| first(t) as usize).collect();
+        assert_eq!(got, vec![2, 2]);
     }
 }

@@ -164,6 +164,132 @@ impl LayerCache {
             LayerCache::Swa { len, .. } => *len = 0,
         }
     }
+
+    /// Number of positions currently stored (absolute count of appends, the same
+    /// `len` both variants advance). All layers are driven in lockstep, so this
+    /// is identical across every cache after a shared forward.
+    pub fn len(&self) -> usize {
+        match self {
+            LayerCache::Full { len, .. } | LayerCache::Swa { len, .. } => *len,
+        }
+    }
+
+    /// Snapshot the state a `span`-token verify forward is about to clobber, so
+    /// `rollback` can restore it on a partial accept. Taken BEFORE the verify
+    /// forward, at the current length `len0`.
+    ///
+    /// Full-attention layers write to fresh absolute slots [len0, len0+span) and
+    /// never overwrite live data, so their rollback is a pure length truncation —
+    /// no data snapshot (`LayerCheckpoint::Full`). SWA-ring layers overwrite the
+    /// slots positions [len0, len0+span) map to, evicting whatever those slots
+    /// held; the snapshot deep-copies that pre-verify K/V so rejected slots can be
+    /// put back byte-for-byte.
+    pub fn checkpoint(&self, span: usize) -> Result<LayerCheckpoint> {
+        match self {
+            LayerCache::Full { .. } => Ok(LayerCheckpoint::Full),
+            LayerCache::Swa { k, v, len, window } => {
+                let (len0, w) = (*len, *window);
+                Ok(LayerCheckpoint::Swa {
+                    k: snapshot_ring(k, len0, span, w)?,
+                    v: snapshot_ring(v, len0, span, w)?,
+                })
+            }
+        }
+    }
+
+    /// Roll a verify forward back to `len0 + commit` (0 <= commit <= span), where
+    /// `len0`/`span` are the checkpoint's. Full layers truncate the length,
+    /// discarding the rejected tail (its stale slots sit past `len` and are
+    /// overwritten by the next append). SWA layers restore the ring slots the
+    /// rejected positions [len0+commit, len0+span) overwrote to their pre-verify
+    /// contents, then lower the length. After this, the cache is byte-identical to
+    /// one that only ever appended the committed prefix.
+    pub fn rollback(
+        &mut self,
+        ckpt: &LayerCheckpoint,
+        len0: usize,
+        span: usize,
+        commit: usize,
+    ) -> Result<()> {
+        match (self, ckpt) {
+            (LayerCache::Full { len, .. }, LayerCheckpoint::Full) => {
+                *len = len0 + commit;
+                Ok(())
+            }
+            (LayerCache::Swa { k: kr, v: vr, len, window }, LayerCheckpoint::Swa { k: sk, v: sv }) => {
+                let w = *window;
+                let rejected = span - commit;
+                if rejected > 0 {
+                    // The snapshot is stored in position order [len0, len0+span);
+                    // the rejected tail is its suffix [commit, span). Write it back
+                    // to the ring at the rejected positions' slots (wrap-aware).
+                    let start = (len0 + commit) % w;
+                    write_wrapped(kr, &sk.narrow(1, commit, rejected)?, start, w)?;
+                    write_wrapped(vr, &sv.narrow(1, commit, rejected)?, start, w)?;
+                }
+                *len = len0 + commit;
+                Ok(())
+            }
+            _ => anyhow::bail!("kv_rollback: checkpoint kind does not match cache kind"),
+        }
+    }
+}
+
+/// Per-layer rollback state produced by `LayerCache::checkpoint`. Full layers
+/// carry no data (truncation restores them); SWA layers carry the pre-verify K/V
+/// of the ring slots the verify span overwrites, deep-copied into independent
+/// storage and laid out in position order `[n_kv_head, span, head_dim]`.
+pub enum LayerCheckpoint {
+    Full,
+    Swa { k: Tensor, v: Tensor },
+}
+
+/// A whole-model KV rollback point: the length at checkpoint time, the verify
+/// span, and the per-layer snapshots (one entry per cache, in layer order).
+pub struct KvCheckpoint {
+    pub(crate) len0: usize,
+    pub(crate) span: usize,
+    pub(crate) layers: Vec<LayerCheckpoint>,
+}
+
+impl KvCheckpoint {
+    pub(crate) fn new(len0: usize, span: usize, layers: Vec<LayerCheckpoint>) -> Self {
+        Self { len0, span, layers }
+    }
+
+    /// The verify span this checkpoint covers (commit on rollback must be <= it).
+    pub fn span(&self) -> usize {
+        self.span
+    }
+}
+
+/// Deep-copy the ring slots that positions [len0, len0+span) occupy, returned in
+/// POSITION order as `[n_kv_head, span, head_dim]` (wrap-aware). Independent of
+/// the ring's storage: on Metal at our pinned candle rev `Tensor::copy()` /
+/// `contiguous()` on an already-contiguous view is a shallow Arc clone that
+/// copies no data (CLAUDE.md trap), so `materialize` forces a real allocation.
+fn snapshot_ring(ring: &Tensor, len0: usize, span: usize, w: usize) -> Result<Tensor> {
+    let start = len0 % w;
+    let seg1 = span.min(w - start);
+    let block = if seg1 == span {
+        ring.narrow(1, start, span)?
+    } else {
+        // Span straddles the ring boundary: [start, w) then [0, span - seg1).
+        Tensor::cat(&[&ring.narrow(1, start, seg1)?, &ring.narrow(1, 0, span - seg1)?], 1)?
+    };
+    materialize(&block)
+}
+
+/// Force `t` into freshly allocated, independent device storage, byte-for-byte.
+/// `contiguous()` first (needed for `slice_set`, and a no-op-or-shallow view is
+/// fine here — we immediately blit its bytes elsewhere); then `slice_set` into a
+/// fresh zero tensor, which copies the raw bits (unlike `affine`, which would
+/// canonicalize -0.0).
+fn materialize(t: &Tensor) -> Result<Tensor> {
+    let src = t.contiguous()?;
+    let dst = src.zeros_like()?;
+    dst.slice_set(&src, 1, 0)?;
+    Ok(dst)
 }
 
 /// The `min(len, window)` most recent ring entries, reordered oldest→newest.
@@ -212,4 +338,182 @@ fn write_wrapped(ring: &Tensor, src: &Tensor, start: usize, w: usize) -> Result<
         ring.slice_set(&src.narrow(1, first, s - first)?.contiguous()?, 1, 0)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Prefer the real target device (Metal) so the shallow-copy trap the
+    /// snapshot guards against is actually exercised; fall back to CPU where
+    /// Metal is unavailable (the rollback math is device-agnostic).
+    fn dev() -> Device {
+        Device::new_metal(0).unwrap_or(Device::Cpu)
+    }
+
+    /// Deterministic pseudo-random f32s (LCG, no deps), in roughly [-0.5, 0.5].
+    fn seeded(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / u32::MAX as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// K/V for absolute positions `start..start+len` as `[n_kv, len, hd]` f16,
+    /// each position's row keyed by that position so identical positions produce
+    /// identical bits across independent cache builds.
+    fn kv_block(start: usize, len: usize, n_kv: usize, hd: usize, dev: &Device) -> (Tensor, Tensor) {
+        let build = |base: u64| {
+            let rows: Vec<Tensor> = (start..start + len)
+                .map(|p| {
+                    Tensor::from_vec(seeded(n_kv * hd, base + p as u64), (n_kv, 1, hd), dev).unwrap()
+                })
+                .collect();
+            Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap()
+        };
+        (build(1000), build(9000))
+    }
+
+    fn fresh_swa(window: usize, n_kv: usize, hd: usize, dev: &Device) -> LayerCache {
+        let z = || Tensor::zeros((n_kv, window, hd), DType::F16, dev).unwrap();
+        LayerCache::Swa { k: z(), v: z(), len: 0, window }
+    }
+
+    fn fresh_full(max_ctx: usize, n_kv: usize, hd: usize, dev: &Device) -> LayerCache {
+        let z = || Tensor::zeros((n_kv, max_ctx, hd), DType::F16, dev).unwrap();
+        LayerCache::Full { k: z(), v: z(), len: 0 }
+    }
+
+    fn append_range(c: &mut LayerCache, start: usize, len: usize, n_kv: usize, hd: usize, dev: &Device) {
+        if len == 0 {
+            return;
+        }
+        let (k, v) = kv_block(start, len, n_kv, hd, dev);
+        c.append(&k, &v).unwrap();
+    }
+
+    /// Raw bits of every element (f16 widened to f32 losslessly, then bit-cast),
+    /// so the comparison catches sign-of-zero differences a float `==` would miss.
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    }
+
+    fn ring_kv(c: &LayerCache) -> (Tensor, Tensor) {
+        match c {
+            LayerCache::Full { k, v, .. } | LayerCache::Swa { k, v, .. } => (k.clone(), v.clone()),
+        }
+    }
+
+    /// Test 1: a full-attention layer truncated mid-stream and re-extended equals
+    /// a fresh cache built from the surviving prefix plus the same continuation —
+    /// over the valid `[0, len)` view (stale slots past `len` are ignored by
+    /// every reader and reclaimed by the next append).
+    #[test]
+    fn full_layer_truncate_matches_fresh() {
+        let dev = dev();
+        let (n_kv, hd, max_ctx) = (2, 4, 64);
+        for commit in [0usize, 3, 8] {
+            let span = 8;
+            let len0 = 12;
+            let n_new = 4;
+
+            let mut a = fresh_full(max_ctx, n_kv, hd, &dev);
+            append_range(&mut a, 0, len0, n_kv, hd, &dev);
+            let lc = a.checkpoint(span).unwrap();
+            append_range(&mut a, len0, span, n_kv, hd, &dev); // verify span
+            a.rollback(&lc, len0, span, commit).unwrap();
+            append_range(&mut a, len0 + commit, n_new, n_kv, hd, &dev);
+
+            let mut b = fresh_full(max_ctx, n_kv, hd, &dev);
+            append_range(&mut b, 0, len0 + commit, n_kv, hd, &dev);
+            append_range(&mut b, len0 + commit, n_new, n_kv, hd, &dev);
+
+            let end = len0 + commit + n_new;
+            assert_eq!(a.len(), end, "commit {commit}");
+            assert_eq!(b.len(), end, "commit {commit}");
+            let (ka, va) = ring_kv(&a);
+            let (kb, vb) = ring_kv(&b);
+            let view = |t: &Tensor| t.narrow(1, 0, end).unwrap();
+            assert_eq!(bits(&view(&ka)), bits(&view(&kb)), "commit {commit} K");
+            assert_eq!(bits(&view(&va)), bits(&view(&vb)), "commit {commit} V");
+        }
+    }
+
+    /// Test 2: SWA ring checkpoint/rollback is byte-exact across the interesting
+    /// regimes — (a) len0 < window (slots empty pre-wrap), (b) len0 > window with
+    /// the span fully inside the current turn of the ring, (c) span straddling the
+    /// ring boundary — for every commit in 0..=span and with the rejected tail
+    /// both re-covered and not re-covered by the subsequent appends (n_new). The
+    /// property: rollback(commit) then any continuation == never appending the
+    /// rejected positions. The FULL ring is compared, unwritten slots included.
+    #[test]
+    fn swa_ring_rollback_is_bit_exact() {
+        let dev = dev();
+        let (n_kv, hd) = (2, 4);
+        // (window, prefix_len == len0, span)
+        for &(window, len0, span) in &[(16usize, 5usize, 4usize), (8, 12, 3), (8, 14, 4)] {
+            for commit in 0..=span {
+                for &n_new in &[0usize, 2] {
+                    let mut a = fresh_swa(window, n_kv, hd, &dev);
+                    append_range(&mut a, 0, len0, n_kv, hd, &dev);
+                    let lc = a.checkpoint(span).unwrap();
+                    append_range(&mut a, len0, span, n_kv, hd, &dev); // verify span
+                    a.rollback(&lc, len0, span, commit).unwrap();
+                    append_range(&mut a, len0 + commit, n_new, n_kv, hd, &dev);
+
+                    let mut b = fresh_swa(window, n_kv, hd, &dev);
+                    append_range(&mut b, 0, len0, n_kv, hd, &dev);
+                    append_range(&mut b, len0, commit, n_kv, hd, &dev); // committed prefix
+                    append_range(&mut b, len0 + commit, n_new, n_kv, hd, &dev);
+
+                    let label = format!("window {window} len0 {len0} span {span} commit {commit} n_new {n_new}");
+                    assert_eq!(a.len(), b.len(), "{label}: len");
+                    let (ka, va) = ring_kv(&a);
+                    let (kb, vb) = ring_kv(&b);
+                    assert_eq!(bits(&ka), bits(&kb), "{label}: K");
+                    assert_eq!(bits(&va), bits(&vb), "{label}: V");
+                }
+            }
+        }
+    }
+
+    /// Test 3: the snapshot is a real copy, not a Metal shallow Arc clone. Take a
+    /// checkpoint, then overwrite the very slots it captured (by running the verify
+    /// span) and assert the snapshot's bytes are unchanged. If `materialize`
+    /// regressed to a shallow view aliasing the ring, the append would mutate the
+    /// snapshot and this fails.
+    #[test]
+    fn swa_snapshot_is_a_real_copy() {
+        let dev = dev();
+        let (n_kv, hd, window, len0, span) = (2, 4, 8, 12, 4);
+        let mut c = fresh_swa(window, n_kv, hd, &dev);
+        append_range(&mut c, 0, len0, n_kv, hd, &dev);
+        let lc = c.checkpoint(span).unwrap();
+        let (before_k, before_v) = match &lc {
+            LayerCheckpoint::Swa { k, v } => (bits(k), bits(v)),
+            LayerCheckpoint::Full => unreachable!("SWA cache yields an SWA checkpoint"),
+        };
+        // Clobber the captured slots.
+        append_range(&mut c, len0, span, n_kv, hd, &dev);
+        let (after_k, after_v) = match &lc {
+            LayerCheckpoint::Swa { k, v } => (bits(k), bits(v)),
+            LayerCheckpoint::Full => unreachable!(),
+        };
+        assert_eq!(before_k, after_k, "snapshot K aliased the ring (shallow copy)");
+        assert_eq!(before_v, after_v, "snapshot V aliased the ring (shallow copy)");
+    }
 }

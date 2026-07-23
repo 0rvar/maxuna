@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod chat;
 pub mod config;
+pub mod dflash;
 pub mod generate;
 pub mod gguf;
 pub mod kv_cache;
