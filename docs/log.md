@@ -4,6 +4,44 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — tensor attention gemm: 2x in isolation, REJECTED as default by the decode gate; kept as opt-in
+
+**Arc.** The attention sub-budget put the prefill projections (classic
+simdgroup f16 gemm) at 585 ms/forward — the biggest category. Prototyped two
+Metal-4 `matmul2d` ports on the production shapes: float-operand tiles
+(`_t_hp`-analog) were BIT-IDENTICAL to classic but zero speedup — the mm_id
+precedent repeating exactly; half-operand tiles (`_t`-analog, fork-faithful
+f16-staged activations) were ~2x on every shape at ~1.85e-4 rel — the fork's
+own prefill numerics class. Orvar approved shipping the f16-staged variant as
+default, gate to sign off. Ported with full plumbing (opt-in/kill-switch env,
+`attn_mm` provenance enforced per tier, lazy-compiled separate Metal-4
+library; decode gemv and LAGUNA_ATTN_F32 untouched).
+
+**Gate verdict: REJECTED.** End-to-end it delivered 267 tok/s @925 (0.76x
+fork) and passed 5 of 6 grades — but decode/code-short flipped step 29
+(candidate 33586 vs reference 785, ref margin 0.6001, past the 0.5 excuse
+line). The fork-calibration data was decisive: the fork ITSELF — f16-staged
+prefill and all — agrees with the reference at that step (argmax 785, margin
+narrowed 0.60 → 0.32; our token sits 4th in its list). So our tensor drift
+exceeds the fork envelope, full stop. Supporting signals: mm cosine fell
+0.996987 → 0.995842 (headroom 2e-3 → 8e-4) and Δnll rose 0.0019 → 0.0047
+(79% of the bound) — same drift class as mm_id's `_t` but a bigger dose (48
+layers × 5 projections), and it compounds visibly.
+
+**Resolution.** Default inverted: classic simdgroup stays the shipped mm
+branch; tensor is opt-in `LAGUNA_ATTN_MM_TENSOR`; per-tier `attn_mm`
+enforcement pins candidates to "classic". Confirmation gate: all six back at
+the known-good anchors (mm 0.996987, Δnll 0.001937 — bit-identical era).
+Kernel + numerics test + bench kept for the follow-up: probe `matmul2d` with
+MIXED operands (f16 weight tiles × f32 activation tiles — never tried in the
+mm_id work either); if the API takes it, that's tensor speed with zero
+activation rounding. Lessons: (1) per-matmul numerics class does NOT predict
+the model-level envelope — the dose matters; (2) the layered gate design
+earned its keep: cosine and ppl both PASSED while the fork-calibrated greedy
+tier caught the drift; (3) an isolation 2x that costs the correctness margin
+is not a win — the gate is the definition of done, and "the fork does f16
+staging too" is not a license when the fork's own outputs disagree.
+
 ## 2026-07-23 — attention mask hoisting SHIPPED: prefill 211 → 228 @925 / 184 → 237 @4k, byte-identical
 
 **Context.** The attention sub-budget (new `prefill_attn_*` benches; parts

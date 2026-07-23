@@ -298,6 +298,18 @@ kernels and they have different (both correct) numerical envelopes vs the f32
     `"f32"` (strict gates the legacy f32 attention path); mm/decode/ppl candidates
     must be `"f16"` (the shipped default). A dump missing the field came from a stale
     `logits-dump` binary and hard-fails (regenerate).
+  - `attn_mm` (the attention prefill gemm path) is pinned per side in EVERY tier
+    the same way: reference and strict candidates must be `"f32-bypass"`
+    (`LAGUNA_ATTN_F32` routes attention through the legacy dequant-f32 QMatMul, so
+    the f16 library's mm branch never runs), while the mm/decode/ppl candidate paths
+    run the shipped classic simdgroup attention prefill gemm and must be
+    `"classic"`. A Metal-4 cooperative-tensor prefill gemm (`f16_t.metal`) exists as
+    an opt-in (`LAGUNA_ATTN_MM_TENSOR` → `"tensor"`), but it was rejected as the
+    default by the decode gate on 2026-07-23: its f16 activation staging flips a
+    0.6-margin reference decision at code-short step 29 (a flip the fork itself does
+    NOT make — the fork agrees with the reference there), so our drift exceeds the
+    fork envelope. It is kept for future numerics work. A dump missing the field is
+    a stale binary and hard-fails (regenerate).
   - Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE must prove the mm_id path was
     actually active — `moe_impl == "fused"`, `seq_len >= mm_min_seq`,
     `no_mm_id == false` — else the gate hard-fails asking you to regenerate.

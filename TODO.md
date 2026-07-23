@@ -303,10 +303,19 @@ implementation — never silently drop scope.
   - **A (float tiles) is not worth porting**: bit-IDENTICAL to classic (rel_l2 0.0)
     but ~break-even on speed (no tensor-core throughput gain from float operands) —
     exactly the mm_id `_t_hp` precedent ("compiles but slower than f16 tiles").
-  Recommended port: make B the default attention prefill gemm, keep the classic
-  float-tile kernel as the strict-tier / `LAGUNA_ATTN_F32` fallback (mirror the
-  mm_id `_t` default + `_hp`/classic fallback structure, incl. the lazy-compile
-  split so a future float-`matmul2d` rejection can't break the default library).
+  PORTED then REVERTED to opt-in 2026-07-23. Variant B graduated to production
+  (src/ops/f16_t.metal, own lazy-compiled Metal-4 library; numerics test + timing
+  bench in f16.rs) and was shipped as the mm-branch default. The parity gate then
+  REJECTED it as default on the decode tier: its f16 activation staging flips a
+  0.6001-margin reference decode decision at code-short step 29 (cand 33586 vs ref
+  785), a flip the FORK itself does NOT make (fork argmax 785, margin 0.32; 33586
+  is 4th in the fork's top-10) — so our drift exceeds the fork envelope. (mm passed
+  but headroom shrank to 8e-4 / cos 0.995842; ppl consumed 79% of its bound.) The
+  tensor kernel is kept as opt-in `LAGUNA_ATTN_MM_TENSOR`; the classic simdgroup
+  gemm stays the default. Candidate follow-up: probe `matmul2d` with MIXED operands
+  (f16 weight tiles × f32 activation tiles), which would eliminate the activation
+  rounding entirely and could clear the decode envelope; until then classic stays
+  default.
 - [x] **Combine-library reassociation hardening — RESOLVED via source pragma**
   (2026-07-22). The fused combine kernels' bit-identity to candle's chain rests
   on the rescale multiply chain (`r1 = d*l; r2 = r1*2^-15; r3 = r2*ww`) NOT

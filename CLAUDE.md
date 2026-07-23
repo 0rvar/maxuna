@@ -206,11 +206,14 @@ Warm steady-state, fused path, vs fork `llama-bench`, pmset-verified 2×2
 | prefill 4k (4007 tok / pp4096) | ~237 tok/s | 348 | (stale: ~345) | 793 |
 
 Decode is at parity with the fork in BOTH modes (0.98x). Prefill "ours" LPM
-figures are 2026-07-23 post combine-fusion + mask-hoisting (174 → 228 @925,
-~155 → 237 @4k in one day); the full-power ours column predates both. The
-remaining prefill gap (0.64-0.68x fork) is led by the attention projections
-gemm (classic simdgroup f16 path — tensor-path port is the open TODO), the
-transpose/cast/rope glue, and serial scheduling vs ggml's concurrent encoder.
+figures are 2026-07-23 post combine-fusion + mask-hoisting (174 → ~230-238
+@925, ~155 → 236 @4k in one day); the full-power ours column predates both.
+The remaining prefill gap (~0.67x fork) is led by the attention projections
+gemm — the cooperative-tensor port is ~2x in isolation but REJECTED as
+default by the decode gate (drift outside the fork envelope; opt-in
+`LAGUNA_ATTN_MM_TENSOR`, see docs/log.md; mixed-operand matmul2d is the open
+follow-up) — plus the transpose/cast/rope glue and serial scheduling vs
+ggml's concurrent encoder.
 
 Prefill: the vendored two-pass mm_id kernel (tensor `matmul2d` default) took
 prefill ~60 → ~188 tok/s (3.1x; ~174 re-measured 2026-07-22 in LPM). Decode:

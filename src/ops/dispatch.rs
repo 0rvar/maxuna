@@ -982,6 +982,17 @@ pub(crate) fn run_plain_mv(
 /// the only f16 in the chain). Dispatches per the fork's host split: the gemv
 /// for t <= 8 tokens, the tiled gemm above (`F16_MM_MIN_SEQ`).
 pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
+    run_matmul_f16_variant(weight, x, !crate::ops::attn_mm_tensor())
+}
+
+/// `run_matmul_f16` with the prefill (ne11 >= 8) mm-branch kernel chosen
+/// explicitly: `mm_classic` true runs the classic simdgroup kernel (the shipped
+/// default), false the Metal-4 cooperative-tensor kernel. Production derives the
+/// flag from the cached `LAGUNA_ATTN_MM_TENSOR` opt-in switch (`run_matmul_f16`);
+/// the f16.rs tests call this with an explicit variant because the switch is a
+/// process-global `OnceLock`. The decode gemv branch is identical for both
+/// (classic mv).
+pub(crate) fn run_matmul_f16_variant(weight: &Tensor, x: &Tensor, mm_classic: bool) -> Result<Tensor> {
     let cdev = x.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("matmul_f16 requires x on a Metal device");
@@ -1055,8 +1066,12 @@ pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         if t > F16_MM_MIN_SEQ {
-            // Tiled gemm: 64(out) x 32(token) tiles, 128 threads / 4 simdgroups,
-            // float sa/sb tiles (12288 B; the store-back tile reuses the region).
+            // Tiled gemm: 64(out) x 32(token) tiles, 128 threads / 4 simdgroups.
+            // Default is the classic simdgroup kernel (float tiles, 12288 B; the
+            // store-back tile reuses the region); LAGUNA_ATTN_MM_TENSOR opts into
+            // the Metal-4 cooperative-tensor kernel (half operand tiles, 8192 B
+            // smem). Same MmArgs, grid and threads either way — only the kernel,
+            // its library, and the tile smem differ.
             let args = MmArgs {
                 ne00: k as i32,
                 ne02: 1,
@@ -1073,13 +1088,17 @@ pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
                 r2: 1,
                 r3: 1,
             };
-            let pipeline = pipelines::f16_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_v")?;
+            let (pipeline, smem) = if mm_classic {
+                (pipelines::f16_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_v")?, 12288)
+            } else {
+                (pipelines::f16_t_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_t")?, 8192)
+            };
             encoder.set_compute_pipeline_state(&pipeline);
             encoder.set_bytes(0, &args);
             encoder.set_input_buffer(1, Some(w_buf), w_off);
             encoder.set_input_buffer(2, Some(x_buf), x_off);
             encoder.set_output_buffer(3, Some(&dst), 0);
-            encoder.set_threadgroup_memory_length(0, 12288);
+            encoder.set_threadgroup_memory_length(0, smem);
             let grid = mtl_size!(t.div_ceil(32), n_out.div_ceil(64), 1);
             encoder.dispatch_thread_groups(grid, mtl_size!(128, 1, 1));
         } else {

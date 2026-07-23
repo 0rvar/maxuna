@@ -221,6 +221,9 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// model resolved at load ("f16" default, "f32" under LAGUNA_ATTN_F32) — the
 /// gate enforces it per side/tier, so a dump from a binary that predates the
 /// f16 attention path (and thus omits the field) cannot pass as current.
+/// `attn_mm` records the attention prefill gemm path the model resolved at load
+/// ("classic" default, "tensor" under LAGUNA_ATTN_MM_TENSOR, "f32-bypass" under
+/// LAGUNA_ATTN_F32); the gate enforces it per side/tier like `attn_dtype`.
 /// `combine` records the routed-expert combine path: "reference" for the
 /// Reference-oracle runner (which never touches `ops::combine` — it combines via
 /// its own per-expert index_add), else "fused" (default) or "classic" (under
@@ -240,6 +243,11 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         "no_mm_id": laguna::ops::no_mm_id_forced(),
         "mm_min_seq": laguna::ops::MM_ID_MIN_SEQ,
         "attn_dtype": attn_dtype,
+        // Attention prefill gemm path: "classic" (shipped simdgroup default),
+        // "tensor" (LAGUNA_ATTN_MM_TENSOR), or "f32-bypass" (LAGUNA_ATTN_F32).
+        // The gate enforces it per side/tier (like attn_dtype), so a dump
+        // predating the field cannot pass as current.
+        "attn_mm": model.attn_mm(),
         // Reference runner never dispatches ops::combine, so it is neither
         // "fused" nor "classic" — mirror how moe_impl distinguishes reference.
         "combine": if matches!(moe_impl, "reference" | "ref") {

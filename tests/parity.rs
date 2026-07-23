@@ -112,6 +112,13 @@ struct Provenance {
     /// provenance field — the gate hard-fails on that per side (same reasoning as
     /// `attn_dtype`).
     combine: Option<String>,
+    /// Attention prefill gemm path: "classic" (the shipped simdgroup default),
+    /// "tensor" (`LAGUNA_ATTN_MM_TENSOR`, the opt-in Metal-4 cooperative-tensor
+    /// kernel), or "f32-bypass" (`LAGUNA_ATTN_F32` — attention runs the legacy
+    /// dequant-f32 QMatMul, so the f16 library's mm branch never runs). `None` for
+    /// dumps predating the field — the gate hard-fails on that per side (same
+    /// reasoning as `attn_dtype`).
+    attn_mm: Option<String>,
 }
 
 impl Provenance {
@@ -165,6 +172,12 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
             // hard-fails on that later, per side); present-but-not-a-string is malformed.
             combine: match p.get("combine") {
                 Some(d) => Some(d.as_str().context("provenance `combine` is not a string")?.to_string()),
+                None => None,
+            },
+            // Absent in dumps predating the attn_mm field (the gate hard-fails on
+            // that later, per side); present-but-not-a-string is malformed.
+            attn_mm: match p.get("attn_mm") {
+                Some(d) => Some(d.as_str().context("provenance `attn_mm` is not a string")?.to_string()),
                 None => None,
             },
         })),
@@ -448,6 +461,28 @@ fn check_combine(p: &Provenance, side: &str, want: &str) -> Result<()> {
     }
 }
 
+/// Enforce the attention prefill gemm path recorded in one side's provenance.
+/// `want` is "f32-bypass" for the Reference-oracle side and strict-tier candidates
+/// (both run under `LAGUNA_ATTN_F32=1`, which bypasses the f16 library's mm
+/// branch), and "classic" for the mm/decode/ppl candidates that grade the shipped
+/// simdgroup prefill kernel. A provenance MISSING the field came from a
+/// `logits-dump` binary that predates it — hard fail, because such a dump is
+/// otherwise indistinguishable from a current one and the gate would pass
+/// vacuously.
+fn check_attn_mm(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    match p.attn_mm.as_deref() {
+        Some(m) if m == want => Ok(()),
+        Some(other) => bail!(
+            "{side} provenance.attn_mm is {other:?}, expected {want:?}; regenerate the dump \
+             under the environment its gate prescribes (see docs/parity.md §3)"
+        ),
+        None => bail!(
+            "{side} provenance has no attn_mm (stale `logits-dump` binary predating the \
+             field); rebuild logits-dump and regenerate the dump"
+        ),
+    }
+}
+
 fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
@@ -465,6 +500,8 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
         Some(p) if p.moe_impl == "reference" => {
             check_attn_dtype(p, "reference dump", "f32")?;
             check_combine(p, "reference dump", "reference")?;
+            // f32 attention bypasses the f16 library's mm branch entirely.
+            check_attn_mm(p, "reference dump", "f32-bypass")?;
         }
         Some(p) => bail!(
             "reference dump provenance.moe_impl is {:?}, expected \"reference\": the reference side \
@@ -532,6 +569,18 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             "candidate dump has no provenance (predates the field). Regenerate the candidate with \
              the current `logits-dump` — see docs/parity.md §3b."
         ),
+    }
+
+    // EVERY tier also pins the CANDIDATE's attention prefill gemm path: strict runs
+    // under LAGUNA_ATTN_F32 (f16 library bypassed → "f32-bypass"), while mm and
+    // decode grade the shipped classic simdgroup prefill kernel ("classic").
+    // Candidate provenance is already proven Some by the attn_dtype check above.
+    let want_attn_mm = match tier {
+        Tier::Strict => "f32-bypass",
+        Tier::Mm | Tier::Decode => "classic",
+    };
+    if let Some(p) = &candidate.provenance {
+        check_attn_mm(p, "candidate dump", want_attn_mm)?;
     }
 
     // strict tier: the CANDIDATE must be a Fused-runner dump produced under
@@ -829,6 +878,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
         Some(p) if p.moe_impl == "reference" => {
             check_attn_dtype(p, "reference-greedy.json", "f32")?;
             check_combine(p, "reference-greedy.json", "reference")?;
+            check_attn_mm(p, "reference-greedy.json", "f32-bypass")?;
         }
         Some(p) => bail!(
             "reference-greedy.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate \
@@ -847,6 +897,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
         Some(p) if p.moe_impl == "fused" => {
             check_attn_dtype(p, "candidate-greedy.json", "f16")?;
             check_combine(p, "candidate-greedy.json", "fused")?;
+            check_attn_mm(p, "candidate-greedy.json", "classic")?;
         }
         Some(p) => bail!(
             "candidate-greedy.json (replay) provenance.moe_impl is {:?}, expected \"fused\"; the \
@@ -1066,6 +1117,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
         Some(p) if p.moe_impl == "reference" => {
             check_attn_dtype(p, "reference-ppl.json", "f32")?;
             check_combine(p, "reference-ppl.json", "reference")?;
+            check_attn_mm(p, "reference-ppl.json", "f32-bypass")?;
         }
         Some(p) => bail!(
             "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
@@ -1083,6 +1135,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
         Some(p) if p.moe_impl == "fused" => {
             check_attn_dtype(p, "candidate-ppl.json", "f16")?;
             check_combine(p, "candidate-ppl.json", "fused")?;
+            check_attn_mm(p, "candidate-ppl.json", "classic")?;
         }
         Some(p) => bail!(
             "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
@@ -1188,6 +1241,10 @@ fn prov(moe_impl: &str) -> Provenance {
         mm_min_seq: 32,
         attn_dtype: Some(if moe_impl == "reference" { "f32" } else { "f16" }.to_string()),
         combine: Some(if moe_impl == "reference" { "reference" } else { "fused" }.to_string()),
+        // Reference runs under LAGUNA_ATTN_F32 (f16 library bypassed); fused
+        // candidates run the shipped classic prefill kernel. Strict-tier candidate
+        // tests override this to "f32-bypass".
+        attn_mm: Some(if moe_impl == "reference" { "f32-bypass" } else { "classic" }.to_string()),
     }
 }
 
@@ -1295,6 +1352,27 @@ fn greedy_gate_rejects_wrong_or_missing_combine() {
     r.provenance.as_mut().unwrap().combine = None;
     let err = greedy_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("no combine"), "unexpected error: {err}");
+}
+
+#[test]
+fn greedy_gate_rejects_wrong_or_missing_attn_mm() {
+    // The decode gate grades the shipped classic prefill kernel; a candidate replay
+    // produced under LAGUNA_ATTN_MM_TENSOR ran the tensor kernel instead.
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().attn_mm = Some("tensor".to_string());
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("attn_mm"), "unexpected error: {err}");
+    // A candidate provenance missing the attn_mm field predates it — hard fail.
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().attn_mm = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_mm"), "unexpected error: {err}");
+    // The Reference oracle runs under LAGUNA_ATTN_F32 (f16 library bypassed); a
+    // "classic" (or stale/missing) reference moved the anchor.
+    let (mut r, c) = valid_pair();
+    r.provenance.as_mut().unwrap().attn_mm = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_mm"), "unexpected error: {err}");
 }
 
 /// A one-step reference/candidate pair for the near-tie excuse tests: the
@@ -1531,6 +1609,55 @@ fn compare_pins_candidate_attn_dtype_per_tier() {
 }
 
 #[test]
+fn compare_requires_reference_attn_mm() {
+    let candidate = tiny_dump(Some(prov("fused")));
+    // Reference regenerated WITHOUT LAGUNA_ATTN_F32 (its mm branch ran the classic
+    // kernel instead of being bypassed) → hard fail every tier.
+    let mut classic_ref = prov("reference");
+    classic_ref.attn_mm = Some("classic".to_string());
+    let err = compare(&candidate, &tiny_dump(Some(classic_ref)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("attn_mm"), "unexpected error: {err}");
+    // Reference from a binary predating the attn_mm field must also hard-fail.
+    let mut stale_ref = prov("reference");
+    stale_ref.attn_mm = None;
+    let err = compare(&candidate, &tiny_dump(Some(stale_ref)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("no attn_mm"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_pins_candidate_attn_mm_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // strict runs under LAGUNA_ATTN_F32 (f16 library bypassed): a "classic"
+    // candidate (the shipped default, i.e. LAGUNA_ATTN_F32 forgotten) must be
+    // rejected. It first clears strict's f32 attn_dtype pin to reach the attn_mm check.
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    // attn_mm defaults to "classic" — wrong for strict.
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("attn_mm"), "unexpected error: {err}");
+
+    // mm and decode grade the shipped classic prefill kernel: a "tensor"
+    // (LAGUNA_ATTN_MM_TENSOR) or "f32-bypass" candidate ran the wrong path. (The
+    // mm candidate must be mm-active to reach the attn_mm check.)
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq;
+    p.attn_mm = Some("tensor".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("attn_mm"), "unexpected error: {err}");
+    let mut p = prov("fused");
+    p.attn_mm = Some("f32-bypass".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("attn_mm"), "unexpected error: {err}");
+
+    // A candidate provenance missing only the attn_mm field is stale (predates it).
+    let mut p = prov("fused");
+    p.attn_mm = None;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no attn_mm"), "unexpected error: {err}");
+}
+
+#[test]
 fn compare_requires_reference_combine() {
     let candidate = tiny_dump(Some(prov("fused")));
     // A reference whose combine is not "reference" (the Reference runner never
@@ -1555,6 +1682,7 @@ fn compare_pins_candidate_combine_per_tier() {
     // first clear the strict fused/no_mm_id + f32-attn checks to reach the combine pin.
     let mut p = prov("fused");
     p.attn_dtype = Some("f32".to_string());
+    p.attn_mm = Some("f32-bypass".to_string());
     p.no_mm_id = true;
     // combine defaults to "fused" — wrong for strict.
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
@@ -1594,6 +1722,7 @@ fn compare_strict_requires_fused_no_mm_id_candidate() {
     // the mm_id path and belongs under the mm tier, not strict.
     let mut p = prov("fused");
     p.attn_dtype = Some("f32".to_string());
+    p.attn_mm = Some("f32-bypass".to_string());
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
     assert!(err.contains("no_mm_id"), "unexpected error: {err}");
 }
@@ -1718,6 +1847,22 @@ fn ppl_gate_rejects_wrong_or_missing_combine() {
     r.provenance.as_mut().unwrap().combine = None;
     let err = ppl_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("no combine"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_wrong_or_missing_attn_mm() {
+    // The ppl gate grades the shipped classic prefill kernel; a candidate produced
+    // under LAGUNA_ATTN_MM_TENSOR ran the tensor kernel instead.
+    let (r, mut c) = valid_ppl_pair();
+    c.provenance.as_mut().unwrap().attn_mm = Some("tensor".to_string());
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("attn_mm"), "unexpected error: {err}");
+    // A reference from a binary predating the attn_mm field must hard-fail (the
+    // oracle runs under LAGUNA_ATTN_F32, recording "f32-bypass"; the field proves it).
+    let (mut r, c) = valid_ppl_pair();
+    r.provenance.as_mut().unwrap().attn_mm = None;
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_mm"), "unexpected error: {err}");
 }
 
 #[test]

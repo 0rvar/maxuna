@@ -57,6 +57,12 @@ pub struct LagunaModel {
     /// LAGUNA_ATTN_F32); activations are f32 either way. Surfaced so dump
     /// provenance can record which path ran.
     attn_dtype: DType,
+    /// Attention PREFILL gemm path resolved once at load, for dump provenance:
+    /// "f32-bypass" when LAGUNA_ATTN_F32 sends attention through the legacy
+    /// dequant-f32 QMatMul (the f16 library, and thus its mm branch, never runs),
+    /// else the f16 library's mm-branch kernel — "classic" (the shipped simdgroup
+    /// default) or "tensor" (the opt-in Metal-4 kernel, LAGUNA_ATTN_MM_TENSOR).
+    attn_mm: &'static str,
     max_ctx: usize,
     tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
@@ -85,6 +91,21 @@ impl LagunaModel {
         let attn_weights = match attn_dtype {
             DType::F32 => AttnWeights::DequantF32,
             _ => AttnWeights::F16,
+        };
+
+        // The attention prefill gemm path, for dump provenance. LAGUNA_ATTN_F32
+        // routes the whole attention block through the legacy dequant-f32 QMatMul,
+        // so the f16 library's mm branch never runs ("f32-bypass"). Otherwise the
+        // mm branch runs, defaulting to the classic simdgroup kernel, or the
+        // Metal-4 cooperative-tensor kernel under LAGUNA_ATTN_MM_TENSOR. Resolved
+        // once here (single source of truth is the cached `attn_mm_tensor` switch
+        // the dispatch reads).
+        let attn_mm = if attn_dtype == DType::F32 {
+            "f32-bypass"
+        } else if crate::ops::attn_mm_tensor() {
+            "tensor"
+        } else {
+            "classic"
         };
 
         // Two RoPE tables shared across all layers of each type (Arc-shared into
@@ -138,6 +159,7 @@ impl LagunaModel {
             lm_head_buffer,
             lm_head_dtype,
             attn_dtype,
+            attn_mm,
             max_ctx,
             tap_enabled: false,
             taps: Vec::new(),
@@ -158,6 +180,15 @@ impl LagunaModel {
     /// `LAGUNA_ATTN_F32`). Activations are f32 in both modes.
     pub fn attn_dtype(&self) -> DType {
         self.attn_dtype
+    }
+
+    /// The attention PREFILL gemm path `load` resolved, for dump provenance:
+    /// "classic" (the shipped simdgroup default), "tensor" (the opt-in Metal-4
+    /// cooperative-tensor kernel, `LAGUNA_ATTN_MM_TENSOR`), or "f32-bypass"
+    /// (`LAGUNA_ATTN_F32` — the f16 library, and thus its mm branch, is bypassed
+    /// entirely).
+    pub fn attn_mm(&self) -> &'static str {
+        self.attn_mm
     }
 
     /// Run the transformer stack (embedding → 48 layers → final norm) and return

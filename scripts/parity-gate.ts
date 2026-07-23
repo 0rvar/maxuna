@@ -120,7 +120,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
+    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_COMBINE_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
     if (k === "LAGUNA_PARITY_DIR" || k === "LAGUNA_PARITY_TIER") continue;
     e[k] = v;
   }

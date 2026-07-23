@@ -57,6 +57,27 @@ pub fn active_mm_variant_name() -> &'static str {
     mm_id_variant().name()
 }
 
+/// `LAGUNA_ATTN_MM_TENSOR=1` opts the attention PREFILL gemm — the mm branch
+/// (ne11 >= 8) of `matmul_f16` — into the Metal-4 cooperative-tensor kernel
+/// (`f16_t.metal`'s `kernel_mul_mm_f16_f32_t`). The DEFAULT is the classic
+/// simdgroup kernel (`f16.metal`'s `kernel_mul_mm_f16_f32_v`): the tensor kernel
+/// stages the activation as f16, and that extra rounding pushed our decode drift
+/// outside the fork's own envelope (a 0.6-margin reference decision flipped at a
+/// step the fork does not flip — see docs/parity.md §3b / TODO.md), so it is
+/// kept opt-in for future numerics work, not shipped. The decode gemv branch
+/// (ne11 < 8) is unaffected — it always runs the classic mv. Orthogonal to
+/// `LAGUNA_ATTN_F32`, which bypasses the whole f16 library for the legacy
+/// dequant-f32 QMatMul path; when that is set this switch is moot (the mm branch
+/// never runs).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches (`no_mm_id`,
+/// `combine_classic`): any value enables it — only leaving it unset keeps the
+/// classic default.
+pub(crate) fn attn_mm_tensor() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_MM_TENSOR").is_some())
+}
+
 /// The mm_id prefill kernel family. Runtime-selectable via env; the single
 /// source of truth (both the kernel selection in dispatch and the rescale
 /// decision in moe read the cached value here).
