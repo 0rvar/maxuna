@@ -26,6 +26,21 @@ use std::sync::OnceLock;
 /// tell whether a dump actually exercised the mm_id path (do NOT re-hardcode 32).
 pub const MM_ID_MIN_SEQ: usize = 32;
 
+/// Effective mm_id threshold: `LAGUNA_MM_ID_MIN_SEQ=<n>` overrides the default
+/// (probe/bench knob — e.g. forcing mm_id onto short speculative verify spans
+/// to measure the mv_id/mm_id crossover). Value-parsed, read once and cached;
+/// unset or unparsable falls back to `MM_ID_MIN_SEQ`. Dump provenance records
+/// this effective value, so an overridden run can never masquerade as default.
+pub fn mm_id_min_seq() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LAGUNA_MM_ID_MIN_SEQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MM_ID_MIN_SEQ)
+    })
+}
+
 /// `LAGUNA_NO_MM_ID=1` forces the per-token mv_id path everywhere (prefill
 /// included), as a fallback / parity-debug switch. Read once and cached — it is
 /// consulted per MoE layer on the hot path.

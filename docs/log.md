@@ -4,6 +4,100 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — DFlash perf arc: drafter f16 (code greedy 24.2 → 27.6), wall-clock auto-pause (prose 0.94x → 1.09x/parity), expert-union probe REFUTED, upstream offset-bug issue drafted
+
+Four-lever follow-up to the DFlash ship (next entry down), all landed same day.
+
+**Drafter forward perf (WP-E1).** Three changes, all in the drafter/draft path
+(target math untouched — no parity-gate re-run needed, confirmed by review):
+(1) drafter matmul weights load as dense f16 (BF16→f32→f16, hard error on
+non-finite after narrowing) and multiply through the vendored `ops::matmul_f16`
+mixed-dtype kernels — same f16-weights × f32-activations, f32-accumulate
+convention as the target's attention; norms stay f32. `LAGUNA_DRAFT_F32`
+reverts (and the scalar-reference tests pin the f32 path; the f16 companion
+test observed rel_l2 1.2e-5 vs the f64 oracle, bound 5e-5). (2) The per-layer
+per-round `Tensor::cat` of the full committed drafter KV (O(n_past), growing)
+died: noise K/V now slice_set into cache scratch rows ≥ committed_len and
+attention reads a narrowed view (`unsqueeze` not `reshape` — reshape of the
+non-contiguous view would force the copy back). candle's broadcast_matmul
+contiguous-izes only the GQA broadcast, same as before. (3) Draft readback is
+GPU-side argmax + softmax-prob-of-argmax; only `[n_draft]` id/prob arrays
+cross to CPU (was ~6MB/round of full-vocab logits). Same-batch A/B: f16
+weights alone +16% end-to-end (23.8 → 27.6 greedy code, identical draft
+streams); overall code greedy 24.2 → 27.6, temp-1.0 code 25.5 → 28.0 (79.2%
+acceptance), byte-identity anchor held throughout. Prose barely moved
+(15.2 → 15.4 vs 17.7 base) — prose rounds were verify-dominated, which is the
+auto-pause's job.
+
+**Wall-clock auto-pause (WP-E2, three iterations — each driven by measurement,
+worth recording).** Design: a pure `PauseController` compares EMAs of spec
+cost per committed token vs plain-step cost (the empty-draft fallback path —
+like-for-like, both carry tap encode/inject), pauses drafting when spec stops
+paying, probes with exponential backoff (32→256 committed tokens), forced
+plain rounds keep the comparator fresh. Acceptance-count thresholds were
+REJECTED up front: break-even committed/round is span-dependent (verify costs
+~95ms @span2 → ~273ms @span16 vs ~53ms/plain-token — see the spec-verify-bench
+numbers below), so economics must be judged on the clock.
+Iteration 1 bug: the spec EMA was a mean of per-round ms/tok RATIOS — a
+1-commit 350ms/tok round weighs as much as an 11-commit 25ms/tok round, so the
+estimate crossed plain's ~58ms while true aggregate was ~42, and the
+controller paused 76/99 rounds on a 1.4x-winning workload. Fix: separate EMAs
+of round-ms and committed, decide on the quotient (ratio of EMAs ≈ windowed
+Σms/Σtok); plus attribution fixes (empty-draft rounds don't charge drafter
+time to the plain EMA; a per-round device.synchronize keeps each round's
+encode/inject tail in its own window — in-order queue, so only CPU run-ahead
+is trimmed).
+Iteration 2 bug (field data, user run): a transient GPU-contention patch
+poisoned the spec EMAs, and recovery was throttled twice (backoff to 256 ×
+α=0.25 per probe) — 1046/1106 rounds stayed paused at 64.8% probe acceptance.
+The cost asymmetry is inverted (wrongly-paused loses ~30% forever;
+wrongly-resumed loses a few rounds), so: probes run as PAIRS, probe spec
+samples fold at α=0.5, and a pair whose own aggregate beats plain resumes
+immediately and SNAPS the spec EMAs to the pair (poisoned history dropped).
+Iteration 3 (review round, Claude + GLM): accelerated warm-up plain cadence
+(every 4th round until 2 plain samples — otherwise short runs could never
+pause before ~round 64); empty-draft probes gated out of pair decisions (a
+both-empty pair must not eager-resume on zero spec evidence) and counted in
+paused_rounds; DOCUMENTED determinism trade-off: with auto-pause on, temp>0
+--draft output is not run-to-run seed-reproducible (round kinds depend on
+wall-clock; near-tie divergence between batched and plain rounds predates the
+controller — only WHICH rounds batch became timing-dependent);
+`--draft-pause-margin 0` is the deterministic escape. Greedy byte-identity
+verified after every iteration.
+Final same-batch numbers (LPM, -n 192): code greedy 25.0 vs 27.0 margin-0 vs
+19.1 base (the ~7% controller cost is pausing through genuine local
+low-acceptance streaks); prose 19.4 vs 16.7 margin-0 vs 17.8 base — ABOVE
+plain at 192 (spec on the easy opening, paused for the body), 18.0 vs 18.5
+at 512 (≈parity). --stats now splits draft/verify wall time, rejected counts,
+verified positions, paused rounds.
+
+**Expert-union / mm_id crossover probe — REFUTED.** Hypothesis: verify spans
+(≤16 tok) lose to mv_id's no-dedup expert reads; mm_id's compaction (which IS
+the expert union) would win below MM_ID_MIN_SEQ=32. New `spec-verify-bench`
+bin (replays checkpoint → span-forward → rollback on long-swa fixture tokens)
++ `LAGUNA_MM_ID_MIN_SEQ` value-parsed env override (recorded in dump
+provenance). Result: mm_id LOSES at every span below the threshold (95→131ms
+@2, 273→338 @16, converging ~24-32; ≥32 rows equal within ~3% noise) — map0 +
+half-empty 32-wide token tiles cost more than dedup saves. The threshold was
+already at the crossover. Residual idea (future, only with new evidence): a
+dedup-aware small-batch mv_id (unique-expert gather ≈26% routed-read saving
+@span16) without mm tiles.
+
+**Candle upstream.** The quantized-matmul offset drop is mm-path only (`fwd`
+rebuilds the input layout from shape, quantized/metal.rs:410; `fwd_mv` threads
+the offset correctly) — ready-to-post issue draft with candle-only repro:
+`candle-issue-qmatmul-offset.md`. Perf impact of our QLinear workaround is
+negligible (KB-scale activation blits); the bug's real cost was the debugging
+tour.
+
+Also: `pmset -g` reports `powermode` (not `lowpowermode`) on this OS build —
+scripts/bench.ts would have thrown; regex now accepts both. GPU-collision
+lesson re-learned: a user-launched generate mid-bench OOM'd two runs AND
+poisoned the controller field test above — pgrep immediately before every
+model run, and treat any surprising bench number as contention until ruled
+out. Suite at close: 124 lib + 48 parity-gate, 0 failures, verified
+independently of the implementing agents.
+
 ## 2026-07-23 — DFlash speculative decoding SHIPPED: fork-parity acceptance, code-gen decode 18.4 → 25.5 tok/s; the 0%-acceptance bug was candle's quantized matmul dropping the input start_offset
 
 **What DFlash is.** The drafter (`models/laguna-s-2.1-DFlash-BF16.gguf`, 1.1B

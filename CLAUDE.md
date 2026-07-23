@@ -234,7 +234,8 @@ sessions (owner's choice — full power = coil whine + fans). Same-mode 2×2
 calibration (2026-07-22) measured the LPM clamp at ~2.1x on decode
 (bandwidth-bound) and ~2.3-2.8x on prefill (compute-bound) — bigger than the
 ~1.7x phase-0 estimate. VERIFY the active mode before labeling any number:
-`pmset -g | awk '/lowpowermode/{print $2}'` (1 = LPM) — the System Settings
+`pmset -g | awk '/powermode/{print $2}'` (1 = LPM; the key reads
+`lowpowermode` or `powermode` depending on OS build) — the System Settings
 Energy Mode toggle is per-power-source (Battery vs Power Adapter tabs) and has
 already silently failed to apply once. Ratios/budget shares transfer across
 modes; absolute cross-mode comparisons do not (docs/log.md power-calibration
@@ -319,11 +320,18 @@ Known remaining gaps (see TODO.md priority list for the plan):
 Speculative decoding via the block-diffusion drafter
 (`models/laguna-s-2.1-DFlash-BF16.gguf`): `laguna generate --draft <gguf>`
 (defaults `--draft-max 15 --draft-p-min 0.5`). Structure: `src/dflash.rs` is
-the self-contained drafter (dense f32, plain candle ops, own cache — never
-references LagunaModel; borrows the target's embeddings/lm_head via
-`embed_ids`/`lm_head` accessors); generate.rs owns the round loop; kv_cache.rs
-does verify rollback (full layers truncate; SWA rings snapshot/restore the
-clobbered slots). Gotchas with teeth:
+the self-contained drafter (own cache — never references LagunaModel; borrows
+the target's embeddings/lm_head via `embed_ids`/`lm_head` accessors);
+generate.rs owns the round loop; kv_cache.rs does verify rollback (full layers
+truncate; SWA rings snapshot/restore the clobbered slots). Gotchas with teeth:
+- Drafter matmul weights default to dense f16 (BF16→f32→f16, finiteness-checked
+  at load) multiplied by the vendored `ops::matmul_f16` kernels (f32 accumulate,
+  same convention as the target's attention projections; norm weights stay f32).
+  `LAGUNA_DRAFT_F32` (presence-based, read once) reverts to full f32 + plain
+  candle matmul — the path the scalar-reference unit tests pin. `draft_forward`
+  writes each block's noise K/V into cache scratch rows and attends a narrowed
+  view (no growing per-round concat), and the draft readback reduces per-row
+  argmax/prob on-GPU (only the tiny id/prob arrays cross to CPU).
 - `dflash.target_layers` are layer-INPUT ids — use
   `DflashConfig::spec_tap_layers()` (the enforced −1 translation to `l_out`
   indices); wiring them raw is off-by-one and drops the 48 sentinel.
@@ -331,9 +339,27 @@ clobbered slots). Gotchas with teeth:
   causal-LM convention.
 - Greedy spec-on output is BYTE-IDENTICAL to spec-off (regression anchor);
   acceptance is at fork parity (13.1% vs llama-server's 13.7%, same config).
-- Perf (LPM): code-gen 25.5 vs 18.4 tok/s base (1.39x, temp 1.0); prose is
-  NET NEGATIVE (~15.2 vs 17.9) — don't "fix" that by tuning knobs, the
-  ledger levers are drafter-forward perf + acceptance auto-disable.
+  The auto-pause controller preserves this: it changes round STRUCTURE only,
+  never the sample stream (exactly one target-sampler draw per committed token
+  on every path).
+- Wall-clock auto-pause is ON by default (`--draft-pause-margin`, default 1.0;
+  `0` = always draft): a `PauseController` (generate.rs) compares spec ms/tok
+  vs plain ms EMAs and falls back to plain decode when speculation stops
+  paying, so prose is ≈ plain instead of a net loss. Do NOT tune it with
+  acceptance counts — break-even is span-dependent, so it must be wall-clock.
+  DETERMINISM: with auto-pause on, temp>0 `--draft` output is NOT run-to-run
+  reproducible for a fixed seed — which rounds batch-verify now depends on
+  wall-clock EMAs, and batched-verify vs plain rounds diverge at near-ties (that
+  near-tie sensitivity predates the controller; only WHICH rounds are batched
+  became timing-dependent). `--draft-pause-margin 0` restores full fixed-seed
+  determinism. Greedy byte-identity is unaffected.
+- Perf (LPM, 2026-07-23 post drafter-f16 + auto-pause, same-batch anchors):
+  code-gen greedy 25.0 vs 19.1 base (1.31x; always-on margin-0 hits 27.0/1.41x —
+  the ~7% delta is the controller pausing through genuine local low-acceptance
+  streaks, the price of adaptation); prose 19.4 vs 17.8 at 192 tok (adaptivity
+  WINS: spec on the easy opening, paused for the body) and 18.0 vs 18.5 at 512
+  (≈parity; always-on prose was 0.94x). Drafter forward is ~2x pre-f16 (the
+  LAGUNA_DRAFT_F32 A/B measured +16% end-to-end from weights alone).
 - The fork's `speculative-simple` does NOT support DFlash (no ctx_other →
   segfault after load); the reference driver is llama-server, which ignores
   per-request `speculative.n_max` (restart with `--spec-draft-n-max`).

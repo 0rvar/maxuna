@@ -44,8 +44,10 @@ mkdirSync(outDir, { recursive: true });
 
 async function powerMode(): Promise<"lpm" | "full"> {
   const out = await $`pmset -g`.text();
-  const m = out.match(/lowpowermode\s+(\d)/);
-  if (!m) throw new Error("pmset -g did not report lowpowermode");
+  // macOS reports the key as `lowpowermode` or `powermode` depending on
+  // OS build; both use 1 = Low Power Mode.
+  const m = out.match(/\b(?:low)?powermode\s+(\d)/);
+  if (!m) throw new Error("pmset -g did not report (low)powermode");
   return m[1] === "1" ? "lpm" : "full";
 }
 

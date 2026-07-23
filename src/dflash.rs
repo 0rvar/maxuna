@@ -12,15 +12,19 @@
 //! output gate, SwiGLU FFN, plain NEOX rope (theta 500k, all 128 dims, no YaRN),
 //! full causal attention on every layer (no SWA).
 //!
-//! Weights are materialized DENSE f32 (BF16 -> f32 is exact; norms are stored
-//! f32). The whole forward uses plain candle ops — no custom Metal kernels, no
-//! `src/ops` dispatch. The drafter is tiny (~1.1B, <= block_size query rows per
-//! forward), so this favors clarity over speed. (An f16 weight downcast would
-//! roughly halve the ~4.4GB footprint; deferred.)
+//! Matmul weights are materialized DENSE f16 by default (BF16 -> f32 -> f16),
+//! multiplied against f32 activations by the vendored mixed-dtype kernels
+//! (`crate::ops::matmul_f16`: f32 products/accumulation, f32 output — the same
+//! convention as the target's attention projections, so the only added rounding
+//! is the stored weights). Norm weights (attn/ffn/output norms, q/k-norm,
+//! aux_norm) stay f32. `LAGUNA_DRAFT_F32` restores full-f32 weights with plain
+//! candle matmul (the path the scalar-reference tests pin). The drafter is tiny
+//! (~1.1B, <= block_size query rows per forward).
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::quantized::GgmlDType;
@@ -113,6 +117,58 @@ impl DflashConfig {
     }
 }
 
+/// How the drafter's matmul weights are stored/multiplied. `F16` uses the
+/// vendored mixed-dtype kernels (`crate::ops::matmul_f16`, Metal only); `F32`
+/// keeps them dense f32 and uses plain candle matmul (portable, the path the
+/// scalar-reference tests pin). Threaded explicitly through `build` so tests can
+/// construct either path without racing a process-global env switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeightDtype {
+    F32,
+    F16,
+}
+
+/// The drafter matmul-weight dtype selected by the environment, read once.
+/// `LAGUNA_DRAFT_F32` (presence-based, like the other `LAGUNA_*` switches — any
+/// value selects it) reverts to full f32; otherwise f16 is the default.
+fn draft_weight_dtype() -> WeightDtype {
+    static V: OnceLock<WeightDtype> = OnceLock::new();
+    *V.get_or_init(|| {
+        if std::env::var_os("LAGUNA_DRAFT_F32").is_some() {
+            WeightDtype::F32
+        } else {
+            WeightDtype::F16
+        }
+    })
+}
+
+/// Cast a dense matmul weight to the requested storage dtype. `F32` passes the
+/// tensor through unchanged; `F16` narrows it (BF16 -> f32 by `get`, then f32 ->
+/// f16 here) and enforces the `matmul_f16` kernel constraints (rank-2, `k % 32 ==
+/// 0`, `n_out % 4 == 0`) plus finiteness. BF16's exponent range exceeds f16's, so
+/// a weight that overflows f16 must be a hard load error rather than a silent inf.
+fn matmul_weight(t: Tensor, dtype: WeightDtype, name: &str) -> Result<Tensor> {
+    match dtype {
+        WeightDtype::F32 => Ok(t),
+        WeightDtype::F16 => {
+            let (n_out, k) = t
+                .dims2()
+                .with_context(|| format!("matmul weight {name} is not rank-2 [n_out, k]"))?;
+            ensure!(k % 32 == 0, "matmul weight {name} k={k} must be a multiple of 32 for the f16 kernels");
+            ensure!(n_out % 4 == 0, "matmul weight {name} n_out={n_out} must be a multiple of 4 for the f16 kernels");
+            let f16 = t.to_dtype(DType::F16)?;
+            // Widen back and reduce: any inf/nan produced by the narrowing makes
+            // the sum non-finite (finite f16 magnitudes stay well within f32).
+            let mag = f16.to_dtype(DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            ensure!(
+                mag.is_finite(),
+                "matmul weight {name} has non-finite values after f16 narrowing (weight overflows f16 range)"
+            );
+            Ok(f16)
+        }
+    }
+}
+
 /// Accept any GGUF integer width/signedness (target_layers is i32[]).
 fn value_usize(v: &Value) -> Result<usize> {
     if let Ok(u) = v.to_u64() {
@@ -126,8 +182,10 @@ fn value_usize(v: &Value) -> Result<usize> {
     Ok(i as usize)
 }
 
-/// One decoder layer's weights, all dense f32. Matmul weights are `[out, in]`
-/// (GGUF layout); `y = x @ wᵀ`.
+/// One decoder layer's weights. Matmul weights (`wq/wk/wv/wo`, `gate`, the FFN
+/// projections) are `[out, in]` (GGUF layout, `y = x @ wᵀ`) and dense f16 by
+/// default / f32 under `LAGUNA_DRAFT_F32`; norm weights are always f32. `linear`
+/// dispatches on each weight's dtype.
 struct LayerWeights {
     attn_norm: RmsNorm,
     wq: Tensor,   // [n_head*head_dim, n_embd]
@@ -146,6 +204,9 @@ struct LayerWeights {
 /// One layer's full-attention KV cache: `[n_head_kv, max_ctx, head_dim]` f32.
 /// Chosen f32 (not the target's f16) for exactness — the drafter is tiny, so the
 /// extra bytes are negligible and it keeps the naive-reference tests bit-tight.
+/// Rows `0..committed` are the injected context; rows `committed..max_ctx` are
+/// scratch — `draft_forward` writes each round's noise K/V there in place (no
+/// growing per-round concat) and `inject` overwrites them when it commits.
 struct LayerCache {
     k: Tensor,
     v: Tensor,
@@ -188,17 +249,20 @@ impl DflashDrafter {
         let mut file =
             File::open(&gguf.path).with_context(|| format!("opening {} for drafter load", gguf.path.display()))?;
         let content = &gguf.content;
-        Self::build(cfg, device, max_ctx, |name| read_tensor_f32(&mut file, content, name, device))
+        let dtype = draft_weight_dtype();
+        Self::build(cfg, device, max_ctx, dtype, |name| read_tensor_f32(&mut file, content, name, device))
     }
 
     /// Assemble the drafter from a tensor provider yielding dense f32 tensors by
     /// GGUF name (with the `.weight` suffix). Shared by `load` (reads the GGUF)
     /// and the tests (an in-memory synthetic map), so both exercise identical
-    /// assembly.
+    /// assembly. `dtype` selects the matmul-weight storage (f16 default / f32);
+    /// norm weights are always kept f32.
     fn build(
         cfg: DflashConfig,
         device: &Device,
         max_ctx: usize,
+        dtype: WeightDtype,
         mut get: impl FnMut(&str) -> Result<Tensor>,
     ) -> Result<Self> {
         ensure!(max_ctx >= 1, "max_ctx must be >= 1");
@@ -230,6 +294,7 @@ impl DflashDrafter {
             cfg.n_embd,
             cfg.n_embd_inp()
         );
+        let fc = matmul_weight(fc, dtype, "fc")?;
         let output_norm = norm(get("output_norm")?);
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
@@ -237,17 +302,17 @@ impl DflashDrafter {
             let p = |n: &str| format!("blk.{il}.{n}");
             layers.push(LayerWeights {
                 attn_norm: norm(get(&p("attn_norm"))?),
-                wq: get(&p("attn_q"))?,
-                wk: get(&p("attn_k"))?,
-                wv: get(&p("attn_v"))?,
-                wo: get(&p("attn_output"))?,
+                wq: matmul_weight(get(&p("attn_q"))?, dtype, "attn_q")?,
+                wk: matmul_weight(get(&p("attn_k"))?, dtype, "attn_k")?,
+                wv: matmul_weight(get(&p("attn_v"))?, dtype, "attn_v")?,
+                wo: matmul_weight(get(&p("attn_output"))?, dtype, "attn_output")?,
                 q_norm: norm(get(&p("attn_q_norm"))?),
                 k_norm: norm(get(&p("attn_k_norm"))?),
-                gate: get(&p("attn_gate"))?,
+                gate: matmul_weight(get(&p("attn_gate"))?, dtype, "attn_gate")?,
                 ffn_norm: norm(get(&p("ffn_norm"))?),
-                ffn_gate: get(&p("ffn_gate"))?,
-                ffn_up: get(&p("ffn_up"))?,
-                ffn_down: get(&p("ffn_down"))?,
+                ffn_gate: matmul_weight(get(&p("ffn_gate"))?, dtype, "ffn_gate")?,
+                ffn_up: matmul_weight(get(&p("ffn_up"))?, dtype, "ffn_up")?,
+                ffn_down: matmul_weight(get(&p("ffn_down"))?, dtype, "ffn_down")?,
             });
         }
 
@@ -387,10 +452,14 @@ impl DflashDrafter {
     /// Noise-block draft forward. `noise_embd` is `[n_block, n_embd]` f32 —
     /// target-side token embeddings of `[id_last, MASK * (n_block-1)]` at
     /// positions `pos0..pos0+n_block` (pos0 must equal the committed length). Runs
-    /// the full causal decoder attending over `[committed cache | noise block]`;
-    /// the noise K/V is used for this forward only and never written to the cache
-    /// (committed is unchanged on return). Returns final-normed hidden states
-    /// `[n_block, n_embd]` f32 (pre-lm_head; the caller applies the target's
+    /// the full causal decoder attending over `[committed cache | noise block]`.
+    /// Each layer's noise K/V is written into the cache scratch region (rows
+    /// `committed..committed+n_block`) and attention reads a narrowed cache view,
+    /// so the committed prefix is never re-copied. `committed` is unchanged on
+    /// return: those scratch rows stay uncommitted and a later `inject` overwrites
+    /// them. The invariant is that `draft_forward` never dirties rows `< committed`
+    /// — rows at and beyond `committed` are scratch. Returns final-normed hidden
+    /// states `[n_block, n_embd]` f32 (pre-lm_head; the caller applies the target's
     /// shared lm_head).
     pub fn draft_forward(&mut self, noise_embd: &Tensor, pos0: usize) -> Result<Tensor> {
         ensure!(
@@ -429,14 +498,17 @@ impl DflashDrafter {
             let k = self.rope(&k.transpose(0, 1)?.contiguous()?, pos0)?; // [n_kv, nb, hd]
             let v = v.transpose(0, 1)?.contiguous()?; // [n_kv, nb, hd]
 
-            // Effective K/V = committed context ++ this block's noise K/V.
-            let (k_all, v_all) = if committed > 0 {
-                let k_ctx = self.caches[il].k.narrow(1, 0, committed)?;
-                let v_ctx = self.caches[il].v.narrow(1, 0, committed)?;
-                (Tensor::cat(&[&k_ctx, &k], 1)?, Tensor::cat(&[&v_ctx, &v], 1)?)
-            } else {
-                (k, v)
-            };
+            // Effective K/V = committed context ++ this block's noise K/V. Write
+            // the noise K/V into the cache scratch rows (committed..committed+nb)
+            // and attend over a narrowed cache view, so the committed prefix is
+            // read in place rather than re-copied into a fresh concat each round.
+            // These rows are scratch (committed does not advance); a later inject
+            // overwrites them, and this forward overwrites every scratch row it
+            // reads before reading it, so the reuse never leaks stale K/V.
+            self.caches[il].k.slice_set(&k, 1, committed)?;
+            self.caches[il].v.slice_set(&v, 1, committed)?;
+            let k_all = self.caches[il].k.narrow(1, 0, committed + n_block)?;
+            let v_all = self.caches[il].v.narrow(1, 0, committed + n_block)?;
 
             let attn = self.attention(&q, &k_all, &v_all, committed, n_block, scale)?; // [n_head, nb, hd]
 
@@ -458,9 +530,14 @@ impl DflashDrafter {
     }
 
     /// Causal GQA attention of `n_block` queries over `committed + n_block` keys.
-    /// `q [n_head, nb, hd]`, `k_all`/`v_all [n_kv, committed+nb, hd]`, all f32.
-    /// Committed keys are always visible; the noise keys are causally masked
-    /// within the block (key i' visible to query i iff i' <= i).
+    /// `q [n_head, nb, hd]` contiguous; `k_all`/`v_all [n_kv, committed+nb, hd]`
+    /// may be non-contiguous narrowed cache views, so the GQA head axis is added
+    /// with `unsqueeze` (a metadata-only view) rather than `reshape` — the
+    /// following `broadcast_matmul` materializes its broadcast operand anyway
+    /// (candle contiguises the GQA expansion), and reads the strided view
+    /// directly, so no separate prefix copy is introduced. All f32. Committed
+    /// keys are always visible; the noise keys are causally masked within the
+    /// block (key i' visible to query i iff i' <= i).
     fn attention(
         &self,
         q: &Tensor,
@@ -475,8 +552,8 @@ impl DflashDrafter {
         let k_seq = committed + n_block;
 
         let q4 = q.reshape((n_kv, g, n_block, hd))?;
-        let k4 = k_all.reshape((n_kv, 1, k_seq, hd))?;
-        let v4 = v_all.reshape((n_kv, 1, k_seq, hd))?;
+        let k4 = k_all.unsqueeze(1)?; // [n_kv, 1, k_seq, hd]
+        let v4 = v_all.unsqueeze(1)?; // [n_kv, 1, k_seq, hd]
 
         let scores = q4.broadcast_matmul(&k4.transpose(2, 3)?)?.affine(scale as f64, 0.0)?;
         let mask = self.causal_mask(committed, n_block, k_seq)?; // [1, 1, nb, k_seq]
@@ -527,9 +604,19 @@ impl DflashDrafter {
     }
 }
 
-/// `y = x @ wᵀ` for a dense `[out, in]` weight and `x [.., in]`.
+/// `y = x @ wᵀ` for a dense `[out, in]` weight and rank-2 `x [t, in]` f32,
+/// dispatched on the weight's dtype: an f16 weight goes through the vendored
+/// mixed-dtype kernels (`crate::ops::matmul_f16`, f32 accumulate, Metal only),
+/// an f32 weight through plain candle matmul. `matmul_f16` needs a contiguous
+/// f32 `x`; every call site already passes a freshly produced contiguous tensor,
+/// but a strided input is made contiguous before the kernel dispatch.
 fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    Ok(x.matmul(&w.t()?)?)
+    if w.dtype() == DType::F16 {
+        let x = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        Ok(crate::ops::matmul_f16(w, &x)?)
+    } else {
+        Ok(x.matmul(&w.t()?)?)
+    }
 }
 
 /// Numerically stable softplus, ln(1 + exp(x)) = relu(x) + ln(1 + exp(-|x|)).
@@ -676,8 +763,14 @@ mod tests {
         m
     }
 
-    fn drafter_from_map(cfg: DflashConfig, m: &HashMap<String, Tensor>, dev: &Device, max_ctx: usize) -> DflashDrafter {
-        DflashDrafter::build(cfg, dev, max_ctx, |name| {
+    fn drafter_from_map(
+        cfg: DflashConfig,
+        m: &HashMap<String, Tensor>,
+        dev: &Device,
+        max_ctx: usize,
+        dtype: WeightDtype,
+    ) -> DflashDrafter {
+        DflashDrafter::build(cfg, dev, max_ctx, dtype, |name| {
             m.get(name).cloned().with_context(|| format!("synthetic tensor {name} missing"))
         })
         .unwrap()
@@ -955,7 +1048,7 @@ mod tests {
         let taps: Vec<Tensor> = (0..n_aux)
             .map(|a| Tensor::from_vec(seeded(seq * n_embd, 100 + a as u64), (seq, n_embd), &dev).unwrap())
             .collect();
-        let drafter = drafter_from_map(cfg.clone(), &m, &dev, 32);
+        let drafter = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
         let got = to_vec(&drafter.encode(&taps).unwrap());
 
         // Scalar reference.
@@ -984,15 +1077,17 @@ mod tests {
         assert!(rel < 1e-5, "encoder rel_l2 {rel} too high");
     }
 
-    /// Test 3: draft_forward matches the independent scalar reference — verifies
-    /// cache-vs-block equivalence, GQA, rope positions, causal masking, gate.
+    /// Test 3: draft_forward on the f32 weight path matches the independent
+    /// scalar reference — verifies cache-vs-block equivalence, GQA, rope
+    /// positions, causal masking, gate. The f16 path is graded against the same
+    /// reference (looser tolerance) in `draft_forward_f16_matches_scalar`.
     #[test]
     fn draft_forward_matches_scalar() {
         let dev = Device::Cpu;
         let (n_embd, hd) = (8usize, 4usize);
         let cfg = tiny_cfg(2, 2, 1, hd, n_embd, 16);
         let m = synth_weights(&cfg, &dev);
-        let mut drafter = drafter_from_map(cfg.clone(), &m, &dev, 32);
+        let mut drafter = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
 
         let committed = 4usize;
         let n_block = 3usize;
@@ -1027,6 +1122,59 @@ mod tests {
         assert!(rel < 1e-4, "draft_forward rel_l2 {rel} too high");
     }
 
+    /// Companion to Test 3 on the SHIPPED f16 weight path (Metal only): the same
+    /// noise-block forward graded against the SAME full-precision scalar
+    /// reference. The only difference from Test 3 is the f16 weight rounding, so
+    /// the residual is larger but still small. Shapes are sized to satisfy the
+    /// f16 kernel constraints (k % 32 == 0, n_out % 4 == 0) and to exercise BOTH
+    /// the gemv branch (inject, t <= 8) and the tiled gemm branch (the t = 10
+    /// noise block, the production default). Skips cleanly with no Metal device.
+    #[test]
+    fn draft_forward_f16_matches_scalar() {
+        let Ok(dev) = crate::gguf::metal_device() else {
+            eprintln!("skipping draft_forward_f16_matches_scalar: no Metal device");
+            return;
+        };
+        let (n_embd, hd, n_head, n_kv, n_ff) = (64usize, 8usize, 8usize, 4usize, 128usize);
+        let cfg = tiny_cfg(2, n_head, n_kv, hd, n_embd, n_ff);
+        let m = synth_weights(&cfg, &dev);
+        let mut drafter = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F16);
+
+        let committed = 4usize;
+        let n_block = 10usize; // > 8: exercises the tiled gemm (mm) branch
+        let scale_in = 0.25f32;
+        let fused = Tensor::from_vec(seeded(committed * n_embd, 7), (committed, n_embd), &dev)
+            .unwrap()
+            .affine(scale_in as f64, 0.0)
+            .unwrap();
+        let noise = Tensor::from_vec(seeded(n_block * n_embd, 8), (n_block, n_embd), &dev)
+            .unwrap()
+            .affine(scale_in as f64, 0.0)
+            .unwrap();
+
+        drafter.inject(&fused, 0).unwrap();
+        let got = to_vec(&drafter.draft_forward(&noise, committed).unwrap());
+        assert_eq!(drafter.committed_len(), committed);
+
+        let to_rows = |t: &Tensor, rows: usize| -> Vec<Vec<f64>> {
+            let flat = to_vec(t);
+            (0..rows).map(|r| (0..n_embd).map(|c| flat[r * n_embd + c] as f64).collect()).collect()
+        };
+        let ctx = to_rows(&fused, committed);
+        let nz = to_rows(&noise, n_block);
+        let want_rows = naive_draft(&cfg, &m, &ctx, &nz);
+        let want: Vec<f32> = want_rows.iter().flatten().map(|x| *x as f32).collect();
+
+        // f16 weight rounding (plus the tensor gemm's f16 activation staging on
+        // the mm branch) is the only departure from the full-precision reference,
+        // and it is heavily dampened at the output by the exact-f32 residual
+        // stream: observed rel_l2 ~1.2e-5 (~10x the f32 path's pure-accumulation
+        // floor, so f16 is genuinely exercised). Metal accumulation is
+        // deterministic for a fixed dispatch, so the bound sits ~4x above that.
+        let rel = rel_l2(&got, &want);
+        assert!(rel < 5e-5, "draft_forward f16 rel_l2 {rel} too high");
+    }
+
     /// Test 4: cache hygiene — inject/draft/truncate roundtrips leave the cache
     /// in a clean state. A drafter that injects 5, drafts, injects 2 more must
     /// produce identical draft logits to a fresh drafter given the SAME final
@@ -1048,16 +1196,21 @@ mod tests {
 
         // Path 1: inject 5, draft 3 (cache back to 5), truncate is implicit
         // (draft never advances), inject 2 more -> committed 7, then draft.
-        let mut d1 = drafter_from_map(cfg.clone(), &m, &dev, 32);
+        let mut d1 = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
         d1.inject(&inj_a, 0).unwrap();
-        let _ = d1.draft_forward(&noise, 5).unwrap();
+        // Two draft_forwards at the same committed state must be bit-identical:
+        // each round overwrites the scratch rows it reads, so their reuse never
+        // leaks state from the prior draft.
+        let da = to_vec(&d1.draft_forward(&noise, 5).unwrap());
+        let db = to_vec(&d1.draft_forward(&noise, 5).unwrap());
+        assert_eq!(da, db, "repeated draft_forward at the same committed state diverged");
         assert_eq!(d1.committed_len(), 5);
         d1.inject(&inj_b, 5).unwrap();
         assert_eq!(d1.committed_len(), 7);
         let out1 = to_vec(&d1.draft_forward(&noise, 7).unwrap());
 
         // Path 2: a fresh drafter given the same two injections back to back.
-        let mut d2 = drafter_from_map(cfg.clone(), &m, &dev, 32);
+        let mut d2 = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
         d2.inject(&inj_a, 0).unwrap();
         d2.inject(&inj_b, 5).unwrap();
         let out2 = to_vec(&d2.draft_forward(&noise, 7).unwrap());
@@ -1068,7 +1221,7 @@ mod tests {
         }
 
         // Explicit truncate: roll back to 5 and re-inject 2 -> identical to d2.
-        let mut d3 = drafter_from_map(cfg.clone(), &m, &dev, 32);
+        let mut d3 = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
         d3.inject(&inj_a, 0).unwrap();
         d3.inject(&inj_b, 5).unwrap();
         d3.truncate(5).unwrap();

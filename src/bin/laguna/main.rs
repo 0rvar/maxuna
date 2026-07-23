@@ -68,6 +68,15 @@ struct DraftArgs {
     /// this. Adaptive draft length; 0.5 measured best across prompt kinds.
     #[arg(long, default_value_t = 0.5)]
     draft_p_min: f32,
+    /// Auto-pause speculation when its wall-clock cost per committed token
+    /// exceeds a plain decode step's cost times this factor (keeps `--draft`
+    /// from losing to plain decode on low-acceptance text). With auto-pause on,
+    /// temperature>0 runs are not run-to-run reproducible for a fixed seed
+    /// (which rounds batch-verify depends on wall-clock timing, and batched
+    /// rounds differ from plain at near-ties); `0` disables auto-pause (always
+    /// draft) and restores fully deterministic fixed-seed behavior.
+    #[arg(long, default_value_t = 1.0)]
+    draft_pause_margin: f32,
 }
 
 impl DraftArgs {
@@ -76,6 +85,7 @@ impl DraftArgs {
             draft_max: self.draft_max,
             draft_min: self.draft_min,
             draft_p_min: self.draft_p_min,
+            pause_margin: self.draft_pause_margin,
         }
     }
 }
@@ -233,12 +243,29 @@ fn main() -> Result<()> {
                     gstats.decode_tps(),
                 );
                 if let Some(spec) = &gstats.spec {
+                    let paused = if spec.paused_rounds > 0 {
+                        format!(" ({} paused)", spec.paused_rounds)
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "spec:    {} rounds, {} drafted, {} accepted ({:.1}% acceptance)",
+                        "spec:    {} rounds{paused}, {} drafted, {} accepted ({:.1}%), {} rejected",
                         spec.rounds,
                         spec.drafted,
                         spec.accepted,
                         spec.acceptance_rate() * 100.0,
+                        spec.rejected(),
+                    );
+                    // Per-round averages divide by rounds (>= 1 here since a spec
+                    // line only prints after decode ran); guard the zero case.
+                    let rounds = spec.rounds.max(1) as f64;
+                    eprintln!(
+                        "         {} verified positions; draft {:.1}s ({:.0}ms/round), verify {:.1}s ({:.0}ms/round)",
+                        spec.verify_positions,
+                        spec.draft_ms / 1000.0,
+                        spec.draft_ms / rounds,
+                        spec.verify_ms / 1000.0,
+                        spec.verify_ms / rounds,
                     );
                 }
             }

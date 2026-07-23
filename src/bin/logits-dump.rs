@@ -258,7 +258,7 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         "seq_len": seq_len,
         "mm_variant": laguna::ops::active_mm_variant_name(),
         "no_mm_id": laguna::ops::no_mm_id_forced(),
-        "mm_min_seq": laguna::ops::MM_ID_MIN_SEQ,
+        "mm_min_seq": laguna::ops::mm_id_min_seq(),
         "attn_dtype": attn_dtype,
         // Attention prefill gemm path: "tensor" (shipped cooperative-tensor
         // default), "classic" (LAGUNA_ATTN_MM_CLASSIC), or "f32-bypass"

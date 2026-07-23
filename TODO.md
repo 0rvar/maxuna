@@ -100,9 +100,12 @@
    vendor/candle with a ~30-line residency-set patch (upstream PR
    planned). All six gates pass at the exact anchors.
 6. **DFlash speculative decoding — DONE 2026-07-23** (ledger item below):
-   correct + fork-parity acceptance; code-gen decode 18.4 → 25.5 tok/s
-   (1.39x LPM, temp 1.0, p_min 0.5); prose currently net-negative —
-   drafter-forward perf + auto-disable are the deferred levers.
+   correct + fork-parity acceptance. Same-day follow-up arc landed both
+   deferred levers: drafter f16 + concat-kill + GPU readback (code greedy
+   19.1 → 25.0-27.0 tok/s LPM depending on pause margin) and the
+   wall-clock-EMA auto-pause (prose 19.4 vs 17.8 base @192, ≈parity @512 —
+   was 0.94x always-on). Expert-union/mm_id crossover probe CLOSED-REFUTED
+   (sub-items below).
 
 - [x] **Prefill mm_id kernel (biggest perf item)** — DONE. Vendored ggml's
   two-pass token→expert row-map kernels (`src/ops/mm_id.metal`, runtime-compiled
@@ -516,17 +519,98 @@ implementation — never silently drop scope.
   start_offset — the 0%-acceptance bug; regression test
   `qlinear_forward_honors_row_offset_views`).
   Deferred follow-ups:
-  - [ ] **Drafter forward perf** — WP-D1 is deliberately naive (dense f32
-    candle ops, ~4.4GB resident, CPU logits readback per round). Levers:
-    f16 weights, single fused draft readback (GPU argmax; full-vocab
-    softmax only needed for p_min), drop the redundant row-0 lm_head.
-    Would lift the all-prompt-kinds break-even, not just code.
-  - [ ] **Auto-disable spec on low acceptance** (prose regresses ~15%):
-    track a running acceptance EMA and fall back to plain decode when the
-    round economics go negative.
-  - [ ] **Candle upstream**: the quantized-matmul start_offset drop is an
-    upstream bug (quantized/metal.rs rebuilds the input layout from its
-    shape) — worth folding into the residency-set PR conversation.
+  - [x] **Drafter forward perf** — DONE (WP-E1, 2026-07-23). Shipped:
+    (1) matmul weights default to dense f16 (BF16→f32→f16, load-time
+    finiteness guard) multiplied by the vendored mixed-dtype `matmul_f16`
+    kernels (f32 accumulate, same convention as the target's attention
+    projections); `LAGUNA_DRAFT_F32` reverts to full f32 + plain candle
+    matmul. Norm weights stay f32. (2) Per-layer per-round KV concat
+    eliminated — `draft_forward` writes each block's noise K/V into the
+    cache scratch rows and attends over a narrowed view (no growing
+    prefix copy; the GQA-broadcast contiguous that candle forces anyway is
+    unchanged). (3) GPU-side draft readback — per-row argmax id + softmax
+    prob of the argmax reduced on-device, only the `[n_draft]` id/prob
+    arrays cross to CPU (was a full `[n_draft, vocab]` readback). The
+    redundant row-0 lm_head was ALREADY dropped (generate.rs narrows to
+    rows 1..=n_draft before lm_head). Measured (LPM, -n 192, CSV-parser
+    code prompt): greedy spec 24.2 → 27.6 tok/s (base 19.1, 1.44x;
+    output byte-identical to spec-off); temp-1.0 code 25.5 → 28.0 (1.52x
+    vs 18.4 base, 79.2% acceptance). Same-binary A/B pins attribution:
+    LAGUNA_DRAFT_F32 gives 23.8 vs f16's 27.6 (+16% from weights alone,
+    identical draft/accept counts). Prose temp-1.0 barely moved (15.2 →
+    15.4 vs 17.7 base) — prose rounds are verify-dominated (~3
+    drafts/round), which is the auto-pause item's job, not the drafter's.
+  - [x] **Auto-disable spec on low acceptance** — DONE (WP-E2, 2026-07-23).
+    A wall-clock `PauseController` (generate.rs) compares the speculative cost
+    per committed token against a plain single-token round's ms (the empty-draft
+    fallback path — the right comparator, same tap encode/inject overhead a
+    paused round pays). The spec cost is a RATE, not a mean of per-round ratios:
+    it tracks `EMA(round_ms)` and `EMA(committed)` separately (α = 0.25) and
+    compares their quotient, which estimates the windowed aggregate Σms/Σtok. A
+    single EMA of `round_ms/committed` over-weights low-commit rounds and paused
+    76/99 rounds on a 1.4x-winning code-gen run (bimodal ~25 ms/tok 11-commit vs
+    ~350 ms/tok 1-commit rounds); the quotient form does not. Two attribution
+    fixes came with it: an empty-draft round folds only `round_ms − draft_ms`
+    into the plain EMA (the wasted drafter time stays in stats, off the plain
+    comparator), and one `device.synchronize()` per round pins the round
+    boundary so a spec round's queued inject/encode tail can't bleed into the
+    next round's timing window. After warm-up (≥ 8 spec + ≥ 2 plain samples) it
+    pauses when `spec_cost > ema_plain_ms * margin`
+    (`--draft-pause-margin`, default 1.0; `0` disables — always draft).
+    Paused rounds run plain; every R committed tokens a probe EVENT (a PAIR of
+    consecutive spec rounds) re-measures (R backs off 32→64→128→256 on each
+    failed pair). Recovery is EAGER because the cost asymmetry is inverted (a
+    stale pause loses 30%+ forever — one field run stayed paused 1046/1106
+    rounds at 64.8% acceptance after a transient contention patch — while a
+    wrongly-lifted pause self-corrects in a few rounds): probe samples fold at
+    α=0.5 (fresh evidence dominates the stale ema_spec), and a pair resumes on
+    its OWN aggregate rate crossing back under threshold (ignoring the still-
+    poisoned smoothed EMA), snapping the spec EMAs to the pair's values to drop
+    the poisoned history. An empty-draft probe round contributes no sample and
+    decides nothing (accounting-wise a paused plain round that retries); a pair
+    that draws zero real samples decides nothing, one real sample decides on
+    itself. While Active it forces one plain round every 32 to keep `ema_plain`
+    fresh — tightened to every 4th round until the plain warm-up (≥ 2 samples)
+    is met, so a short all-drafting net-negative run reaches the pause gate
+    instead of only ever hitting it near round 64. Committed tokens are always the
+    target sampler's own draws on every path (spec/plain/probe), so greedy
+    spec-on output stays byte-identical to spec-off — pause changes round
+    STRUCTURE only. `SpecStats.paused_rounds` (paused-plain rounds + empty-draft
+    probes, which also run plain; real probes excluded) + `--stats` report it.
+    DETERMINISM trade-off: with auto-pause on, temp>0 output is no longer
+    run-to-run reproducible for a fixed seed — round-kind selection rides
+    wall-clock EMAs, and batched-verify vs plain rounds diverge at near-ties
+    (that near-tie sensitivity predates the controller; only WHICH rounds batch
+    became timing-dependent). `--draft-pause-margin 0` restores full determinism;
+    greedy byte-identity is unaffected.
+    An acceptance-count threshold was REJECTED: break-even committed/round is
+    span-dependent (~2.5 at span 2 to ~3.8 at span 16), so a fixed count
+    misfires — economics must be wall-clock. The spec-verify-bench numbers
+    motivate it: verify costs ~95 ms at span 2 → ~273 ms at span 16 vs
+    ~53 ms/plain token, so a low-acceptance round that verifies a long rejected
+    span loses badly to plain decode.
+  - [x] **Verify-side expert-union / mm_id crossover — CLOSED 2026-07-23,
+    REFUTED by measurement.** Hypothesis: verify spans (≤16 tokens) pay for
+    mv_id's lack of cross-token expert dedup, and mm_id's per-expert
+    compaction (which IS the expert-union dedup) would win if allowed below
+    MM_ID_MIN_SEQ. Probe: `spec-verify-bench` (new bin — replays the exact
+    checkpoint → span-forward → rollback verify op over long-swa fixture
+    tokens at n_past 512) with the new `LAGUNA_MM_ID_MIN_SEQ` override
+    (value-parsed env, recorded in dump provenance). Result (LPM, ms/verify,
+    mv_id vs mm_id-forced): span 2: 95 vs 131; 8: 210 vs 268; 16: 273 vs
+    338; 24: 367 vs 378; 32/48 equal within ~3% (both mm_id — doubles as
+    the noise floor). mm_id LOSES everywhere below the existing threshold:
+    map0 + half-empty 32-wide token tiles cost more than dedup saves.
+    MM_ID_MIN_SEQ=32 is already at the crossover — do NOT lower it. The
+    residual idea (worth a future probe only with new evidence): a
+    dedup-aware small-batch mv_id (gather each unique expert once, gemv all
+    its tokens) — the up-to ~26% routed-read saving at span 16 (E[unique of
+    160 draws from 256] ≈ 119) without mm_id's tile geometry.
+    upstream bug — mm path only (`fwd` rebuilds the input layout from its
+    shape at quantized/metal.rs:410 and passes that layout's zero offset;
+    `fwd_mv` threads the caller's offset correctly). Ready-to-post issue
+    draft with repro: `candle-issue-qmatmul-offset.md` (posting alongside
+    the residency-set PR is Orvar's call).
 - [ ] **HTTP server** (OpenAI-compatible /v1/chat/completions) so coding agents can
   connect; v1 is CLI-only per scope decision.
 - [ ] **Self-quantized Q5/Q6 tier** — official GGUF repo only ships Q4_K_M (75.2GB),

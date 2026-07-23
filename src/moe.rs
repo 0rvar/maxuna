@@ -237,7 +237,7 @@ impl ExpertFfn for FusedExperts {
         let mm_supported = mm_id::supported(self.gate.dtype, top_k, variant)
             && mm_id::supported(self.up.dtype, top_k, variant)
             && mm_id::supported(self.down.dtype, top_k, variant);
-        let use_mm = seq >= crate::ops::MM_ID_MIN_SEQ && !crate::ops::no_mm_id() && mm_supported;
+        let use_mm = seq >= crate::ops::mm_id_min_seq() && !crate::ops::no_mm_id() && mm_supported;
 
         // One map0 pass (per-expert token-slot map) shared by gate/up/down: the
         // three projections route by the SAME ids, so their maps are byte-identical.
