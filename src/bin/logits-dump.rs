@@ -235,8 +235,14 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// LAGUNA_ATTN_GLUE_CLASSIC). Unlike `combine`, BOTH runners execute the
 /// attention glue — the Reference oracle's anchor is the env pin, not a
 /// separate code path — so the value is env-derived for every runner and the
-/// gate expects "classic" on reference dumps. Additive: readers that ignore
-/// these still parse older/newer dumps.
+/// gate expects "classic" on reference dumps. `sdpa` records the sdpa compute
+/// dtype: "f16" (the shipped kernel) or "f32" (the `LAGUNA_SDPA_F32`
+/// experiment hook); env-derived for every runner, like `attn_glue`.
+/// `schema_version` stamps which field set this dump carries
+/// (`laguna::parity_schema`): the gate resolves a field missing from an older
+/// dump to its grandfather value instead of hard-failing, so adding a field
+/// no longer invalidates cached/committed references. Additive: readers that
+/// ignore these still parse older/newer dumps.
 fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
     let attn_dtype = match model.attn_dtype() {
         DType::F32 => "f32",
@@ -244,6 +250,7 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         other => unreachable!("attention computes in f16 or f32, not {other:?}"),
     };
     json!({
+        "schema_version": laguna::parity_schema::PROVENANCE_SCHEMA_VERSION,
         "moe_impl": moe_impl,
         "seq_len": seq_len,
         "mm_variant": laguna::ops::active_mm_variant_name(),
@@ -268,6 +275,10 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         // env pin, not a separate code path), so this is env-derived for every
         // runner; parity-gate.ts pins "classic" for reference and strict dumps.
         "attn_glue": if laguna::ops::attn_glue_classic() { "classic" } else { "fused" },
+        // sdpa compute dtype: like attn_glue, env-derived for every runner
+        // (both runners execute the same sdpa kernel); "f32" only under the
+        // LAGUNA_SDPA_F32 experiment hook.
+        "sdpa": if laguna::ops::sdpa_f32() { "f32" } else { "f16" },
     })
 }
 

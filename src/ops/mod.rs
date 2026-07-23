@@ -94,6 +94,22 @@ pub fn attn_glue_classic() -> bool {
     *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_GLUE_CLASSIC").is_some())
 }
 
+/// `LAGUNA_SDPA_F32` runs the sdpa attention kernel in f32 instead of the
+/// shipped f16: q skips its f16 cast, the cached f16 k/v are widened exactly,
+/// and candle's Metal sdpa dispatches its float32 kernels (supported at the
+/// pinned rev for head_dim 128 + GQA, full and vector). An EXPERIMENT hook for
+/// numerics work (e.g. isolating sdpa-precision drift), NOT a shipping path —
+/// the parity gates pin provenance `sdpa` to "f16" unless the run opts in via
+/// `LAGUNA_PARITY_EXPECT_SDPA` (see docs/parity.md §3b).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`no_mm_id`, `combine_classic`): any value enables it — only leaving it
+/// unset keeps the f16 default.
+pub fn sdpa_f32() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_SDPA_F32").is_some())
+}
+
 /// `LAGUNA_ATTN_MM_TENSOR=1` opts the attention PREFILL gemm — the mm branch
 /// (ne11 >= 8) of `matmul_f16` — into the Metal-4 cooperative-tensor kernel
 /// (`f16_t.metal`'s `kernel_mul_mm_f16_f32_t`). The DEFAULT is the classic

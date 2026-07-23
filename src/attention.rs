@@ -278,6 +278,11 @@ impl AttnBlock {
         mask: Option<&Tensor>,
         scale: f32,
     ) -> Result<Tensor> {
+        // Experiment hook (`LAGUNA_SDPA_F32`): run the whole sdpa in f32. The
+        // default path below is untouched when the env is absent.
+        if crate::ops::sdpa_f32() {
+            return self.sdpa_attention_f32(q, k_all, v_all, mask, scale);
+        }
         // Metal-only path, so the glue switch alone picks the cast kernels. q
         // arrives contiguous (rope output / decode reshape), so the fused cast
         // needs no trailing contiguous; both casts are bit-identical to
@@ -298,6 +303,35 @@ impl AttnBlock {
         let out = candle_nn::ops::sdpa(&q, &k, &v, mask, false, scale, 1.0)?;
         let out = out.squeeze(0)?;
         Ok(if fused_glue { crate::ops::cast_f32(&out)? } else { out.to_dtype(DType::F32)? })
+    }
+
+    /// f32 sdpa experiment path (`LAGUNA_SDPA_F32`, non-default): the same
+    /// candle Metal sdpa kernel family as the default path, dispatched in f32
+    /// — q stays f32 (no f16 cast), the cached f16 k/v are widened to f32
+    /// (exact: widening never rounds), and the pre-materialized f16 mask is
+    /// widened too (also exact — it holds only 0 and -inf). The pinned candle
+    /// rev supports SdpaDType::F32 for both the full (seq > 1,
+    /// `steel_attention_float32_*`) and vector (seq == 1,
+    /// `sdpa_vector_float_*`) kernels at head_dim 128 with GQA; f32 is only
+    /// rejected at head_dim 512. Output matches the default path's shape and
+    /// dtype ([n_head, seq, hd] f32) so the downstream flow is unchanged.
+    fn sdpa_attention_f32(
+        &self,
+        q: &Tensor,
+        k_all: &Tensor,
+        v_all: &Tensor,
+        mask: Option<&Tensor>,
+        scale: f32,
+    ) -> Result<Tensor> {
+        // q arrives contiguous (rope output / decode reshape). Widening the
+        // cache's head-strided k/v views also packs them contiguous.
+        let q = q.unsqueeze(0)?; // [1, n_head, seq, hd] f32
+        let k = k_all.to_dtype(DType::F32)?.unsqueeze(0)?;
+        let v = v_all.to_dtype(DType::F32)?.unsqueeze(0)?;
+        // candle requires the mask dtype to match q's.
+        let mask32 = mask.map(|m| m.to_dtype(DType::F32)).transpose()?;
+        let out = candle_nn::ops::sdpa(&q, &k, &v, mask32.as_ref(), false, scale, 1.0)?;
+        Ok(out.squeeze(0)?)
     }
 
     /// Explicit softmax(q·kᵀ·scale + mask)·v in q's dtype (f32), GQA via a
@@ -726,6 +760,67 @@ pub(crate) mod tests {
         let swa_mask = block_swa.prefill_mask(&cache_swa, xs.dim(0).unwrap(), 0).unwrap();
         let swa = block_swa.forward(&xs, &mut cache_swa, 0, swa_mask.as_ref()).unwrap();
         check(&swa, &ref_swa, "swa prefill");
+    }
+
+    /// Test 4c: the f32 sdpa experiment path (`LAGUNA_SDPA_F32` dispatches to
+    /// `sdpa_attention_f32`) returns finite f32 output with the default path's
+    /// [n_head, seq, hd] shape, for both head-count geometries (48 full / 72
+    /// SWA) at seq 1 (vector kernel, no mask) and seq 8 (full kernel, real
+    /// prefill mask), and tracks the explicit f32 reference chain
+    /// (`manual_attention`) closely — same math, different kernel, so no
+    /// bit-identity claim. Called directly rather than through the cached env
+    /// switch so the test never mutates process env; the default f16 path is
+    /// covered by the sibling sdpa tests. Metal only.
+    #[test]
+    fn sdpa_f32_path_finite_and_shape_stable() {
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return, // no Metal device: nothing to compare
+        };
+        let (n_kv, hd, hidden) = (8usize, 128usize, 256usize);
+
+        // (n_head, layer index, SWA window): il 0 is full attention, il 1 SWA.
+        for (n_head, il, window) in [(48usize, 0usize, 512usize), (72, 1, 4)] {
+            let cfg = test_cfg(n_head, n_kv, hd, hidden, 4, window);
+            let rope = Arc::new(Rope::new(cfg.rope(il), 64, &dev).unwrap());
+            let w = raw_weights(n_head, n_kv, hd, hidden, &dev);
+            let block = build_block(&w, &cfg, il, rope, &dev, AttnWeights::DequantF32);
+            let cache = LayerCache::new(&cfg, il, 64, &dev).unwrap();
+            let scale = 1.0f32 / (hd as f32).sqrt();
+
+            for seq in [1usize, 8] {
+                // Synthetic post-rope q and cached k/v at this geometry: q f32
+                // [n_head, seq, hd]; k/v f16 [n_kv, k_seq, hd] as the cache
+                // stores them (k_seq == seq for a pos-0 prefill; a longer
+                // context for the seq-1 vector-kernel case).
+                let k_seq = if seq == 1 { 16 } else { seq };
+                let t3 = |dims: (usize, usize, usize), seed: u64| {
+                    Tensor::from_vec(seeded(dims.0 * dims.1 * dims.2, seed), dims, &dev).unwrap()
+                };
+                let q = t3((n_head, seq, hd), 11 + seq as u64);
+                let k16 = t3((n_kv, k_seq, hd), 22 + seq as u64).to_dtype(DType::F16).unwrap();
+                let v16 = t3((n_kv, k_seq, hd), 33 + seq as u64).to_dtype(DType::F16).unwrap();
+                // The hoisted prefill mask (None at seq 1, like production).
+                let mask = if seq > 1 { block.prefill_mask(&cache, seq, 0).unwrap() } else { None };
+
+                let got = block
+                    .sdpa_attention_f32(&q, &k16, &v16, mask.as_ref().map(|m| &m.sdpa), scale)
+                    .unwrap();
+                assert_eq!(got.dims(), &[n_head, seq, hd], "heads {n_head} seq {seq}");
+                assert_eq!(got.dtype(), DType::F32, "heads {n_head} seq {seq}");
+                let host = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert!(
+                    host.iter().all(|x| x.is_finite()),
+                    "non-finite f32 sdpa output at heads {n_head} seq {seq}"
+                );
+
+                let want = block
+                    .manual_attention(&q, &k16, &v16, mask.as_ref().map(|m| &m.raw), scale, seq)
+                    .unwrap();
+                let cos = cosine(&got, &want);
+                assert!(cos > 0.999, "heads {n_head} seq {seq}: cos {cos} vs f32 reference");
+            }
+        }
     }
 
     /// Decode-attention perf benches (phase 0 of the attention-fusion work).

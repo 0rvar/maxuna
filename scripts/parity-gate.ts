@@ -21,7 +21,15 @@
  *   bun scripts/parity-gate.ts \
  *     [--tiers strict,mm,decode,ppl] \
  *     [--fixtures code-short,text-mixed,long-swa] \
- *     [--regen-ref] [--regen-ppl-ref] [--parity-dir DIR]
+ *     [--regen-ref] [--regen-ppl-ref] [--parity-dir DIR] \
+ *     [--sdpa-f32] [--attn-mm-tensor]
+ *
+ * --sdpa-f32 / --attn-mm-tensor are EXPERIMENT flags (not shipping gates):
+ * mm/decode/ppl CANDIDATE dumps run with the opt-in path env
+ * (LAGUNA_SDPA_F32 / LAGUNA_ATTN_MM_TENSOR) and the gate invocations get the
+ * matching LAGUNA_PARITY_EXPECT_SDPA / LAGUNA_PARITY_EXPECT_ATTN_MM
+ * expectation overrides; references and the strict tier stay pinned to the
+ * blessed classic/f16 paths.
  *
  * Defaults: all tiers; fixtures per tier (strict/mm force code-short; decode
  * uses all three; ppl has no fixture axis). Parity dir: $LAGUNA_PARITY_DIR or
@@ -70,6 +78,13 @@ interface Opts {
   regenRef: boolean;
   regenPplRef: boolean;
   parityDir: string;
+  /** EXPERIMENT (not a shipping gate): run mm/decode/ppl CANDIDATE dumps under
+   *  LAGUNA_SDPA_F32=1 and grade them with LAGUNA_PARITY_EXPECT_SDPA=f32.
+   *  References and the strict tier stay pinned to the blessed f16 kernel. */
+  sdpaF32: boolean;
+  /** EXPERIMENT: same shape for the opt-in tensor attention prefill gemm —
+   *  candidates run LAGUNA_ATTN_MM_TENSOR=1, gates expect attn_mm=tensor. */
+  attnMmTensor: boolean;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -97,6 +112,8 @@ function parseArgs(argv: string[]): Opts {
     fixtures: csv(flags.fixtures, ALL_FIXTURES, "fixture"),
     regenRef: Boolean(flags["regen-ref"]),
     regenPplRef: Boolean(flags["regen-ppl-ref"]),
+    sdpaF32: Boolean(flags["sdpa-f32"]),
+    attnMmTensor: Boolean(flags["attn-mm-tensor"]),
     parityDir: typeof flags["parity-dir"] === "string"
       ? String(flags["parity-dir"])
       : (process.env.LAGUNA_PARITY_DIR || "/tmp/laguna-parity"),
@@ -120,8 +137,10 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
-    if (k === "LAGUNA_PARITY_DIR" || k === "LAGUNA_PARITY_TIER") continue;
+    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_SDPA_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
+    // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
+    // those explicitly per run; an inherited one would skew every tier.
+    if (k.startsWith("LAGUNA_PARITY_")) continue;
     e[k] = v;
   }
   return e;
@@ -142,6 +161,34 @@ function baseEnv(): Record<string, string> {
  */
 function referenceEnv(): Record<string, string> {
   return { ...baseEnv(), LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1" };
+}
+
+/** Experiment flags (--sdpa-f32 / --attn-mm-tensor), set once in main. */
+let EXPERIMENT = { sdpaF32: false, attnMmTensor: false };
+
+/**
+ * Env for mm/decode/ppl CANDIDATE dump runs: baseEnv plus the opt-in path
+ * switches the experiment flags request. References and the strict candidate
+ * never get these — they stay pinned to the blessed classic/f16 paths, so an
+ * experiment run still grades the opt-in path against the real oracle.
+ */
+function candidateEnv(): Record<string, string> {
+  const e = baseEnv();
+  if (EXPERIMENT.sdpaF32) e.LAGUNA_SDPA_F32 = "1";
+  if (EXPERIMENT.attnMmTensor) e.LAGUNA_ATTN_MM_TENSOR = "1";
+  return e;
+}
+
+/**
+ * Matching provenance expectations for the mm/decode/ppl gate invocations
+ * (tests/parity.rs reads LAGUNA_PARITY_EXPECT_*): without these the gate would
+ * reject the experiment candidates' provenance outright.
+ */
+function experimentGateEnv(): Record<string, string> {
+  const e: Record<string, string> = {};
+  if (EXPERIMENT.sdpaF32) e.LAGUNA_PARITY_EXPECT_SDPA = "f32";
+  if (EXPERIMENT.attnMmTensor) e.LAGUNA_PARITY_EXPECT_ATTN_MM = "tensor";
+  return e;
 }
 
 /** Run a command with stdout+stderr streamed to `logPath` (never a pager). */
@@ -235,11 +282,22 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
   try {
     const j = await Bun.file(path).json();
     if (kind && j.kind !== kind) return false;
+    const p = j?.provenance;
+    if (!p) return false;
+    // Version-aware, mirroring tests/parity.rs (src/parity_schema.rs is the
+    // source of truth): a dump without schema_version is version 1; a field
+    // missing from a dump predating its introduction resolves to its
+    // grandfather value (sdpa: introduced v2, grandfather "f16"), so the
+    // pre-versioning references stay reusable; missing at/after introduction
+    // means a stale binary — regenerate.
+    const version = typeof p.schema_version === "number" ? p.schema_version : 1;
+    const sdpa = p.sdpa ?? (version < 2 ? "f16" : undefined);
     return (
-      j?.provenance?.moe_impl === "reference" &&
-      j?.provenance?.attn_dtype === "f32" &&
-      j?.provenance?.combine === "reference" &&
-      j?.provenance?.attn_glue === "classic"
+      p.moe_impl === "reference" &&
+      p.attn_dtype === "f32" &&
+      p.combine === "reference" &&
+      p.attn_glue === "classic" &&
+      sdpa === "f16"
     );
   } catch {
     return false;
@@ -403,9 +461,11 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // (both bit-identical to their fused kernels, so these only match the
   // oracle's blessed path). mm runs the default mm_id prefill
   // (code-short's 58 tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
+  // Only the mm candidate picks up the experiment flags (candidateEnv); strict
+  // stays pinned to the exact env its 0.999 anchor was blessed with.
   const env = tier === "strict"
     ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1" }
-    : baseEnv();
+    : candidateEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);
   const cCode = await timed(`${tier} candidate`, () =>
@@ -418,8 +478,13 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   if (cCode !== 0) die(`${tier} candidate dump failed (exit ${cCode}):\n${await tailLog(candLog)}`);
 
   const gateLog = join(dir, "gate.log");
+  // The experiment expectation overrides apply to the mm gate only (strict's
+  // candidate ran the pinned env, so its expectations stay literal).
+  const gateEnv = tier === "strict"
+    ? { LAGUNA_PARITY_TIER: tier as string }
+    : { LAGUNA_PARITY_TIER: tier as string, ...experimentGateEnv() };
   const gCode = await timed(`${tier} gate`, () =>
-    runGate(PARITY_BIN, "logit_parity", dir, { LAGUNA_PARITY_TIER: tier }, gateLog),
+    runGate(PARITY_BIN, "logit_parity", dir, gateEnv, gateLog),
   );
   rows.push({ tier, fixture, status: gCode === 0 ? "PASS" : "FAIL", metric: await gateMetric(tier, gateLog), logPath: gateLog });
 }
@@ -458,14 +523,14 @@ async function runDecodeFixture(fixture: string, parityDir: string, regenRef: bo
     runToLog(
       [LOGITS_DUMP, "--model", MODEL, "--moe-impl", "fused", "--replay", refPath, "--output", candPath],
       candLog,
-      baseEnv(),
+      candidateEnv(),
     ),
   );
   if (cCode !== 0) die(`decode candidate (${fixture}) failed (exit ${cCode}):\n${await tailLog(candLog)}`);
 
   const gateLog = join(dir, "gate.log");
   const gCode = await timed(`decode gate ${fixture}`, () =>
-    runGate(PARITY_BIN, "greedy_parity", dir, { LAGUNA_PARITY_TIER: "decode" }, gateLog),
+    runGate(PARITY_BIN, "greedy_parity", dir, { LAGUNA_PARITY_TIER: "decode", ...experimentGateEnv() }, gateLog),
   );
   rows.push({ tier: "decode", fixture, status: gCode === 0 ? "PASS" : "FAIL", metric: await gateMetric("decode", gateLog), logPath: gateLog });
 }
@@ -505,13 +570,13 @@ async function runPplTier(parityDir: string, regenPplRef: boolean): Promise<void
     runToLog(
       [LOGITS_DUMP, "--model", MODEL, "--moe-impl", "fused", "--max-ctx", String(PPL_MAX_CTX), "--ppl", CORPUS, "--output", candPath],
       candLog,
-      baseEnv(),
+      candidateEnv(),
     ),
   );
   if (cCode !== 0) die(`ppl candidate dump failed (exit ${cCode}):\n${await tailLog(candLog)}`);
 
   const gateLog = join(dir, "gate.log");
-  const gCode = await timed("ppl gate", () => runGate(PARITY_BIN, "ppl_parity", dir, {}, gateLog));
+  const gCode = await timed("ppl gate", () => runGate(PARITY_BIN, "ppl_parity", dir, experimentGateEnv(), gateLog));
   rows.push({ tier: "ppl", fixture: "corpus", status: gCode === 0 ? "PASS" : "FAIL", metric: await gateMetric("ppl", gateLog), logPath: gateLog });
 }
 
@@ -527,8 +592,22 @@ async function main() {
   }
   mkdirSync(opts.parityDir, { recursive: true });
 
+  EXPERIMENT = { sdpaF32: opts.sdpaF32, attnMmTensor: opts.attnMmTensor };
+
   console.log(`parity-gate: tiers=[${opts.tiers.join(",")}] fixtures=[${opts.fixtures.join(",")}] dir=${opts.parityDir}`);
   if (opts.regenRef) console.log("  --regen-ref: reference dumps will be regenerated");
+  if (opts.sdpaF32 || opts.attnMmTensor) {
+    console.log("");
+    console.log("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    console.log("  !! EXPERIMENT RUN — results do NOT gate the shipped defaults  !!");
+    if (opts.sdpaF32)
+      console.log("  !! --sdpa-f32: candidates run LAGUNA_SDPA_F32=1;              !!\n  !!             gates expect provenance sdpa=f32               !!");
+    if (opts.attnMmTensor)
+      console.log("  !! --attn-mm-tensor: candidates run LAGUNA_ATTN_MM_TENSOR=1;  !!\n  !!             gates expect provenance attn_mm=tensor         !!");
+    console.log("  !! references + strict stay pinned to the blessed paths       !!");
+    console.log("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    console.log("");
+  }
 
   // Build once up front: the logits-dump binary and the parity test binary.
   console.log("building logits-dump (release)...");

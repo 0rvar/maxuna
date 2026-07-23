@@ -321,6 +321,22 @@ kernels and they have different (both correct) numerical envelopes vs the f32
     replaces (proven by `f32::to_bits` tests in `src/ops/attn_glue.rs` against the
     live chains), so the pin anchors provenance rather than a numerical tier. A
     dump missing the field is a stale binary and hard-fails (regenerate).
+  - `sdpa` (the sdpa compute dtype: `"f16"` = the shipped kernel, `"f32"` = the
+    `LAGUNA_SDPA_F32` experiment hook, which skips q's f16 cast, widens the
+    cached f16 k/v exactly, and dispatches candle's float32 Metal sdpa kernels)
+    is pinned per side: references and strict candidates must be `"f16"` (every
+    blessed anchor ran the f16 kernel); mm/decode/ppl candidates expect `"f16"`
+    by default. Introduced at provenance schema version 2 with grandfather
+    `"f16"` (see the versioning note below), so pre-versioning dumps stay valid.
+  - **Experiment expectation overrides.** The mm/decode/ppl CANDIDATE
+    expectations for `sdpa` and `attn_mm` are overridable per gate run via
+    `LAGUNA_PARITY_EXPECT_SDPA` (e.g. `f32`) and `LAGUNA_PARITY_EXPECT_ATTN_MM`
+    (e.g. `tensor`), read by `tests/parity.rs`. This is how an opt-in path
+    (f32 sdpa, tensor attention prefill) gets graded against the real oracle
+    without editing the test; `parity-gate.ts --sdpa-f32` / `--attn-mm-tensor`
+    set the candidate env and the matching override together and print a
+    prominent EXPERIMENT banner. Reference-side and strict-tier pins are never
+    overridable — they anchor the oracle.
   - Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE must prove the mm_id path was
     actually active — `moe_impl == "fused"`, `seq_len >= mm_min_seq`,
     `no_mm_id == false` — else the gate hard-fails asking you to regenerate.
@@ -337,6 +353,24 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   fail-closed with no legacy exception, so **a long-lived dump that predates the
   provenance (or `attn_dtype`) field must be regenerated once with the current
   `logits-dump`** before the gate will run.
+
+  **Provenance schema versioning.** Missing-field-equals-stale-binary is the only
+  sound default, but before versioning it meant every provenance field ADDITION
+  retroactively invalidated every cached/committed reference dump (~40 min of GPU
+  regeneration each time — paid three times for `combine`/`attn_mm`/`attn_glue`).
+  Each dump's provenance now carries `schema_version` (written by `logits-dump`;
+  `src/parity_schema.rs` is the single source of truth for the current version and
+  the field-introduction table, used by both `tests/parity.rs` and mirrored in
+  `parity-gate.ts`'s reference-reuse check). A dump with no `schema_version` is
+  version 1: the baseline field set (`moe_impl`, `seq_len`, `mm_variant`,
+  `mm_min_seq`, `no_mm_id`, `attn_dtype`, `combine`, `attn_mm`, `attn_glue`), all
+  REQUIRED with no grandfathering — the references regenerated at that era carry
+  every one, so a v1 dump missing any of them is genuinely stale, not merely old.
+  A field introduced at version N (e.g. `sdpa`: N=2, grandfather `"f16"`) resolves
+  to its grandfather value when missing from a dump whose version predates N —
+  adding a field therefore no longer invalidates existing references — while
+  missing at/after N remains the stale-binary hard fail. A dump claiming a version
+  NEWER than the gate binary knows is rejected (rebuild the test binary).
 
   **Why forced replay, not free-run.** Comparing two free-running greedy decodes
   cascades at the first near-tie: the moment the two engines pick different

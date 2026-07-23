@@ -4,6 +4,54 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — drift attribution: f16 sdpa amplifies staging noise (CONFIRMED); tensor projections numerically unlocked, perf-blocked on flash attention
+
+**The experiment.** Question from the tensor-gemm rejection: WHERE does the
+fused pipeline spend its decode envelope, and can reallocating it let the 2x
+tensor projections pass? Hypothesis: our sdpa-in-f16 (candidate AND reference
+both — common-mode, so not a direct drift source) AMPLIFIES upstream f16
+staging noise nonlinearly, and f32 accumulation would damp it. Machinery
+built for it (all env-gated, no default changes): LAGUNA_SDPA_F32 f32 sdpa
+path (candle's native f32 Metal sdpa kernels — steel_attention_float32 +
+sdpa_vector_float, head_dim 128 supported; cached f16 k/v widened exactly
+per call), provenance field `sdpa` on the new schema v2, gate flags
+`--sdpa-f32`/`--attn-mm-tensor` with LAGUNA_PARITY_EXPECT_* test overrides
+(no more editing the test for experiments), and provenance SCHEMA VERSIONING
+(src/parity_schema.rs): missing fields grandfather to their classic-era
+value iff the dump's schema_version predates the field — field additions no
+longer invalidate references (the ~40-min regen tax, paid 3x, is dead;
+`committed_ppl_reference_fixture_stays_valid` proves it against the real
+fixture).
+
+**Results (three-config gate matrix, candidate-only cycles):**
+- tensor-only control: rejection reproduced EXACTLY on the post-glue binary
+  (mm 0.995842, Δnll 0.004732, step-29 flip) — glue bit-identity confirmed
+  yet again, and yesterday's adjudication is stable.
+- sdpa-f32 alone: all pass, but anchors move slightly AWAY from the
+  reference (mm 0.996987→0.996568, Δnll 0.001937→0.004305). Exactly the
+  predicted signature of changing a common-mode op on one side only: pure
+  differential noise, no benefit alone.
+- tensor + sdpa-f32: ALL SIX PASS and step 29 AGREES OUTRIGHT (63/64 + the
+  perennial step-0 near-tie; Δnll 0.003426 < either single change). The
+  interaction term is the finding: precise accumulation damps the staging
+  noise rather than adding its own — amplification confirmed.
+
+**Perf verdict: not shippable as-is.** LPM benches of the combined config:
+prefill 235.2 @925 / 204.1 @4k (shipped: 262/256), decode 15.2 (shipped:
+19.1). f32 sdpa doubles the O(T²) attention traffic (worst at 4k) and the
+experiment path re-widens the entire cached KV every forward. The tensor
+projection gain cannot outrun that; no configuration of the current pieces
+is net-positive.
+
+**Strategic readout.** The gate no longer blocks tensor projections — our
+attention precision does, and the fork already told us the answer: its
+flash_attn_ext takes f16 KV and accumulates in f32, giving the damping
+WITHOUT the bandwidth (f16 inputs, f32 registers). The flash-attention port
+is promoted to the top attention lever with dual payoff: removes the
+sdpa/mask/cast structural overhead AND unlocks the 2x projections as
+default. Defaults unchanged today; the experiment machinery stays for the
+flash+tensor rerun.
+
 ## 2026-07-23 — attention glue fusion SHIPPED: prefill 238→262 @925, decode 18.2→19.1 (passes the fork in LPM)
 
 **What shipped.** Three fused Metal kernels replacing ~275 ms/forward of

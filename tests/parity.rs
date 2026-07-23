@@ -93,7 +93,18 @@ struct Dump {
 /// The `logits-dump` `provenance` object: enough to tell whether a candidate dump
 /// actually exercised the mm_id prefill path it is being graded against, and
 /// which attention weight dtype the run used.
+///
+/// Missing-field handling is VERSION-AWARE (`laguna::parity_schema`): each
+/// `Option` field below that is `None` is resolved against the dump's
+/// `schema_version` — a field missing from a dump that predates the field's
+/// introduction takes its grandfather value (the dump stays valid; this is what
+/// keeps cached/committed references usable across field additions), while a
+/// field missing at/after its introduction is the hard "stale binary" fail.
 struct Provenance {
+    /// The field set this dump carries. Dumps written before versioning carry
+    /// no `schema_version` and are version 1 (the baseline set: every field up
+    /// to `attn_glue`, all required with no grandfathering).
+    schema_version: u32,
     moe_impl: String,
     seq_len: usize,
     mm_variant: String,
@@ -127,6 +138,12 @@ struct Provenance {
     /// the field — the gate hard-fails on that per side (same reasoning as
     /// `attn_dtype`).
     attn_glue: Option<String>,
+    /// sdpa compute dtype: "f16" (the shipped kernel) or "f32" (the
+    /// `LAGUNA_SDPA_F32` experiment hook). Introduced at schema version 2 with
+    /// grandfather "f16" — every earlier binary ran the f16 sdpa kernel
+    /// unconditionally, so a v1 dump missing the field resolves to "f16";
+    /// missing at v2+ is the stale-binary hard fail.
+    sdpa: Option<String>,
 }
 
 impl Provenance {
@@ -165,6 +182,27 @@ fn u32_array(v: &Value, key: &str) -> Result<Vec<u32>> {
 fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
     match v.get("provenance") {
         Some(p) if !p.is_null() => Ok(Some(Provenance {
+            // Absent in dumps written before schema versioning: they are
+            // version 1, the baseline field set — this default is what keeps
+            // every pre-versioning reference dump valid. A version NEWER than
+            // this test knows is a stale TEST binary — fail closed rather than
+            // mis-resolve fields introduced after this build.
+            schema_version: match p.get("schema_version") {
+                None => 1,
+                Some(sv) => {
+                    let n = sv.as_u64().context("provenance `schema_version` is not an integer")?;
+                    let n = u32::try_from(n)
+                        .with_context(|| format!("provenance schema_version {n} exceeds u32"))?;
+                    if n > laguna::parity_schema::PROVENANCE_SCHEMA_VERSION {
+                        bail!(
+                            "provenance schema_version {n} is newer than this gate's {} — rebuild \
+                             the parity test binary",
+                            laguna::parity_schema::PROVENANCE_SCHEMA_VERSION
+                        );
+                    }
+                    n
+                }
+            },
             moe_impl: p["moe_impl"].as_str().context("provenance missing `moe_impl`")?.to_string(),
             seq_len: p["seq_len"].as_u64().context("provenance missing `seq_len`")? as usize,
             mm_variant: p["mm_variant"].as_str().context("provenance missing `mm_variant`")?.to_string(),
@@ -192,6 +230,12 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
             // on that later, per side); present-but-not-a-string is malformed.
             attn_glue: match p.get("attn_glue") {
                 Some(d) => Some(d.as_str().context("provenance `attn_glue` is not a string")?.to_string()),
+                None => None,
+            },
+            // Absent in schema-version-1 dumps (grandfathered to "f16" by the
+            // version-aware check); present-but-not-a-string is malformed.
+            sdpa: match p.get("sdpa") {
+                Some(d) => Some(d.as_str().context("provenance `sdpa` is not a string")?.to_string()),
                 None => None,
             },
         })),
@@ -431,25 +475,38 @@ fn is_near_tie(candidate: &Dump, reference: &Dump) -> bool {
     cand_is_contender && margin < NEAR_TIE_MARGIN
 }
 
-/// Enforce the attention weight dtype recorded in one side's provenance.
-/// `want` is "f32" for the Reference-oracle side (reference dumps are produced
-/// under `LAGUNA_ATTN_F32=1`) and for strict-tier candidates; "f16" for
-/// candidates gating the shipped default path. A provenance MISSING the field
-/// came from a `logits-dump` binary that predates it — hard fail, because such
-/// a stale binary's dumps are otherwise indistinguishable from current ones
-/// and the gate would pass vacuously.
-fn check_attn_dtype(p: &Provenance, side: &str, want: &str) -> Result<()> {
-    match p.attn_dtype.as_deref() {
-        Some(d) if d == want => Ok(()),
+/// Version-aware enforcement of one string provenance field: present must
+/// equal `want`; missing resolves through `laguna::parity_schema` — a dump
+/// whose `schema_version` predates the field's introduction takes the field's
+/// grandfather value (keeping pre-introduction references valid), while
+/// missing at/after introduction is the hard "stale binary" fail (such a
+/// dump is otherwise indistinguishable from a current one and the gate would
+/// pass vacuously).
+fn check_field(p: &Provenance, side: &str, name: &str, value: Option<&str>, want: &str) -> Result<()> {
+    let effective = match value {
+        Some(v) => Some(v),
+        None => laguna::parity_schema::resolve_missing(name, p.schema_version),
+    };
+    match effective {
+        Some(v) if v == want => Ok(()),
         Some(other) => bail!(
-            "{side} provenance.attn_dtype is {other:?}, expected {want:?}; regenerate the dump \
+            "{side} provenance.{name} is {other:?}, expected {want:?}; regenerate the dump \
              under the environment its gate prescribes (see docs/parity.md §3)"
         ),
         None => bail!(
-            "{side} provenance has no attn_dtype (stale `logits-dump` binary predating the \
-             field); rebuild logits-dump and regenerate the dump"
+            "{side} provenance has no {name} (stale `logits-dump` binary predating the field; \
+             required at schema_version {}); rebuild logits-dump and regenerate the dump",
+            p.schema_version
         ),
     }
+}
+
+/// Enforce the attention weight dtype recorded in one side's provenance.
+/// `want` is "f32" for the Reference-oracle side (reference dumps are produced
+/// under `LAGUNA_ATTN_F32=1`) and for strict-tier candidates; "f16" for
+/// candidates gating the shipped default path.
+fn check_attn_dtype(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "attn_dtype", p.attn_dtype.as_deref(), want)
 }
 
 /// Enforce the routed-expert combine path recorded in one side's provenance.
@@ -457,44 +514,19 @@ fn check_attn_dtype(p: &Provenance, side: &str, want: &str) -> Result<()> {
 /// `ops::combine`), "classic" for strict-tier candidates (produced under
 /// `LAGUNA_COMBINE_CLASSIC=1`, the candle chain the strict anchor was blessed
 /// with), and "fused" for the mm/decode/ppl candidates that grade the shipped
-/// vendored combine. A provenance MISSING the field came from a `logits-dump`
-/// binary that predates the combine provenance field — hard fail, because such a
-/// dump is otherwise indistinguishable from a current one and the gate would pass
-/// vacuously.
+/// vendored combine.
 fn check_combine(p: &Provenance, side: &str, want: &str) -> Result<()> {
-    match p.combine.as_deref() {
-        Some(c) if c == want => Ok(()),
-        Some(other) => bail!(
-            "{side} provenance.combine is {other:?}, expected {want:?}; regenerate the dump \
-             under the environment its gate prescribes (see docs/parity.md §3)"
-        ),
-        None => bail!(
-            "{side} provenance has no combine (dump predates the combine provenance field); \
-             rebuild logits-dump and regenerate the dump"
-        ),
-    }
+    check_field(p, side, "combine", p.combine.as_deref(), want)
 }
 
 /// Enforce the attention prefill gemm path recorded in one side's provenance.
 /// `want` is "f32-bypass" for the Reference-oracle side and strict-tier candidates
 /// (both run under `LAGUNA_ATTN_F32=1`, which bypasses the f16 library's mm
 /// branch), and "classic" for the mm/decode/ppl candidates that grade the shipped
-/// simdgroup prefill kernel. A provenance MISSING the field came from a
-/// `logits-dump` binary that predates it — hard fail, because such a dump is
-/// otherwise indistinguishable from a current one and the gate would pass
-/// vacuously.
+/// simdgroup prefill kernel — except when a gate run opts in to grading the
+/// tensor path via `LAGUNA_PARITY_EXPECT_ATTN_MM` (see `expected_attn_mm`).
 fn check_attn_mm(p: &Provenance, side: &str, want: &str) -> Result<()> {
-    match p.attn_mm.as_deref() {
-        Some(m) if m == want => Ok(()),
-        Some(other) => bail!(
-            "{side} provenance.attn_mm is {other:?}, expected {want:?}; regenerate the dump \
-             under the environment its gate prescribes (see docs/parity.md §3)"
-        ),
-        None => bail!(
-            "{side} provenance has no attn_mm (stale `logits-dump` binary predating the \
-             field); rebuild logits-dump and regenerate the dump"
-        ),
-    }
+    check_field(p, side, "attn_mm", p.attn_mm.as_deref(), want)
 }
 
 /// Enforce the attention-glue path recorded in one side's provenance. `want` is
@@ -502,22 +534,39 @@ fn check_attn_mm(p: &Provenance, side: &str, want: &str) -> Result<()> {
 /// produced under `LAGUNA_ATTN_GLUE_CLASSIC=1` — unlike `combine`, the oracle
 /// EXECUTES the attention glue, so its anchor is the env pin, not a separate
 /// code path), and "fused" for the mm/decode/ppl candidates that grade the
-/// shipped vendored glue kernels. A provenance MISSING the field came from a
-/// `logits-dump` binary that predates it — hard fail, because such a dump is
-/// otherwise indistinguishable from a current one and the gate would pass
-/// vacuously.
+/// shipped vendored glue kernels.
 fn check_attn_glue(p: &Provenance, side: &str, want: &str) -> Result<()> {
-    match p.attn_glue.as_deref() {
-        Some(g) if g == want => Ok(()),
-        Some(other) => bail!(
-            "{side} provenance.attn_glue is {other:?}, expected {want:?}; regenerate the dump \
-             under the environment its gate prescribes (see docs/parity.md §3)"
-        ),
-        None => bail!(
-            "{side} provenance has no attn_glue (stale `logits-dump` binary predating the \
-             field); rebuild logits-dump and regenerate the dump"
-        ),
-    }
+    check_field(p, side, "attn_glue", p.attn_glue.as_deref(), want)
+}
+
+/// Enforce the sdpa compute dtype recorded in one side's provenance. "f16" is
+/// the shipped kernel and the value every reference and strict candidate must
+/// carry (the blessed anchors all ran it); mm/decode/ppl candidates also
+/// expect "f16" unless a gate run opts in via `LAGUNA_PARITY_EXPECT_SDPA`
+/// (see `expected_sdpa`). Introduced at schema version 2: a version-1 dump
+/// missing the field is grandfathered to "f16" by `check_field` — that is what
+/// keeps the pre-versioning reference dumps valid.
+fn check_sdpa(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "sdpa", p.sdpa.as_deref(), want)
+}
+
+/// Experiment hook (docs/parity.md §3b): the sdpa dtype expected of mm/decode/
+/// ppl CANDIDATES. Default "f16" (the shipped kernel); `LAGUNA_PARITY_EXPECT_SDPA`
+/// overrides it so an experiment gate run can grade `LAGUNA_SDPA_F32` candidates
+/// (parity-gate.ts `--sdpa-f32` sets both ends). References and strict
+/// candidates are never overridable — they anchor the oracle.
+fn expected_sdpa() -> String {
+    std::env::var("LAGUNA_PARITY_EXPECT_SDPA").unwrap_or_else(|_| "f16".to_string())
+}
+
+/// Experiment hook (docs/parity.md §3b): the attention prefill gemm path
+/// expected of mm/decode/ppl CANDIDATES. Default "classic" (the shipped
+/// simdgroup kernel); `LAGUNA_PARITY_EXPECT_ATTN_MM` overrides it so an
+/// experiment gate run can grade `LAGUNA_ATTN_MM_TENSOR` candidates
+/// (parity-gate.ts `--attn-mm-tensor` sets both ends). References and strict
+/// candidates stay pinned to "f32-bypass".
+fn expected_attn_mm() -> String {
+    std::env::var("LAGUNA_PARITY_EXPECT_ATTN_MM").unwrap_or_else(|_| "classic".to_string())
 }
 
 fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
@@ -542,6 +591,9 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             // The oracle runs the attention glue too, pinned to the candle
             // chains (LAGUNA_ATTN_GLUE_CLASSIC=1, parity-gate.ts referenceEnv()).
             check_attn_glue(p, "reference dump", "classic")?;
+            // The oracle always runs the shipped f16 sdpa kernel (the
+            // LAGUNA_SDPA_F32 experiment hook is candidate-only).
+            check_sdpa(p, "reference dump", "f16")?;
         }
         Some(p) => bail!(
             "reference dump provenance.moe_impl is {:?}, expected \"reference\": the reference side \
@@ -613,14 +665,28 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
 
     // EVERY tier also pins the CANDIDATE's attention prefill gemm path: strict runs
     // under LAGUNA_ATTN_F32 (f16 library bypassed → "f32-bypass"), while mm and
-    // decode grade the shipped classic simdgroup prefill kernel ("classic").
+    // decode grade the shipped classic simdgroup prefill kernel by default —
+    // overridable per gate run via LAGUNA_PARITY_EXPECT_ATTN_MM (experiment hook).
     // Candidate provenance is already proven Some by the attn_dtype check above.
     let want_attn_mm = match tier {
-        Tier::Strict => "f32-bypass",
-        Tier::Mm | Tier::Decode => "classic",
+        Tier::Strict => "f32-bypass".to_string(),
+        Tier::Mm | Tier::Decode => expected_attn_mm(),
     };
     if let Some(p) = &candidate.provenance {
-        check_attn_mm(p, "candidate dump", want_attn_mm)?;
+        check_attn_mm(p, "candidate dump", &want_attn_mm)?;
+    }
+
+    // EVERY tier pins the CANDIDATE's sdpa compute dtype: "f16" (the shipped
+    // kernel) everywhere by default; mm and decode may be overridden per gate
+    // run via LAGUNA_PARITY_EXPECT_SDPA (experiment hook — grading a
+    // LAGUNA_SDPA_F32 candidate). Strict stays pinned: its 0.999 anchor was
+    // blessed on the f16 kernel.
+    let want_sdpa = match tier {
+        Tier::Strict => "f16".to_string(),
+        Tier::Mm | Tier::Decode => expected_sdpa(),
+    };
+    if let Some(p) = &candidate.provenance {
+        check_sdpa(p, "candidate dump", &want_sdpa)?;
     }
 
     // strict tier: the CANDIDATE must be a Fused-runner dump produced under
@@ -933,6 +999,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_combine(p, "reference-greedy.json", "reference")?;
             check_attn_mm(p, "reference-greedy.json", "f32-bypass")?;
             check_attn_glue(p, "reference-greedy.json", "classic")?;
+            check_sdpa(p, "reference-greedy.json", "f16")?;
         }
         Some(p) => bail!(
             "reference-greedy.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate \
@@ -947,12 +1014,14 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
     match &candidate.provenance {
         // The decode gate grades the SHIPPED path, which computes attention in
         // f16 and uses the fused combine; an f32/classic (or field-less) candidate
-        // ran some other build/env.
+        // ran some other build/env. The attn_mm and sdpa expectations are
+        // overridable per gate run (LAGUNA_PARITY_EXPECT_* experiment hooks).
         Some(p) if p.moe_impl == "fused" => {
             check_attn_dtype(p, "candidate-greedy.json", "f16")?;
             check_combine(p, "candidate-greedy.json", "fused")?;
-            check_attn_mm(p, "candidate-greedy.json", "classic")?;
+            check_attn_mm(p, "candidate-greedy.json", &expected_attn_mm())?;
             check_attn_glue(p, "candidate-greedy.json", "fused")?;
+            check_sdpa(p, "candidate-greedy.json", &expected_sdpa())?;
         }
         Some(p) => bail!(
             "candidate-greedy.json (replay) provenance.moe_impl is {:?}, expected \"fused\"; the \
@@ -1174,6 +1243,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_combine(p, "reference-ppl.json", "reference")?;
             check_attn_mm(p, "reference-ppl.json", "f32-bypass")?;
             check_attn_glue(p, "reference-ppl.json", "classic")?;
+            check_sdpa(p, "reference-ppl.json", "f16")?;
         }
         Some(p) => bail!(
             "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
@@ -1187,12 +1257,14 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
     }
     match &candidate.provenance {
         // The ppl gate grades the SHIPPED path, which streams f16 attention weights
-        // and uses the fused combine.
+        // and uses the fused combine. The attn_mm and sdpa expectations are
+        // overridable per gate run (LAGUNA_PARITY_EXPECT_* experiment hooks).
         Some(p) if p.moe_impl == "fused" => {
             check_attn_dtype(p, "candidate-ppl.json", "f16")?;
             check_combine(p, "candidate-ppl.json", "fused")?;
-            check_attn_mm(p, "candidate-ppl.json", "classic")?;
+            check_attn_mm(p, "candidate-ppl.json", &expected_attn_mm())?;
             check_attn_glue(p, "candidate-ppl.json", "fused")?;
+            check_sdpa(p, "candidate-ppl.json", &expected_sdpa())?;
         }
         Some(p) => bail!(
             "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
@@ -1291,6 +1363,7 @@ fn ppl_parity() -> Result<()> {
 /// f32/classic path strict grades. Tests perturb the fields to hit rejection paths.
 fn prov(moe_impl: &str) -> Provenance {
     Provenance {
+        schema_version: laguna::parity_schema::PROVENANCE_SCHEMA_VERSION,
         moe_impl: moe_impl.to_string(),
         seq_len: 2,
         mm_variant: "tensor".to_string(),
@@ -1307,6 +1380,9 @@ fn prov(moe_impl: &str) -> Provenance {
         // fused candidates run the shipped fused glue kernels. Strict-tier
         // candidate tests override this to "classic".
         attn_glue: Some(if moe_impl == "reference" { "classic" } else { "fused" }.to_string()),
+        // Both runners execute the shipped f16 sdpa kernel (the LAGUNA_SDPA_F32
+        // experiment hook is opt-in and never blessed).
+        sdpa: Some("f16".to_string()),
     }
 }
 
@@ -1795,6 +1871,151 @@ fn compare_pins_candidate_attn_glue_per_tier() {
     p.attn_glue = None;
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
     assert!(err.contains("no attn_glue"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_pins_candidate_sdpa_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // Every tier expects the shipped f16 sdpa kernel by default; a candidate
+    // produced under LAGUNA_SDPA_F32 (the experiment hook) must be rejected
+    // unless the gate run opts in via LAGUNA_PARITY_EXPECT_SDPA.
+    let mut p = prov("fused");
+    p.sdpa = Some("f32".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("sdpa"), "unexpected error: {err}");
+
+    // The reference oracle always runs the f16 sdpa kernel; an f32 reference
+    // moved the anchor.
+    let mut r = prov("reference");
+    r.sdpa = Some("f32".to_string());
+    let err = compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("sdpa"), "unexpected error: {err}");
+}
+
+#[test]
+fn sdpa_missing_at_current_version_hard_fails() {
+    // A dump claiming the current schema version but missing sdpa came from a
+    // stale/doctored binary: hard fail, both sides.
+    let reference = tiny_dump(Some(prov("reference")));
+    let mut p = prov("fused");
+    p.sdpa = None;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no sdpa"), "unexpected error: {err}");
+
+    let mut r = prov("reference");
+    r.sdpa = None;
+    let err = compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no sdpa"), "unexpected error: {err}");
+}
+
+#[test]
+fn sdpa_missing_grandfathered_at_schema_version_1() {
+    // A version-1 dump (schema_version absent = 1) predates the sdpa field:
+    // it resolves to the grandfather value "f16" and PASSES when f16 is
+    // expected. This is the property that keeps every pre-versioning
+    // reference/candidate dump valid across the field's introduction.
+    let mut r = prov("reference");
+    r.schema_version = 1;
+    r.sdpa = None;
+    let mut c = prov("fused");
+    c.schema_version = 1;
+    c.sdpa = None;
+    compare(&tiny_dump(Some(c)), &tiny_dump(Some(r)), Tier::Decode)
+        .expect("v1 dumps without sdpa must be grandfathered to f16 and pass");
+}
+
+#[test]
+fn v1_baseline_fields_hard_fail_missing_at_any_version() {
+    // The version-1 baseline fields have no grandfather: missing is a hard
+    // fail even from a dump that (correctly) claims schema version 1 — the
+    // just-regenerated references all carry them, so a v1 dump without one is
+    // genuinely stale, not merely old.
+    let candidate = tiny_dump(Some(prov("fused")));
+    let mut r = prov("reference");
+    r.schema_version = 1;
+    r.attn_dtype = None;
+    let err = compare(&candidate, &tiny_dump(Some(r)), Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no attn_dtype"), "unexpected error: {err}");
+
+    let mut r = prov("reference");
+    r.schema_version = 1;
+    r.attn_glue = None;
+    let err = compare(&candidate, &tiny_dump(Some(r)), Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no attn_glue"), "unexpected error: {err}");
+}
+
+#[test]
+fn load_dump_defaults_missing_schema_version_to_v1() {
+    // A dump written before schema versioning: full v1 provenance, no
+    // schema_version, no sdpa. It must load as version 1 and clear the
+    // reference-side sdpa pin via the grandfather value — the exact shape of
+    // the cached /tmp/laguna-parity references and the committed ppl fixture.
+    let dir = scratch_dir("v1-provenance");
+    let dump = json!({
+        "tokens": [2, 3],
+        "logits": [5.0, 4.0],
+        "top1": 0,
+        "top5": [[0, 5.0], [1, 4.0]],
+        "provenance": {
+            "moe_impl": "reference", "seq_len": 2, "mm_variant": "tensor",
+            "no_mm_id": false, "mm_min_seq": 32, "attn_dtype": "f32",
+            "combine": "reference", "attn_mm": "f32-bypass", "attn_glue": "classic",
+        },
+    });
+    let p = dir.join("v1.json");
+    std::fs::write(&p, serde_json::to_string(&dump).unwrap()).unwrap();
+    let d = load_dump(&p).expect("a v1-shaped dump must still load");
+    let prov = d.provenance.expect("provenance must parse");
+    assert_eq!(prov.schema_version, 1);
+    assert_eq!(prov.sdpa, None);
+    check_sdpa(&prov, "reference dump", "f16")
+        .expect("missing sdpa at v1 must grandfather to f16");
+}
+
+#[test]
+fn load_dump_rejects_future_schema_version() {
+    // A dump claiming a schema version newer than this test binary knows
+    // cannot have its missing fields resolved soundly: fail closed.
+    let dir = scratch_dir("future-schema");
+    let dump = json!({
+        "tokens": [2],
+        "logits": [5.0, 4.0],
+        "top1": 0,
+        "top5": [[0, 5.0], [1, 4.0]],
+        "provenance": {
+            "schema_version": laguna::parity_schema::PROVENANCE_SCHEMA_VERSION + 1,
+            "moe_impl": "reference", "seq_len": 1, "mm_variant": "tensor",
+            "no_mm_id": false, "mm_min_seq": 32, "attn_dtype": "f32",
+            "combine": "reference", "attn_mm": "f32-bypass", "attn_glue": "classic",
+        },
+    });
+    let p = dir.join("future.json");
+    std::fs::write(&p, serde_json::to_string(&dump).unwrap()).unwrap();
+    let err = load_dump(&p).err().expect("future schema_version must fail").to_string();
+    assert!(err.contains("newer than this gate"), "unexpected error: {err}");
+}
+
+/// The committed ppl reference fixture must stay valid under the current
+/// checks without regeneration — the whole point of schema versioning. This
+/// runs the exact reference-side pins `ppl_compare` applies (it is v1-shaped:
+/// no schema_version, no sdpa → grandfathered "f16").
+#[test]
+fn committed_ppl_reference_fixture_stays_valid() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference-ppl.json");
+    let d = load_ppl_dump(&fixture).expect("committed fixture must load");
+    assert_eq!(d.kind, "ppl");
+    let p = d.provenance.expect("committed fixture carries provenance");
+    assert_eq!(p.moe_impl, "reference");
+    check_attn_dtype(&p, "reference-ppl.json", "f32").unwrap();
+    check_combine(&p, "reference-ppl.json", "reference").unwrap();
+    check_attn_mm(&p, "reference-ppl.json", "f32-bypass").unwrap();
+    check_attn_glue(&p, "reference-ppl.json", "classic").unwrap();
+    check_sdpa(&p, "reference-ppl.json", "f16").unwrap();
 }
 
 #[test]

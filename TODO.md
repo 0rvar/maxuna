@@ -256,13 +256,38 @@
   parity-gate.ts fail-fasts on moe_impl/attn_dtype/combine/attn_glue but not
   attn_mm ("f32-bypass") — the Rust gate catches it, but only after an
   expensive candidate run.
-- [ ] **Per-op drift attribution** (idea 2026-07-23, motivated by the tensor
-  gemm rejection): measure WHERE the fused pipeline's envelope is spent, op
-  by op (candidate sdpa-in-f16 vs the fork's flash-attn accumulation is the
-  prime suspect; Track A per-layer taps are the machinery). Outcome decides
-  the drift-budget swap: if sdpa is the big spender, a higher-precision sdpa
-  epilogue might buy the headroom that lets tensor projections pass the
-  decode gate — potentially better than the mm_id-to-_t_hp swap.
+- [x] **Per-op drift attribution — DONE 2026-07-23, hypothesis CONFIRMED,
+  perf blocked on flash attention.** Three-config gate matrix via the new
+  `--sdpa-f32` / `--attn-mm-tensor` experiment flags (env-gated f32 sdpa
+  path: LAGUNA_SDPA_F32, candle's native f32 Metal sdpa kernels, per-call
+  exact widening of cached f16 k/v; provenance field `sdpa`, schema v2):
+  (1) tensor-only control reproduced the rejection exactly (mm 0.995842,
+  Δnll 0.004732, step-29 flip) on the post-glue binary; (2) sdpa-f32 alone
+  passes but drifts slightly off the f16-sdpa reference (mm 0.996568, Δnll
+  0.004305 — pure differential noise, as predicted for a common-mode
+  change); (3) tensor + sdpa-f32 passes ALL SIX and step 29 AGREES OUTRIGHT
+  (63/64 + the perennial step-0 excuse; Δnll 0.003426 — better than either
+  single change). Mechanism confirmed: f16 sdpa AMPLIFIES upstream f16
+  staging noise; f32 accumulation damps it. So the decode envelope does not
+  block tensor projections — our sdpa precision does. BUT the experiment
+  implementation is perf-negative (LPM: prefill 235.2 @925 / 204.1 @4k vs
+  shipped 262/256; decode 15.2 vs 19.1): f32 sdpa doubles O(T²) attention
+  traffic and re-widens the whole KV cache every forward. No shippable
+  configuration of the current pieces is net-positive. The unlock is the
+  mixed-precision flash-attention kernel (next item). Defaults unchanged;
+  experiment path kept env-gated.
+- [ ] **Flash-attention kernel: f16 KV inputs, f32 accumulation (ggml
+  flash_attn_ext design) — NOW THE TOP ATTENTION LEVER** (promoted
+  2026-07-23 by the drift-attribution result). Dual payoff: (a) perf —
+  one kernel replaces sdpa + the T×T mask/cast traffic and runs on permute
+  views (the fork's remaining structural attention edge); (b) numerics —
+  f32 softmax/output accumulation is precisely the damping the gate matrix
+  proved unlocks the 2x cooperative-tensor projections
+  (`LAGUNA_ATTN_MM_TENSOR`) as default. Gate plan when it lands: rerun the
+  matrix with flash+tensor; expected to reproduce the combined-config pass
+  without the f32-bandwidth tax. Note the fork's own kernel is the design
+  reference (reference/llama.cpp-laguna-branch ggml flash_attn_ext), and
+  candle's sdpa steel kernels are the porting substrate.
 - [ ] **Track B dumps for text-mixed / long-swa** — the full-logit reference-vs-
   fused gate ran only on code-short (greedy covers the other two fixtures);
   generate the remaining dumps if fused ever changes.

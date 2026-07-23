@@ -7,6 +7,7 @@ pub mod kv_cache;
 pub mod model;
 pub mod moe;
 pub mod ops;
+pub mod parity_schema;
 pub mod rope;
 pub mod sampler;
 pub mod tokenizer;
