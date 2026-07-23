@@ -232,12 +232,30 @@ impl AttnBlock {
         let (k_all, v_all) = cache.append(&k16, &v16)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
 
-        // sdpa is a Metal-only kernel; fall back to an explicit f32 attention on
-        // other devices (used by the CPU tests and any non-Metal run). The two
-        // paths consume different mask forms: sdpa the materialized f16 mask,
-        // the manual fallback the raw `[seq, k_seq]` additive one.
+        // Attention proper, three routes:
+        //  - Metal prefill (seq > 1) default: the vendored flash kernel, which
+        //    consumes the f32 rope output q directly and computes the causal /
+        //    sliding-window mask in-kernel — no f16 q cast, no materialized
+        //    mask tensor (model.rs skips building `PrefillMask` on this path).
+        //    k_off mirrors `attn_mask_for`'s column semantics: 0 for full
+        //    attention (keys 0..pos+seq); `pos - min(pos, window)` for SWA,
+        //    whose oldest→newest prefill view puts absolute position
+        //    `pos - m + j` in column j.
+        //  - Metal decode (seq == 1) and `LAGUNA_FLASH_CLASSIC`: candle's sdpa
+        //    (the pre-flash path, byte-for-byte, including LAGUNA_SDPA_F32),
+        //    consuming the materialized f16 mask.
+        //  - non-Metal: the explicit f32 fallback (CPU tests, Reference
+        //    oracle), consuming the raw `[seq, k_seq]` additive mask.
         let attn = if matches!(x_normed.device(), Device::Metal(_)) {
-            self.sdpa_attention(&q, &k_all, &v_all, mask.map(|m| &m.sdpa), scale)?
+            if seq > 1 && !crate::ops::flash_classic() {
+                let (k_off, window) = match cache.mask_kind() {
+                    MaskKind::Full => (0, None),
+                    MaskKind::Swa { window } => (pos - pos.min(window), Some(window)),
+                };
+                crate::ops::flash_attn(&q, &k_all, &v_all, pos, k_off, window, scale)?
+            } else {
+                self.sdpa_attention(&q, &k_all, &v_all, mask.map(|m| &m.sdpa), scale)?
+            }
         } else {
             self.manual_attention(&q, &k_all, &v_all, mask.map(|m| &m.raw), scale, seq)?
         }; // [n_head, seq, head_dim] f32
@@ -663,8 +681,11 @@ pub(crate) mod tests {
         assert!(swa.attn_mask(1, 10).unwrap().is_none());
     }
 
-    /// Test 4: the Metal sdpa path matches the f32 CPU reference (f16 tolerance),
-    /// for full-attn prefill, a decode step, and an SWA windowed prefill.
+    /// Test 4: the Metal attention path matches the f32 CPU reference (f16
+    /// tolerance), for full-attn prefill, a decode step, and an SWA windowed
+    /// prefill. Prefill (seq > 1) routes through the vendored flash kernel by
+    /// default (LAGUNA_FLASH_CLASSIC unset in the test env), so this exercises
+    /// the flash path end-to-end; decode exercises the sdpa vector kernel.
     #[test]
     fn metal_sdpa_matches_reference() {
         let dev = match Device::new_metal(0) {
@@ -820,6 +841,63 @@ pub(crate) mod tests {
                 let cos = cosine(&got, &want);
                 assert!(cos > 0.999, "heads {n_head} seq {seq}: cos {cos} vs f32 reference");
             }
+        }
+    }
+
+    /// Test 4d: the vendored flash prefill kernel and the classic sdpa path
+    /// (the `LAGUNA_FLASH_CLASSIC` fallback) agree on identical inputs, for
+    /// both head-count classes, full and SWA masking, and pos 0 / mid-stream.
+    /// Both paths are invoked DIRECTLY (`sdpa_attention` / `ops::flash_attn`),
+    /// never via env, so the test cannot mutate process state. The classic
+    /// path casts q and computes in f16, so agreement is tolerance-level (the
+    /// cosine bound the sibling sdpa tests use), not bitwise — the bitwise-vs-
+    /// f32-reference contract lives in the ops::flash tests. Metal only.
+    #[test]
+    fn flash_matches_classic_sdpa_path() {
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return, // no Metal device: nothing to compare
+        };
+        let (n_kv, hd, hidden) = (8usize, 128usize, 256usize);
+        let seq = 8usize;
+
+        // (n_head, layer index, SWA window, pos): il 0 full attention, il 1 SWA.
+        for (n_head, il, window, pos) in
+            [(48usize, 0usize, 512usize, 0usize), (48, 0, 512, 8), (72, 1, 4, 0), (72, 1, 4, 8)]
+        {
+            let cfg = test_cfg(n_head, n_kv, hd, hidden, 4, window);
+            let rope = Arc::new(Rope::new(cfg.rope(il), 64, &dev).unwrap());
+            let w = raw_weights(n_head, n_kv, hd, hidden, &dev);
+            let block = build_block(&w, &cfg, il, rope, &dev, AttnWeights::DequantF32);
+            let cache = LayerCache::new(&cfg, il, 64, &dev).unwrap();
+            let scale = 1.0f32 / (hd as f32).sqrt();
+
+            // Cache view geometry exactly as production: full attention keeps
+            // all pos+seq keys (k_off 0); SWA keeps the m=min(pos, window)
+            // surviving keys plus the new ones (k_off = pos - m).
+            let (k_off, k_seq, flash_window) = match cache.mask_kind() {
+                MaskKind::Full => (0usize, pos + seq, None),
+                MaskKind::Swa { window: w } => {
+                    let m = pos.min(w);
+                    (pos - m, m + seq, Some(w))
+                }
+            };
+            let t3 = |dims: (usize, usize, usize), seed: u64| {
+                Tensor::from_vec(seeded(dims.0 * dims.1 * dims.2, seed), dims, &dev).unwrap()
+            };
+            let q = t3((n_head, seq, hd), 61 + pos as u64);
+            let k16 = t3((n_kv, k_seq, hd), 62 + pos as u64).to_dtype(DType::F16).unwrap();
+            let v16 = t3((n_kv, k_seq, hd), 63 + pos as u64).to_dtype(DType::F16).unwrap();
+            let mask = PrefillMask::build(cache.mask_kind(), n_head, seq, pos, &dev).unwrap();
+
+            let classic = block
+                .sdpa_attention(&q, &k16, &v16, mask.as_ref().map(|m| &m.sdpa), scale)
+                .unwrap();
+            let flash =
+                crate::ops::flash_attn(&q, &k16, &v16, pos, k_off, flash_window, scale).unwrap();
+            assert_eq!(flash.dims(), classic.dims(), "heads {n_head} pos {pos}");
+            let cos = cosine(&flash, &classic);
+            assert!(cos > 0.999, "heads {n_head} pos {pos}: flash vs classic cos {cos}");
         }
     }
 

@@ -222,8 +222,8 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// gate enforces it per side/tier, so a dump from a binary that predates the
 /// f16 attention path (and thus omits the field) cannot pass as current.
 /// `attn_mm` records the attention prefill gemm path the model resolved at load
-/// ("classic" default, "tensor" under LAGUNA_ATTN_MM_TENSOR, "f32-bypass" under
-/// LAGUNA_ATTN_F32); the gate enforces it per side/tier like `attn_dtype`.
+/// ("tensor" default, "classic" under LAGUNA_ATTN_MM_CLASSIC, "f32-bypass"
+/// under LAGUNA_ATTN_F32); the gate enforces it per side/tier like `attn_dtype`.
 /// `combine` records the routed-expert combine path: "reference" for the
 /// Reference-oracle runner (which never touches `ops::combine` — it combines via
 /// its own per-expert index_add), else "fused" (default) or "classic" (under
@@ -238,6 +238,9 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// gate expects "classic" on reference dumps. `sdpa` records the sdpa compute
 /// dtype: "f16" (the shipped kernel) or "f32" (the `LAGUNA_SDPA_F32`
 /// experiment hook); env-derived for every runner, like `attn_glue`.
+/// `flash` records the prefill attention kernel: "fused" (the vendored flash
+/// kernel, the Metal default) or "classic" (the candle sdpa chain, under
+/// `LAGUNA_FLASH_CLASSIC`); env-derived for every runner, like `attn_glue`.
 /// `schema_version` stamps which field set this dump carries
 /// (`laguna::parity_schema`): the gate resolves a field missing from an older
 /// dump to its grandfather value instead of hard-failing, so adding a field
@@ -257,8 +260,9 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         "no_mm_id": laguna::ops::no_mm_id_forced(),
         "mm_min_seq": laguna::ops::MM_ID_MIN_SEQ,
         "attn_dtype": attn_dtype,
-        // Attention prefill gemm path: "classic" (shipped simdgroup default),
-        // "tensor" (LAGUNA_ATTN_MM_TENSOR), or "f32-bypass" (LAGUNA_ATTN_F32).
+        // Attention prefill gemm path: "tensor" (shipped cooperative-tensor
+        // default), "classic" (LAGUNA_ATTN_MM_CLASSIC), or "f32-bypass"
+        // (LAGUNA_ATTN_F32).
         // The gate enforces it per side/tier (like attn_dtype), so a dump
         // predating the field cannot pass as current.
         "attn_mm": model.attn_mm(),
@@ -279,6 +283,11 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         // (both runners execute the same sdpa kernel); "f32" only under the
         // LAGUNA_SDPA_F32 experiment hook.
         "sdpa": if laguna::ops::sdpa_f32() { "f32" } else { "f16" },
+        // Prefill attention kernel: "fused" (the vendored flash kernel,
+        // default on Metal) or "classic" (the candle sdpa chain, under
+        // LAGUNA_FLASH_CLASSIC). Env-derived for every runner, like attn_glue;
+        // parity-gate.ts pins "classic" for reference and strict dumps.
+        "flash": if laguna::ops::flash_classic() { "classic" } else { "fused" },
     })
 }
 

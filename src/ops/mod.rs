@@ -2,6 +2,7 @@ pub mod attn_glue;
 pub mod combine;
 mod dispatch;
 pub mod f16;
+pub mod flash;
 pub mod mm_id;
 pub mod mv_id;
 mod pipelines;
@@ -10,6 +11,7 @@ pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, r
 pub use combine::combine;
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
+pub use flash::flash_attn;
 pub use mm_id::mul_mm_id;
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 
@@ -94,6 +96,23 @@ pub fn attn_glue_classic() -> bool {
     *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_GLUE_CLASSIC").is_some())
 }
 
+/// `LAGUNA_FLASH_CLASSIC=1` reverts the prefill (seq > 1) attention from the
+/// vendored flash kernel (`ops::flash_attn` — in-kernel masking, no
+/// materialized mask tensor) back to the candle sdpa chain (f16 cast +
+/// materialized `PrefillMask` + `candle_nn::ops::sdpa` + f32 cast) —
+/// byte-for-byte the pre-flash behavior, including the `LAGUNA_SDPA_F32`
+/// experiment hook. Decode (seq == 1) always runs the sdpa vector path and is
+/// unaffected. The parity gates pin provenance `flash` to "classic" on
+/// references and the strict tier (parity-gate.ts referenceEnv()).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`attn_glue_classic`, `combine_classic`): any value enables it — only
+/// leaving it unset keeps the fused flash path.
+pub fn flash_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_FLASH_CLASSIC").is_some())
+}
+
 /// `LAGUNA_SDPA_F32` runs the sdpa attention kernel in f32 instead of the
 /// shipped f16: q skips its f16 cast, the cached f16 k/v are widened exactly,
 /// and candle's Metal sdpa dispatches its float32 kernels (supported at the
@@ -110,25 +129,24 @@ pub fn sdpa_f32() -> bool {
     *V.get_or_init(|| std::env::var_os("LAGUNA_SDPA_F32").is_some())
 }
 
-/// `LAGUNA_ATTN_MM_TENSOR=1` opts the attention PREFILL gemm — the mm branch
-/// (ne11 >= 8) of `matmul_f16` — into the Metal-4 cooperative-tensor kernel
-/// (`f16_t.metal`'s `kernel_mul_mm_f16_f32_t`). The DEFAULT is the classic
-/// simdgroup kernel (`f16.metal`'s `kernel_mul_mm_f16_f32_v`): the tensor kernel
-/// stages the activation as f16, and that extra rounding pushed our decode drift
-/// outside the fork's own envelope (a 0.6-margin reference decision flipped at a
-/// step the fork does not flip — see docs/parity.md §3b / TODO.md), so it is
-/// kept opt-in for future numerics work, not shipped. The decode gemv branch
-/// (ne11 < 8) is unaffected — it always runs the classic mv. Orthogonal to
-/// `LAGUNA_ATTN_F32`, which bypasses the whole f16 library for the legacy
-/// dequant-f32 QMatMul path; when that is set this switch is moot (the mm branch
-/// never runs).
+/// `LAGUNA_ATTN_MM_CLASSIC` reverts the attention PREFILL gemm — the mm branch
+/// (ne11 >= 8) of `matmul_f16` — from the DEFAULT Metal-4 cooperative-tensor
+/// kernel (`f16_t.metal`'s `kernel_mul_mm_f16_f32_t`) back to the classic
+/// simdgroup kernel (`f16.metal`'s `kernel_mul_mm_f16_f32_v`). The tensor
+/// kernel stages the activation as f16 — one extra rounding over the classic
+/// float tiles, the same precision class as the fork's own prefill (see
+/// docs/parity.md §3b) — so this kill-switch exists for A/B numerics work. The
+/// decode gemv branch (ne11 < 8) is unaffected — it always runs the classic mv.
+/// Orthogonal to `LAGUNA_ATTN_F32`, which bypasses the whole f16 library for
+/// the legacy dequant-f32 QMatMul path; when that is set this switch is moot
+/// (the mm branch never runs).
 ///
 /// PRESENCE-BASED and cached (read once), like the sibling switches (`no_mm_id`,
-/// `combine_classic`): any value enables it — only leaving it unset keeps the
-/// classic default.
-pub(crate) fn attn_mm_tensor() -> bool {
+/// `combine_classic`, `flash_classic`): any value enables it — only leaving it
+/// unset keeps the tensor default.
+pub(crate) fn attn_mm_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_MM_TENSOR").is_some())
+    *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_MM_CLASSIC").is_some())
 }
 
 /// The mm_id prefill kernel family. Runtime-selectable via env; the single

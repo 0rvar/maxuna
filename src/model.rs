@@ -60,8 +60,9 @@ pub struct LagunaModel {
     /// Attention PREFILL gemm path resolved once at load, for dump provenance:
     /// "f32-bypass" when LAGUNA_ATTN_F32 sends attention through the legacy
     /// dequant-f32 QMatMul (the f16 library, and thus its mm branch, never runs),
-    /// else the f16 library's mm-branch kernel — "classic" (the shipped simdgroup
-    /// default) or "tensor" (the opt-in Metal-4 kernel, LAGUNA_ATTN_MM_TENSOR).
+    /// else the f16 library's mm-branch kernel — "tensor" (the shipped Metal-4
+    /// cooperative-tensor default) or "classic" (the simdgroup kernel, under the
+    /// LAGUNA_ATTN_MM_CLASSIC kill-switch).
     attn_mm: &'static str,
     max_ctx: usize,
     tap_enabled: bool,
@@ -96,16 +97,16 @@ impl LagunaModel {
         // The attention prefill gemm path, for dump provenance. LAGUNA_ATTN_F32
         // routes the whole attention block through the legacy dequant-f32 QMatMul,
         // so the f16 library's mm branch never runs ("f32-bypass"). Otherwise the
-        // mm branch runs, defaulting to the classic simdgroup kernel, or the
-        // Metal-4 cooperative-tensor kernel under LAGUNA_ATTN_MM_TENSOR. Resolved
-        // once here (single source of truth is the cached `attn_mm_tensor` switch
+        // mm branch runs, defaulting to the Metal-4 cooperative-tensor kernel, or
+        // the classic simdgroup kernel under LAGUNA_ATTN_MM_CLASSIC. Resolved
+        // once here (single source of truth is the cached `attn_mm_classic` switch
         // the dispatch reads).
         let attn_mm = if attn_dtype == DType::F32 {
             "f32-bypass"
-        } else if crate::ops::attn_mm_tensor() {
-            "tensor"
-        } else {
+        } else if crate::ops::attn_mm_classic() {
             "classic"
+        } else {
+            "tensor"
         };
 
         // Two RoPE tables shared across all layers of each type (Arc-shared into
@@ -183,10 +184,10 @@ impl LagunaModel {
     }
 
     /// The attention PREFILL gemm path `load` resolved, for dump provenance:
-    /// "classic" (the shipped simdgroup default), "tensor" (the opt-in Metal-4
-    /// cooperative-tensor kernel, `LAGUNA_ATTN_MM_TENSOR`), or "f32-bypass"
-    /// (`LAGUNA_ATTN_F32` — the f16 library, and thus its mm branch, is bypassed
-    /// entirely).
+    /// "tensor" (the shipped Metal-4 cooperative-tensor default), "classic" (the
+    /// simdgroup kernel, under the `LAGUNA_ATTN_MM_CLASSIC` kill-switch), or
+    /// "f32-bypass" (`LAGUNA_ATTN_F32` — the f16 library, and thus its mm
+    /// branch, is bypassed entirely).
     pub fn attn_mm(&self) -> &'static str {
         self.attn_mm
     }
@@ -229,9 +230,15 @@ impl LagunaModel {
         // per-layer builds — the dominant per-layer attention cost at seq=512.
         // Only at prefill (seq>1); decode builds no mask, so the layers see None.
         // Built lazily per kind so an all-full or all-SWA model never constructs
-        // a mask it won't use.
+        // a mask it won't use. When prefill runs the vendored flash kernel
+        // (Metal, LAGUNA_FLASH_CLASSIC unset) the mask is computed in-kernel and
+        // the layers ignore the argument, so the builds are skipped entirely —
+        // the materialized masks are 1.5-2.3 GB allocations at 4k context. The
+        // classic (LAGUNA_FLASH_CLASSIC) and non-Metal paths still consume them.
+        let flash_prefill =
+            matches!(self.device, Device::Metal(_)) && !crate::ops::flash_classic();
         let (mut full_mask, mut swa_mask) = (None, None);
-        if seq > 1 {
+        if seq > 1 && !flash_prefill {
             for il in 0..self.layers.len() {
                 if full_mask.is_none() && self.cfg.is_full_attn(il) {
                     full_mask = PrefillMask::build(MaskKind::Full, self.cfg.n_head(il), seq, pos, &self.device)?;

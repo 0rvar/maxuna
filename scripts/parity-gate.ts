@@ -22,14 +22,15 @@
  *     [--tiers strict,mm,decode,ppl] \
  *     [--fixtures code-short,text-mixed,long-swa] \
  *     [--regen-ref] [--regen-ppl-ref] [--parity-dir DIR] \
- *     [--sdpa-f32] [--attn-mm-tensor]
+ *     [--sdpa-f32] [--attn-mm-classic] [--flash-classic]
  *
- * --sdpa-f32 / --attn-mm-tensor are EXPERIMENT flags (not shipping gates):
- * mm/decode/ppl CANDIDATE dumps run with the opt-in path env
- * (LAGUNA_SDPA_F32 / LAGUNA_ATTN_MM_TENSOR) and the gate invocations get the
- * matching LAGUNA_PARITY_EXPECT_SDPA / LAGUNA_PARITY_EXPECT_ATTN_MM
- * expectation overrides; references and the strict tier stay pinned to the
- * blessed classic/f16 paths.
+ * --sdpa-f32 / --attn-mm-classic / --flash-classic are EXPERIMENT flags (not
+ * shipping gates): mm/decode/ppl CANDIDATE dumps run with the opt-in path env
+ * (LAGUNA_SDPA_F32 / LAGUNA_ATTN_MM_CLASSIC / LAGUNA_FLASH_CLASSIC) and the
+ * gate invocations get the matching LAGUNA_PARITY_EXPECT_SDPA /
+ * LAGUNA_PARITY_EXPECT_ATTN_MM / LAGUNA_PARITY_EXPECT_FLASH expectation
+ * overrides; references and the strict tier stay pinned to the blessed
+ * classic/f16 paths.
  *
  * Defaults: all tiers; fixtures per tier (strict/mm force code-short; decode
  * uses all three; ppl has no fixture axis). Parity dir: $LAGUNA_PARITY_DIR or
@@ -82,9 +83,14 @@ interface Opts {
    *  LAGUNA_SDPA_F32=1 and grade them with LAGUNA_PARITY_EXPECT_SDPA=f32.
    *  References and the strict tier stay pinned to the blessed f16 kernel. */
   sdpaF32: boolean;
-  /** EXPERIMENT: same shape for the opt-in tensor attention prefill gemm —
-   *  candidates run LAGUNA_ATTN_MM_TENSOR=1, gates expect attn_mm=tensor. */
-  attnMmTensor: boolean;
+  /** EXPERIMENT (A/B hook): candidates run LAGUNA_ATTN_MM_CLASSIC=1 (the
+   *  classic simdgroup attention prefill gemm instead of the shipped
+   *  cooperative-tensor kernel), gates expect attn_mm=classic. */
+  attnMmClassic: boolean;
+  /** EXPERIMENT (A/B hook): candidates run LAGUNA_FLASH_CLASSIC=1 (the candle
+   *  sdpa prefill instead of the shipped flash kernel), gates expect
+   *  flash=classic. References and the strict tier already pin flash classic. */
+  flashClassic: boolean;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -113,7 +119,8 @@ function parseArgs(argv: string[]): Opts {
     regenRef: Boolean(flags["regen-ref"]),
     regenPplRef: Boolean(flags["regen-ppl-ref"]),
     sdpaF32: Boolean(flags["sdpa-f32"]),
-    attnMmTensor: Boolean(flags["attn-mm-tensor"]),
+    attnMmClassic: Boolean(flags["attn-mm-classic"]),
+    flashClassic: Boolean(flags["flash-classic"]),
     parityDir: typeof flags["parity-dir"] === "string"
       ? String(flags["parity-dir"])
       : (process.env.LAGUNA_PARITY_DIR || "/tmp/laguna-parity"),
@@ -137,7 +144,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_SDPA_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
+    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_CLASSIC" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_SDPA_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k === "LAGUNA_FLASH_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("LAGUNA_PARITY_")) continue;
@@ -156,15 +163,18 @@ function baseEnv(): Record<string, string> {
  * (softplus gate / permute-cast copies / partial-rotary rope) to the candle
  * chains (`LAGUNA_ATTN_GLUE_CLASSIC=1`), so the oracle stays on the exact path
  * its artifacts were blessed with (the fused kernels are bit-identical, so
- * these only anchor provenance). Candidate dumps use baseEnv() and run whatever
- * path their tier is gating.
+ * these only anchor provenance). `LAGUNA_ATTN_MM_CLASSIC=1` is pinned too,
+ * defensively: under `LAGUNA_ATTN_F32` the f16 mm branch never runs (provenance
+ * stays "f32-bypass"), but the pin keeps the oracle off the tensor gemm even if
+ * the attention pin ever changes. Candidate dumps use baseEnv() and run
+ * whatever path their tier is gating.
  */
 function referenceEnv(): Record<string, string> {
-  return { ...baseEnv(), LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1" };
+  return { ...baseEnv(), LAGUNA_ATTN_F32: "1", LAGUNA_ATTN_MM_CLASSIC: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1", LAGUNA_FLASH_CLASSIC: "1" };
 }
 
-/** Experiment flags (--sdpa-f32 / --attn-mm-tensor), set once in main. */
-let EXPERIMENT = { sdpaF32: false, attnMmTensor: false };
+/** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */
+let EXPERIMENT = { sdpaF32: false, attnMmClassic: false, flashClassic: false };
 
 /**
  * Env for mm/decode/ppl CANDIDATE dump runs: baseEnv plus the opt-in path
@@ -175,7 +185,8 @@ let EXPERIMENT = { sdpaF32: false, attnMmTensor: false };
 function candidateEnv(): Record<string, string> {
   const e = baseEnv();
   if (EXPERIMENT.sdpaF32) e.LAGUNA_SDPA_F32 = "1";
-  if (EXPERIMENT.attnMmTensor) e.LAGUNA_ATTN_MM_TENSOR = "1";
+  if (EXPERIMENT.attnMmClassic) e.LAGUNA_ATTN_MM_CLASSIC = "1";
+  if (EXPERIMENT.flashClassic) e.LAGUNA_FLASH_CLASSIC = "1";
   return e;
 }
 
@@ -187,7 +198,8 @@ function candidateEnv(): Record<string, string> {
 function experimentGateEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   if (EXPERIMENT.sdpaF32) e.LAGUNA_PARITY_EXPECT_SDPA = "f32";
-  if (EXPERIMENT.attnMmTensor) e.LAGUNA_PARITY_EXPECT_ATTN_MM = "tensor";
+  if (EXPERIMENT.attnMmClassic) e.LAGUNA_PARITY_EXPECT_ATTN_MM = "classic";
+  if (EXPERIMENT.flashClassic) e.LAGUNA_PARITY_EXPECT_FLASH = "classic";
   return e;
 }
 
@@ -271,8 +283,13 @@ async function fixtureTokens(id: string): Promise<string> {
  *  run — the only kind the gate accepts as a reference: moe_impl=="reference",
  *  attn_dtype=="f32" (referenceEnv() pins LAGUNA_ATTN_F32=1),
  *  combine=="reference" (the Reference runner never dispatches ops::combine),
+ *  attn_mm=="f32-bypass" (the LAGUNA_ATTN_F32 pin bypasses the f16 mm branch
+ *  entirely; a v1 field, required with no grandfather),
  *  AND attn_glue=="classic" (referenceEnv() pins LAGUNA_ATTN_GLUE_CLASSIC=1 —
- *  the oracle executes the attention glue, anchored to the candle chains). A
+ *  the oracle executes the attention glue, anchored to the candle chains),
+ *  AND flash=="classic" (referenceEnv() pins LAGUNA_FLASH_CLASSIC=1 —
+ *  grandfathered for dumps predating schema v3, whose binaries all ran the
+ *  candle sdpa prefill). A
  *  dump missing any field predates it and the Rust gate hard-fails on it, so
  *  regenerate here instead of failing after an expensive candidate run. `kind`
  *  (when given) must also match. Any parse/shape problem returns false
@@ -292,12 +309,15 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     // means a stale binary — regenerate.
     const version = typeof p.schema_version === "number" ? p.schema_version : 1;
     const sdpa = p.sdpa ?? (version < 2 ? "f16" : undefined);
+    const flash = p.flash ?? (version < 3 ? "classic" : undefined);
     return (
       p.moe_impl === "reference" &&
       p.attn_dtype === "f32" &&
       p.combine === "reference" &&
+      p.attn_mm === "f32-bypass" &&
       p.attn_glue === "classic" &&
-      sdpa === "f16"
+      sdpa === "f16" &&
+      flash === "classic"
     );
   } catch {
     return false;
@@ -455,16 +475,21 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // DEFAULT vendored mv path is gated by the decode + ppl tiers instead; its
   // full-logit cosine is a diagnostic only — see docs/parity.md §3b) — and
   // LAGUNA_ATTN_F32=1 reverts attention from the default f16 compute path to
-  // the legacy f32 one, LAGUNA_COMBINE_CLASSIC=1 pins the routed-expert
-  // combine to the candle chain, and LAGUNA_ATTN_GLUE_CLASSIC=1 pins the
+  // the legacy f32 one (which bypasses the f16 mm branch — attn_mm provenance
+  // "f32-bypass"; LAGUNA_ATTN_MM_CLASSIC=1 is pinned defensively on top, so
+  // the strict candidate stays off the tensor gemm even if the attention pin
+  // ever changes), LAGUNA_COMBINE_CLASSIC=1 pins the routed-expert
+  // combine to the candle chain, LAGUNA_ATTN_GLUE_CLASSIC=1 pins the
   // attention glue (softplus gate / permute-cast / rope) to the candle chains
   // (both bit-identical to their fused kernels, so these only match the
-  // oracle's blessed path). mm runs the default mm_id prefill
+  // oracle's blessed path), and LAGUNA_FLASH_CLASSIC=1 pins prefill attention
+  // to the candle sdpa chain (the path the 0.999 anchor was blessed with).
+  // mm runs the default mm_id prefill
   // (code-short's 58 tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
   // Only the mm candidate picks up the experiment flags (candidateEnv); strict
   // stays pinned to the exact env its 0.999 anchor was blessed with.
   const env = tier === "strict"
-    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1" }
+    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1", LAGUNA_ATTN_MM_CLASSIC: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1", LAGUNA_FLASH_CLASSIC: "1" }
     : candidateEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);
@@ -592,18 +617,20 @@ async function main() {
   }
   mkdirSync(opts.parityDir, { recursive: true });
 
-  EXPERIMENT = { sdpaF32: opts.sdpaF32, attnMmTensor: opts.attnMmTensor };
+  EXPERIMENT = { sdpaF32: opts.sdpaF32, attnMmClassic: opts.attnMmClassic, flashClassic: opts.flashClassic };
 
   console.log(`parity-gate: tiers=[${opts.tiers.join(",")}] fixtures=[${opts.fixtures.join(",")}] dir=${opts.parityDir}`);
   if (opts.regenRef) console.log("  --regen-ref: reference dumps will be regenerated");
-  if (opts.sdpaF32 || opts.attnMmTensor) {
+  if (opts.sdpaF32 || opts.attnMmClassic || opts.flashClassic) {
     console.log("");
     console.log("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     console.log("  !! EXPERIMENT RUN — results do NOT gate the shipped defaults  !!");
     if (opts.sdpaF32)
       console.log("  !! --sdpa-f32: candidates run LAGUNA_SDPA_F32=1;              !!\n  !!             gates expect provenance sdpa=f32               !!");
-    if (opts.attnMmTensor)
-      console.log("  !! --attn-mm-tensor: candidates run LAGUNA_ATTN_MM_TENSOR=1;  !!\n  !!             gates expect provenance attn_mm=tensor         !!");
+    if (opts.attnMmClassic)
+      console.log("  !! --attn-mm-classic: candidates run LAGUNA_ATTN_MM_CLASSIC=1;!!\n  !!             gates expect provenance attn_mm=classic        !!");
+    if (opts.flashClassic)
+      console.log("  !! --flash-classic: candidates run LAGUNA_FLASH_CLASSIC=1;    !!\n  !!             gates expect provenance flash=classic          !!");
     console.log("  !! references + strict stay pinned to the blessed paths       !!");
     console.log("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     console.log("");

@@ -982,10 +982,10 @@ pub(crate) fn run_plain_mv(
 /// the only f16 in the chain). Dispatches per the fork's host split: the gemv
 /// for t <= 8 tokens, the tiled gemm above (`F16_MM_MIN_SEQ`).
 pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
-    let kernel = if crate::ops::attn_mm_tensor() {
-        F16MmKernel::Tensor
-    } else {
+    let kernel = if crate::ops::attn_mm_classic() {
         F16MmKernel::Classic
+    } else {
+        F16MmKernel::Tensor
     };
     run_matmul_f16_variant(weight, x, kernel)
 }
@@ -995,10 +995,11 @@ pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
 /// `TensorMixed` is reachable exclusively from the f16.rs probe tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum F16MmKernel {
-    /// Classic simdgroup kernel, float tiles (`f16.metal`) — shipped default.
+    /// Classic simdgroup kernel, float tiles (`f16.metal`) — the
+    /// `LAGUNA_ATTN_MM_CLASSIC` kill-switch.
     Classic,
     /// Metal-4 cooperative-tensor kernel, half operand tiles (`f16_t.metal`) —
-    /// the `LAGUNA_ATTN_MM_TENSOR` opt-in.
+    /// shipped default.
     Tensor,
     /// Mixed-operand cooperative-tensor probe: half weight tile x FLOAT
     /// activation tile (`f16_t_mixed.metal`). No env switch, no production
@@ -1010,7 +1011,7 @@ pub(crate) enum F16MmKernel {
 
 /// `run_matmul_f16` with the prefill (ne11 >= 8) mm-branch kernel chosen
 /// explicitly. Production derives the kernel from the cached
-/// `LAGUNA_ATTN_MM_TENSOR` opt-in switch (`run_matmul_f16`); the f16.rs tests
+/// `LAGUNA_ATTN_MM_CLASSIC` kill-switch (`run_matmul_f16`); the f16.rs tests
 /// call this with an explicit kernel because the switch is a process-global
 /// `OnceLock`. The decode gemv branch is identical for every kernel choice
 /// (classic mv).
@@ -1089,11 +1090,11 @@ pub(crate) fn run_matmul_f16_variant(weight: &Tensor, x: &Tensor, kernel: F16MmK
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         if t > F16_MM_MIN_SEQ {
             // Tiled gemm: 64(out) x 32(token) tiles, 128 threads / 4 simdgroups.
-            // Default is the classic simdgroup kernel (float tiles, 12288 B; the
-            // store-back tile reuses the region); LAGUNA_ATTN_MM_TENSOR opts into
-            // the Metal-4 cooperative-tensor kernel (half operand tiles, 8192 B
-            // smem); the test-only TensorMixed probe keeps the activation tile
-            // float (half sa 4096 + float sb 4096 = the same 8192 B). Same
+            // Default is the Metal-4 cooperative-tensor kernel (half operand
+            // tiles, 8192 B smem); LAGUNA_ATTN_MM_CLASSIC reverts to the classic
+            // simdgroup kernel (float tiles, 12288 B; the store-back tile reuses
+            // the region); the test-only TensorMixed probe keeps the activation
+            // tile float (half sa 4096 + float sb 4096 = the same 8192 B). Same
             // MmArgs, grid and threads for all — only the kernel, its library,
             // and the tile smem differ.
             let args = MmArgs {
@@ -1356,6 +1357,35 @@ struct RopeArgs {
     head_dim: i32,
     n_rot: i32,
     pos: i32,
+}
+
+/// Matches the Metal `flash_attn_params` struct (src/ops/flash.metal).
+/// `#[repr(C)]` pins the layout byte-for-byte: twelve 4-byte fields (48 bytes,
+/// a multiple of 8) followed by eight `i64` element strides — no implicit
+/// padding on either side.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashAttnArgs {
+    gqa_factor: i32,
+    scale: f32,
+    nk: i32,
+    nq_aligned: i32,
+    nk_aligned: i32,
+    ql_rem: i32,
+    kl_rem: i32,
+    kl: i32,
+    q_off: i32,
+    k_off: i32,
+    window: i32,
+    disable_skip: i32,
+    q_stride_h: i64,
+    q_stride_r: i64,
+    k_stride_h: i64,
+    k_stride_r: i64,
+    v_stride_h: i64,
+    v_stride_r: i64,
+    o_stride_h: i64,
+    o_stride_r: i64,
 }
 
 /// Linear one-thread-per-element launch shared by the attention-glue kernels:
@@ -1658,6 +1688,218 @@ pub(crate) fn run_rope(
     drop(sin_guard);
 
     Ok(output_tensor(dst, mdev, n, (heads, seq, head_dim)))
+}
+
+/// The flash prefill kernel's fixed tile geometry (flash.metal): BQ=32 query
+/// rows per block, BK=16 key columns per block, head_dim locked at 128.
+const FLASH_BQ: usize = 32;
+const FLASH_BK: usize = 16;
+const FLASH_BD: usize = 128;
+
+/// Vendored flash-attention prefill against the `kernel_flash_attn_*` family
+/// (flash.metal — the modified copy of candle's MLX steel attention kernel).
+/// `q` is `[n_head, seq, 128]` f32 contiguous (the rope output); `k`/`v` are
+/// `[n_kv, K, 128]` f16 cache views that may be HEAD-STRIDED (rows within a
+/// head contiguous, head_dim stride 1; the head axis may carry the cache's
+/// max_ctx gap — passed to the kernel as explicit strides, never forced
+/// contiguous). Masking runs in-kernel: query row i (absolute `pos + i`) sees
+/// key column j (absolute `k_off + j`) iff it is not future and within
+/// `window` (None = full attention) — exactly `kv_cache::attn_mask_for`'s
+/// rule. Returns `[n_head, seq, 128]` f32 contiguous. `disable_skip` defeats
+/// the block-level skip bounds (test-only; the skip is exact — see flash.metal).
+pub(crate) fn run_flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    pos: usize,
+    k_off: usize,
+    window: Option<usize>,
+    scale: f32,
+    disable_skip: bool,
+) -> Result<Tensor> {
+    let cdev = q.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("flash_attn requires q on a Metal device");
+    };
+
+    let (n_head, seq, head_dim) = q
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("q must be rank-3 [n_head, seq, head_dim]: {e}"))?;
+    if q.dtype() != DType::F32 {
+        bail!("q must be f32, got {:?}", q.dtype());
+    }
+    if !q.is_contiguous() {
+        bail!("q must be contiguous");
+    }
+    if head_dim != FLASH_BD {
+        bail!("flash_attn is compiled for head_dim {FLASH_BD}, got {head_dim}");
+    }
+    if seq == 0 {
+        bail!("flash_attn requires at least one query row");
+    }
+
+    let (n_kv, k_len, _) = check_flash_kv(k, "k", head_dim, &cdev)?;
+    let (n_kv_v, v_len, _) = check_flash_kv(v, "v", head_dim, &cdev)?;
+    if (n_kv_v, v_len) != (n_kv, k_len) {
+        bail!("k [{n_kv}, {k_len}] and v [{n_kv_v}, {v_len}] disagree on shape");
+    }
+    if n_kv == 0 || !n_head.is_multiple_of(n_kv) {
+        bail!("n_head ({n_head}) must be a positive multiple of n_kv ({n_kv})");
+    }
+
+    // The mask semantics require every query's own key in range: row i's own
+    // key sits at column `pos + i - k_off`, which must lie in [0, K). A row
+    // with NO visible key would divide 0/0 in the softmax normalizer.
+    if k_off > pos {
+        bail!("k_off ({k_off}) exceeds pos ({pos}): query rows before the key range");
+    }
+    let q_end = pos
+        .checked_add(seq)
+        .ok_or_else(|| anyhow::anyhow!("pos + seq ({pos} + {seq}) overflows usize"))?;
+    let k_end = k_off
+        .checked_add(k_len)
+        .ok_or_else(|| anyhow::anyhow!("k_off + K ({k_off} + {k_len}) overflows usize"))?;
+    if q_end > k_end {
+        bail!(
+            "query rows reach absolute position {q_end} but keys end at {k_end}: \
+             each query's own key must be present"
+        );
+    }
+    // The kernel does its position math in i32.
+    for (what, val) in [("pos + seq", q_end), ("k_off + K", k_end)] {
+        if i32::try_from(val).is_err() {
+            bail!("flash_attn {what} ({val}) overflows the kernel's i32 position math");
+        }
+    }
+    let window = match window {
+        None => i32::MAX,
+        Some(0) => bail!("flash_attn window must be >= 1"),
+        Some(w) => i32::try_from(w).unwrap_or(i32::MAX),
+    };
+
+    let out_count = checked_elems(&[n_head, seq, head_dim], "flash_attn")?;
+    let dst = mdev.new_buffer(out_count, DType::F32, "flash_attn")?;
+
+    let (q_guard, q_layout) = q.storage_and_layout();
+    let Storage::Metal(q_storage) = &*q_guard else {
+        bail!("q is not on a Metal device");
+    };
+    let (k_guard, k_layout) = k.storage_and_layout();
+    let Storage::Metal(k_storage) = &*k_guard else {
+        bail!("k is not on a Metal device");
+    };
+    let (v_guard, v_layout) = v.storage_and_layout();
+    let Storage::Metal(v_storage) = &*v_guard else {
+        bail!("v is not on a Metal device");
+    };
+
+    let nq = seq.div_ceil(FLASH_BQ);
+    let nk = k_len.div_ceil(FLASH_BK);
+    let align_q = seq.is_multiple_of(FLASH_BQ);
+    let align_k = k_len.is_multiple_of(FLASH_BK);
+    let name = match (align_q, align_k) {
+        (true, true) => "kernel_flash_attn_q1_k1",
+        (true, false) => "kernel_flash_attn_q1_k0",
+        (false, true) => "kernel_flash_attn_q0_k1",
+        (false, false) => "kernel_flash_attn_q0_k0",
+    };
+    let pipeline = pipelines::flash_pipeline(mdev.device(), name)?;
+
+    let i64_stride = |s: usize, what: &str| -> Result<i64> {
+        i64::try_from(s).map_err(|_| anyhow::anyhow!("flash_attn {what} stride {s} overflows i64"))
+    };
+    let args = FlashAttnArgs {
+        gqa_factor: (n_head / n_kv) as i32,
+        scale,
+        nk: nk as i32,
+        nq_aligned: (seq / FLASH_BQ) as i32,
+        nk_aligned: (k_len / FLASH_BK) as i32,
+        ql_rem: (seq % FLASH_BQ) as i32,
+        kl_rem: (k_len % FLASH_BK) as i32,
+        kl: k_len as i32,
+        q_off: pos as i32,
+        k_off: k_off as i32,
+        window,
+        disable_skip: disable_skip as i32,
+        q_stride_h: i64_stride(q_layout.stride()[0], "q head")?,
+        q_stride_r: i64_stride(q_layout.stride()[1], "q row")?,
+        k_stride_h: i64_stride(k_layout.stride()[0], "k head")?,
+        k_stride_r: i64_stride(k_layout.stride()[1], "k row")?,
+        v_stride_h: i64_stride(v_layout.stride()[0], "v head")?,
+        v_stride_r: i64_stride(v_layout.stride()[1], "v row")?,
+        o_stride_h: (seq * head_dim) as i64,
+        o_stride_r: head_dim as i64,
+    };
+
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(q_storage.buffer()),
+            q_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(k_storage.buffer()),
+            k_layout.start_offset() * DType::F16.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            3,
+            Some(v_storage.buffer()),
+            v_layout.start_offset() * DType::F16.size_in_bytes(),
+        );
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        // One threadgroup per (query block, query head); 4 simdgroups.
+        let grid = mtl_size!(nq, n_head, 1);
+        encoder.dispatch_thread_groups(grid, mtl_size!(32, 4, 1));
+    }
+    drop(q_guard);
+    drop(k_guard);
+    drop(v_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (n_head, seq, head_dim)))
+}
+
+/// Validate one flash k/v cache view: rank-3 `[n_kv, K, head_dim]` f16 with
+/// head_dim stride 1 and contiguous rows (stride `head_dim`); the head stride
+/// is free (the cache's max_ctx gap). Returns (n_kv, K, head stride).
+fn check_flash_kv(
+    t: &Tensor,
+    what: &str,
+    head_dim: usize,
+    q_device: &Device,
+) -> Result<(usize, usize, usize)> {
+    let (n_kv, len, hd) = t
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("{what} must be rank-3 [n_kv, K, head_dim]: {e}"))?;
+    if t.dtype() != DType::F16 {
+        bail!("{what} must be f16, got {:?}", t.dtype());
+    }
+    if hd != head_dim {
+        bail!("{what} head_dim {hd} != q head_dim {head_dim}");
+    }
+    if len == 0 {
+        bail!("{what} has no keys");
+    }
+    let stride = t.layout().stride();
+    if stride[2] != 1 || stride[1] != head_dim {
+        bail!(
+            "{what} must have contiguous rows (strides [_, {head_dim}, 1]), got {:?}",
+            stride
+        );
+    }
+    if stride[0] < len * head_dim {
+        bail!("{what} head stride {} overlaps its {len} rows", stride[0]);
+    }
+    if !t.device().same_device(q_device) {
+        bail!("{what} must live on the same Metal device as q");
+    }
+    Ok((n_kv, len, stride[0]))
 }
 
 #[cfg(test)]

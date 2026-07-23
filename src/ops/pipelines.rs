@@ -37,9 +37,9 @@ const F16_SOURCE: &str = include_str!("f16.metal");
 /// analogue of `f16.metal`'s classic `kernel_mul_mm_f16_f32_v`). Separate from
 /// `f16.metal` so that file stays Metal-4-free: this library is compiled lazily,
 /// only on the first tensor-path dispatch (`f16_t_pipeline`), mirroring the
-/// `mm_id_t_hp` split. The tensor path is opt-in (`LAGUNA_ATTN_MM_TENSOR`); with
-/// the classic default the mm branch never asks for this library, so it never
-/// compiles.
+/// `mm_id_t_hp` split. The tensor path is the shipped default; under the
+/// `LAGUNA_ATTN_MM_CLASSIC` kill-switch the mm branch never asks for this
+/// library, so it never compiles.
 const F16_T_SOURCE: &str = include_str!("f16_t.metal");
 /// PROBE: the mixed-operand (half weight tile x FLOAT activation tile)
 /// cooperative-tensor variant of `f16_t.metal`. Test-only reachability
@@ -63,6 +63,11 @@ const ATTN_GLUE_SOURCE: &str = include_str!("attn_glue.metal");
 /// rope rotation must instead compile under the same default math mode as
 /// candle's own rope kernel to stay bit-identical (see rope.metal).
 const ROPE_SOURCE: &str = include_str!("rope.metal");
+/// Vendored flash-attention prefill kernel (the modified copy of candle's MLX
+/// steel attention: float Q/O, half K/V, in-kernel causal+sliding-window
+/// masking). Own library (no Metal-4 dependency), compiled fast-math like
+/// candle's metallib with no contract pragmas — see flash.metal's header.
+const FLASH_SOURCE: &str = include_str!("flash.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -194,4 +199,9 @@ pub(crate) fn attn_glue_pipeline(device: &Device, name: &str) -> Result<ComputeP
 /// Pipeline for a `rope.metal` kernel (vendored partial-rotary NEOX rope).
 pub(crate) fn rope_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, ROPE_SOURCE, "rope", name)
+}
+
+/// Pipeline for a `flash.metal` kernel (vendored flash-attention prefill).
+pub(crate) fn flash_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, FLASH_SOURCE, "flash", name)
 }

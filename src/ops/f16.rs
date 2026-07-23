@@ -9,11 +9,11 @@ use crate::ops::dispatch;
 /// fork's mixed-dtype mul_mat: f32 products/accumulation, f32 output.
 ///
 /// Dispatches the classic mat-vec (`f16.metal`) for t <= 8 tokens; above that,
-/// the prefill gemm — by default the classic simdgroup kernel (`f16.metal`), or
-/// the opt-in Metal-4 cooperative-tensor kernel (`f16_t.metal`) under
-/// `LAGUNA_ATTN_MM_TENSOR`. The tensor prefill gemm stages the activation as f16
-/// (its only extra rounding over the classic float-tile kernel), which put our
-/// decode drift outside the fork envelope, so it is opt-in, not shipped (see
+/// the prefill gemm — by default the Metal-4 cooperative-tensor kernel
+/// (`f16_t.metal`), or the classic simdgroup kernel (`f16.metal`) under the
+/// `LAGUNA_ATTN_MM_CLASSIC` kill-switch. The tensor prefill gemm stages the
+/// activation as f16 — its only extra rounding over the classic float-tile
+/// kernel, the same precision class as the fork's own prefill (see
 /// docs/parity.md §3b). Metal only; the caller's fallback is the dequant-f32
 /// `QMatMul` path (`LAGUNA_ATTN_F32`), which bypasses this module entirely.
 pub fn matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {

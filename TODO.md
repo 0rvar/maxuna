@@ -46,11 +46,13 @@
    ~16, transposes 119, sdpa 90, gate 82, rope 75, qk-norm 21).
    (a) **mask hoisting — DONE 2026-07-23** (48 builds/forward → 2 per chunk,
    byte-identical, no kill-switch; prefill 211 → 228 @925, 184 → 237 @4k;
-   docs/log.md entry). (b) projections: cooperative-tensor f16 gemm port —
-   PORTED then REVERTED to opt-in (gate-rejected as default; ledger item), and
-   the mixed-operand escape hatch is PROBED AND CLOSED (bit-identical but
-   classic-speed; ledger item) — projections stay on the classic simdgroup
-   gemm; no further lever known short of loosening the decode envelope.
+   docs/log.md entry; SUBSUMED by (d) — the flash path builds no mask at
+   all). (b) projections: cooperative-tensor f16 gemm port — PORTED then
+   REVERTED to opt-in (gate-rejected as default; ledger item), the
+   mixed-operand escape hatch PROBED AND CLOSED (bit-identical but
+   classic-speed; ledger item) — then UNBLOCKED 2026-07-23 by (d) and made
+   the DEFAULT the same day (owner-approved; kill-switch
+   LAGUNA_ATTN_MM_CLASSIC; ledger item has the gate/bench numbers).
    (c) **glue fusion — DONE 2026-07-23**: three fused kernels, each
    bit-identical by construction (combine playbook): fused softplus-gate
    (kernel_attn_gate, ~10-op candle chain + broadcast_mul → 1), fused
@@ -74,6 +76,12 @@
    fail-fast attn_glue in isReferenceDump. Glue was a TRAFFIC problem, not
    scheduling (territory map): fusion removed the copies concurrency could
    only have overlapped; the takeover now schedules fewer, fatter kernels.
+   (d) **flash-attention kernel — DONE 2026-07-23** (ledger item below):
+   vendored steel kernel, in-kernel causal/window mask + block skip, no mask
+   tensor, f32 boundaries; prefill 264.0 @925 / 268.8 @4k flash-only,
+   301.5/303.3 with tensor (0.85x/0.87x fork); all six gates pass in both
+   configs; the sdpa/mask/transpose+cast rows of the sub-budget above are
+   gone or absorbed on the flash path.
 4. **MoE-block encoder takeover** (ledger item below) — concurrency +
    range-tracked barriers; now also owns the demoted routing-glue fusion.
 5. **mmap + no-copy model load** (see ledger item below) — dev-velocity
@@ -276,18 +284,54 @@
   configuration of the current pieces is net-positive. The unlock is the
   mixed-precision flash-attention kernel (next item). Defaults unchanged;
   experiment path kept env-gated.
-- [ ] **Flash-attention kernel: f16 KV inputs, f32 accumulation (ggml
-  flash_attn_ext design) — NOW THE TOP ATTENTION LEVER** (promoted
-  2026-07-23 by the drift-attribution result). Dual payoff: (a) perf —
-  one kernel replaces sdpa + the T×T mask/cast traffic and runs on permute
-  views (the fork's remaining structural attention edge); (b) numerics —
-  f32 softmax/output accumulation is precisely the damping the gate matrix
-  proved unlocks the 2x cooperative-tensor projections
-  (`LAGUNA_ATTN_MM_TENSOR`) as default. Gate plan when it lands: rerun the
-  matrix with flash+tensor; expected to reproduce the combined-config pass
-  without the f32-bandwidth tax. Note the fork's own kernel is the design
-  reference (reference/llama.cpp-laguna-branch ggml flash_attn_ext), and
-  candle's sdpa steel kernels are the porting substrate.
+- [x] **Flash-attention kernel — DONE 2026-07-23, both payoffs delivered.**
+  Vendored candle's MLX steel attention kernel (`src/ops/flash.metal`, own
+  runtime-compiled library, no Metal-4 dep) rather than porting ggml's — the
+  mapping phase found candle's steel kernel ALREADY accumulates QK/softmax/O
+  in f32 (MLX lineage upcasts operands before the MMA, stronger than ggml's
+  f16-operand MMA), so the differential noise in the old default was purely
+  the boundary casts (q f32→f16 in, out f16 store) plus the materialized
+  mask. The vendored config: Q device-f32 → f32 smem, K/V device-f16
+  head-strided cache views (consumed strided, never packed), f32
+  accumulation, f32 O store — value-identical to the LAGUNA_SDPA_F32
+  experiment without widening KV. Mask tensor DELETED: in-kernel
+  causal+window visibility (`(j+k_off) <= (i+q_off) && (i+q_off)-(j+k_off)
+  < window`) with block-level skip (kb_start/kb_lim), bit-equivalent to the
+  additive 0/-inf mask (exp(-inf) terms are exact zeros); model.rs skips the
+  PrefillMask build entirely on the flash path (was 1.5-2.3GB of mask at
+  4k). Prefill (seq>1) only; decode untouched. Kill-switch
+  LAGUNA_FLASH_CLASSIC; provenance field `flash` at schema v3 grandfathered
+  "classic" (references reused, zero regen — the schema-versioning payoff).
+  Unit tests are BITWISE vs the composed f32-sdpa reference (all cases incl.
+  strided views, ring k_off, unaligned tails, block-skip exactness). Gates:
+  ALL SIX PASS as shipped default (mm 0.996568, Δnll 0.004305 — digit-exact
+  the sdpa-f32-only matrix column, confirming value-identity); flash+tensor
+  matrix ALL SIX PASS (Δnll 0.003426 = combined-config column). Review round
+  (Claude + Codex + GLM + DeepSeek): zero correctness findings. LPM bench:
+  prefill 262.1→264.0 @925, 255.6→268.8 @4k (T² attention term gone — 4k now
+  faster per-token than 925), decode 19.2 (untouched); with
+  LAGUNA_ATTN_MM_TENSOR: 301.5 @925 / 303.3 @4k (0.85x/0.87x fork, from
+  0.74x). The fork's bench numbers DO run flash attention (AUTO-resolved on,
+  kernel_flash_attn_ext_f16_dk128_dv128) — this closed a real structural gap.
+  - [x] **Tensor projections as DEFAULT — DONE 2026-07-23** (owner-approved).
+    The opt-in `LAGUNA_ATTN_MM_TENSOR` is replaced by the opt-out kill-switch
+    `LAGUNA_ATTN_MM_CLASSIC` (repo convention); mm/decode/ppl candidate
+    expectation flips to `attn_mm: "tensor"`
+    (LAGUNA_PARITY_EXPECT_ATTN_MM-overridable), strict keeps its hardcoded
+    "f32-bypass" pin (strict runs LAGUNA_ATTN_F32, which bypasses the f16
+    library entirely — a "classic" expectation would never match a real
+    strict run) plus LAGUNA_ATTN_MM_CLASSIC=1 pinned in the strict/reference
+    envs as belt-and-suspenders; gate flag `--attn-mm-tensor` →
+    `--attn-mm-classic`; isReferenceDump now fail-fasts on attn_mm (closed
+    that ledger sub-item). Gate as shipped default: ALL SIX PASS, digit-exact
+    the experiment matrix (mm 0.996564, Δnll 0.003426, decode 63/63/60 with
+    0 unexcused). Shipped-default bench (LPM): prefill 304.7 @925 /
+    303.8 @4k (0.86x/0.87x fork), decode 18.8 (±5% band, still ahead).
+  - [ ] **Decode vec-kernel port (flash phase 2)** — vendor the
+    sdpa_vector/2-pass kernels with the same f32-boundary treatment: removes
+    the seq==1 q/out casts (~1% decode), insulates decode attention from
+    candle, and gives long-context decode the split-K path on our terms.
+    Low priority: decode is mask-free and already ahead of the fork.
 - [ ] **Track B dumps for text-mixed / long-swa** — the full-logit reference-vs-
   fused gate ran only on code-short (greedy covers the other two fixtures);
   generate the remaining dumps if fused ever changes.

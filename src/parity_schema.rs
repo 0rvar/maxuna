@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 2;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 3;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -37,6 +37,9 @@ pub struct ProvenanceField {
 /// mm_min_seq, no_mm_id, attn_dtype, combine, attn_mm, attn_glue.
 /// Version 2: sdpa (the sdpa compute dtype; every earlier binary ran the f16
 /// sdpa kernel unconditionally, hence grandfather "f16").
+/// Version 3: flash (the prefill attention kernel; every earlier binary ran
+/// the candle sdpa prefill — today's classic path — hence grandfather
+/// "classic").
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField { name: "moe_impl", introduced: 1, grandfather: None },
     ProvenanceField { name: "seq_len", introduced: 1, grandfather: None },
@@ -48,6 +51,7 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField { name: "attn_mm", introduced: 1, grandfather: None },
     ProvenanceField { name: "attn_glue", introduced: 1, grandfather: None },
     ProvenanceField { name: "sdpa", introduced: 2, grandfather: Some("f16") },
+    ProvenanceField { name: "flash", introduced: 3, grandfather: Some("classic") },
 ];
 
 /// Look up a field's introduction record by name.
@@ -99,6 +103,11 @@ mod tests {
         assert_eq!(resolve_missing("sdpa", 1), Some("f16"));
         // ... while missing at/after v2 stays a hard failure.
         assert_eq!(resolve_missing("sdpa", 2), None);
+        // flash introduced at v3: v1/v2 dumps missing it resolve to "classic"
+        // (their binaries ran the candle sdpa prefill); missing at v3 fails.
+        assert_eq!(resolve_missing("flash", 1), Some("classic"));
+        assert_eq!(resolve_missing("flash", 2), Some("classic"));
+        assert_eq!(resolve_missing("flash", 3), None);
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

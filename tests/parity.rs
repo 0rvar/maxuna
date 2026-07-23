@@ -123,12 +123,12 @@ struct Provenance {
     /// provenance field — the gate hard-fails on that per side (same reasoning as
     /// `attn_dtype`).
     combine: Option<String>,
-    /// Attention prefill gemm path: "classic" (the shipped simdgroup default),
-    /// "tensor" (`LAGUNA_ATTN_MM_TENSOR`, the opt-in Metal-4 cooperative-tensor
-    /// kernel), or "f32-bypass" (`LAGUNA_ATTN_F32` — attention runs the legacy
-    /// dequant-f32 QMatMul, so the f16 library's mm branch never runs). `None` for
-    /// dumps predating the field — the gate hard-fails on that per side (same
-    /// reasoning as `attn_dtype`).
+    /// Attention prefill gemm path: "tensor" (the shipped Metal-4
+    /// cooperative-tensor default), "classic" (the simdgroup kernel, under the
+    /// `LAGUNA_ATTN_MM_CLASSIC` kill-switch), or "f32-bypass" (`LAGUNA_ATTN_F32`
+    /// — attention runs the legacy dequant-f32 QMatMul, so the f16 library's mm
+    /// branch never runs). `None` for dumps predating the field — the gate
+    /// hard-fails on that per side (same reasoning as `attn_dtype`).
     attn_mm: Option<String>,
     /// Attention-glue path (fused softplus gate / permute-cast copies /
     /// partial-rotary rope): "fused" (the shipped vendored kernels) or "classic"
@@ -144,6 +144,12 @@ struct Provenance {
     /// unconditionally, so a v1 dump missing the field resolves to "f16";
     /// missing at v2+ is the stale-binary hard fail.
     sdpa: Option<String>,
+    /// Prefill attention kernel: "fused" (the vendored flash kernel, the Metal
+    /// default) or "classic" (the candle sdpa chain, `LAGUNA_FLASH_CLASSIC`).
+    /// Introduced at schema version 3 with grandfather "classic" — every
+    /// earlier binary ran the candle sdpa prefill, so a v1/v2 dump missing the
+    /// field resolves to "classic"; missing at v3+ is the stale-binary hard fail.
+    flash: Option<String>,
 }
 
 impl Provenance {
@@ -236,6 +242,12 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
             // version-aware check); present-but-not-a-string is malformed.
             sdpa: match p.get("sdpa") {
                 Some(d) => Some(d.as_str().context("provenance `sdpa` is not a string")?.to_string()),
+                None => None,
+            },
+            // Absent in schema-version-1/2 dumps (grandfathered to "classic" by
+            // the version-aware check); present-but-not-a-string is malformed.
+            flash: match p.get("flash") {
+                Some(d) => Some(d.as_str().context("provenance `flash` is not a string")?.to_string()),
                 None => None,
             },
         })),
@@ -522,9 +534,10 @@ fn check_combine(p: &Provenance, side: &str, want: &str) -> Result<()> {
 /// Enforce the attention prefill gemm path recorded in one side's provenance.
 /// `want` is "f32-bypass" for the Reference-oracle side and strict-tier candidates
 /// (both run under `LAGUNA_ATTN_F32=1`, which bypasses the f16 library's mm
-/// branch), and "classic" for the mm/decode/ppl candidates that grade the shipped
-/// simdgroup prefill kernel — except when a gate run opts in to grading the
-/// tensor path via `LAGUNA_PARITY_EXPECT_ATTN_MM` (see `expected_attn_mm`).
+/// branch — the mm kill-switch is moot there), and "tensor" for the mm/decode/ppl
+/// candidates that grade the shipped cooperative-tensor prefill kernel — except
+/// when a gate run opts in to grading the `LAGUNA_ATTN_MM_CLASSIC` kill-switch
+/// path via `LAGUNA_PARITY_EXPECT_ATTN_MM` (see `expected_attn_mm`).
 fn check_attn_mm(p: &Provenance, side: &str, want: &str) -> Result<()> {
     check_field(p, side, "attn_mm", p.attn_mm.as_deref(), want)
 }
@@ -560,13 +573,36 @@ fn expected_sdpa() -> String {
 }
 
 /// Experiment hook (docs/parity.md §3b): the attention prefill gemm path
-/// expected of mm/decode/ppl CANDIDATES. Default "classic" (the shipped
-/// simdgroup kernel); `LAGUNA_PARITY_EXPECT_ATTN_MM` overrides it so an
-/// experiment gate run can grade `LAGUNA_ATTN_MM_TENSOR` candidates
-/// (parity-gate.ts `--attn-mm-tensor` sets both ends). References and strict
-/// candidates stay pinned to "f32-bypass".
+/// expected of mm/decode/ppl CANDIDATES. Default "tensor" (the shipped
+/// cooperative-tensor kernel); `LAGUNA_PARITY_EXPECT_ATTN_MM` overrides it so
+/// an A/B gate run can grade `LAGUNA_ATTN_MM_CLASSIC` candidates
+/// (parity-gate.ts `--attn-mm-classic` sets both ends). References and strict
+/// candidates stay pinned to "f32-bypass" (they run under `LAGUNA_ATTN_F32=1`,
+/// so the f16 library's mm branch never runs at all).
 fn expected_attn_mm() -> String {
-    std::env::var("LAGUNA_PARITY_EXPECT_ATTN_MM").unwrap_or_else(|_| "classic".to_string())
+    std::env::var("LAGUNA_PARITY_EXPECT_ATTN_MM").unwrap_or_else(|_| "tensor".to_string())
+}
+
+/// Enforce the prefill attention kernel recorded in one side's provenance.
+/// "classic" (the candle sdpa chain, `LAGUNA_FLASH_CLASSIC=1`) is what every
+/// reference and strict candidate must carry — the oracle and the strict
+/// anchor are pinned off the flash kernel; mm/decode/ppl candidates expect
+/// "fused" (the shipped vendored flash prefill) unless a gate run opts out via
+/// `LAGUNA_PARITY_EXPECT_FLASH` (see `expected_flash`). Introduced at schema
+/// version 3: a v1/v2 dump missing the field is grandfathered to "classic" by
+/// `check_field` — that keeps the pre-flash reference dumps valid.
+fn check_flash(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "flash", p.flash.as_deref(), want)
+}
+
+/// Experiment hook (docs/parity.md §3b): the prefill attention kernel expected
+/// of mm/decode/ppl CANDIDATES. Default "fused" (the shipped flash kernel);
+/// `LAGUNA_PARITY_EXPECT_FLASH` overrides it so an A/B gate run can grade
+/// `LAGUNA_FLASH_CLASSIC` candidates (parity-gate.ts `--flash-classic` sets
+/// both ends). References and strict candidates are never overridable — they
+/// anchor the oracle.
+fn expected_flash() -> String {
+    std::env::var("LAGUNA_PARITY_EXPECT_FLASH").unwrap_or_else(|_| "fused".to_string())
 }
 
 fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
@@ -594,6 +630,9 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             // The oracle always runs the shipped f16 sdpa kernel (the
             // LAGUNA_SDPA_F32 experiment hook is candidate-only).
             check_sdpa(p, "reference dump", "f16")?;
+            // The oracle's prefill is pinned off the flash kernel
+            // (LAGUNA_FLASH_CLASSIC=1, parity-gate.ts referenceEnv()).
+            check_flash(p, "reference dump", "classic")?;
         }
         Some(p) => bail!(
             "reference dump provenance.moe_impl is {:?}, expected \"reference\": the reference side \
@@ -664,9 +703,10 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     }
 
     // EVERY tier also pins the CANDIDATE's attention prefill gemm path: strict runs
-    // under LAGUNA_ATTN_F32 (f16 library bypassed → "f32-bypass"), while mm and
-    // decode grade the shipped classic simdgroup prefill kernel by default —
-    // overridable per gate run via LAGUNA_PARITY_EXPECT_ATTN_MM (experiment hook).
+    // under LAGUNA_ATTN_F32 (f16 library bypassed → "f32-bypass"; the classic path
+    // strict anchors never dispatches the mm branch), while mm and decode grade the
+    // shipped cooperative-tensor prefill kernel by default — overridable per gate
+    // run via LAGUNA_PARITY_EXPECT_ATTN_MM (experiment hook).
     // Candidate provenance is already proven Some by the attn_dtype check above.
     let want_attn_mm = match tier {
         Tier::Strict => "f32-bypass".to_string(),
@@ -746,6 +786,19 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     };
     if let Some(p) = &candidate.provenance {
         check_attn_glue(p, "candidate dump", want_attn_glue)?;
+    }
+
+    // EVERY tier also pins the CANDIDATE's prefill attention kernel (like
+    // sdpa): strict grades the candle sdpa chain (candidate produced under
+    // LAGUNA_FLASH_CLASSIC=1 → "classic"), mm/decode grade the shipped flash
+    // kernel ("fused") by default — overridable per gate run via
+    // LAGUNA_PARITY_EXPECT_FLASH (A/B hook, parity-gate.ts --flash-classic).
+    let want_flash = match tier {
+        Tier::Strict => "classic".to_string(),
+        Tier::Mm | Tier::Decode => expected_flash(),
+    };
+    if let Some(p) = &candidate.provenance {
+        check_flash(p, "candidate dump", &want_flash)?;
     }
 
     // Non-finite candidate logits are a hard failure in EVERY tier: a NaN/Inf
@@ -1000,6 +1053,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_attn_mm(p, "reference-greedy.json", "f32-bypass")?;
             check_attn_glue(p, "reference-greedy.json", "classic")?;
             check_sdpa(p, "reference-greedy.json", "f16")?;
+            check_flash(p, "reference-greedy.json", "classic")?;
         }
         Some(p) => bail!(
             "reference-greedy.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate \
@@ -1022,6 +1076,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_attn_mm(p, "candidate-greedy.json", &expected_attn_mm())?;
             check_attn_glue(p, "candidate-greedy.json", "fused")?;
             check_sdpa(p, "candidate-greedy.json", &expected_sdpa())?;
+            check_flash(p, "candidate-greedy.json", &expected_flash())?;
         }
         Some(p) => bail!(
             "candidate-greedy.json (replay) provenance.moe_impl is {:?}, expected \"fused\"; the \
@@ -1244,6 +1299,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_attn_mm(p, "reference-ppl.json", "f32-bypass")?;
             check_attn_glue(p, "reference-ppl.json", "classic")?;
             check_sdpa(p, "reference-ppl.json", "f16")?;
+            check_flash(p, "reference-ppl.json", "classic")?;
         }
         Some(p) => bail!(
             "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
@@ -1265,6 +1321,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_attn_mm(p, "candidate-ppl.json", &expected_attn_mm())?;
             check_attn_glue(p, "candidate-ppl.json", "fused")?;
             check_sdpa(p, "candidate-ppl.json", &expected_sdpa())?;
+            check_flash(p, "candidate-ppl.json", &expected_flash())?;
         }
         Some(p) => bail!(
             "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
@@ -1372,9 +1429,9 @@ fn prov(moe_impl: &str) -> Provenance {
         attn_dtype: Some(if moe_impl == "reference" { "f32" } else { "f16" }.to_string()),
         combine: Some(if moe_impl == "reference" { "reference" } else { "fused" }.to_string()),
         // Reference runs under LAGUNA_ATTN_F32 (f16 library bypassed); fused
-        // candidates run the shipped classic prefill kernel. Strict-tier candidate
+        // candidates run the shipped tensor prefill kernel. Strict-tier candidate
         // tests override this to "f32-bypass".
-        attn_mm: Some(if moe_impl == "reference" { "f32-bypass" } else { "classic" }.to_string()),
+        attn_mm: Some(if moe_impl == "reference" { "f32-bypass" } else { "tensor" }.to_string()),
         // Reference runs under LAGUNA_ATTN_GLUE_CLASSIC (the oracle executes the
         // attention glue too, anchored to the candle chains by the env pin);
         // fused candidates run the shipped fused glue kernels. Strict-tier
@@ -1383,6 +1440,10 @@ fn prov(moe_impl: &str) -> Provenance {
         // Both runners execute the shipped f16 sdpa kernel (the LAGUNA_SDPA_F32
         // experiment hook is opt-in and never blessed).
         sdpa: Some("f16".to_string()),
+        // Reference runs under LAGUNA_FLASH_CLASSIC (the oracle's prefill is
+        // pinned off the flash kernel); fused candidates run the shipped flash
+        // prefill. Strict-tier candidate tests override this to "classic".
+        flash: Some(if moe_impl == "reference" { "classic" } else { "fused" }.to_string()),
     }
 }
 
@@ -1494,10 +1555,11 @@ fn greedy_gate_rejects_wrong_or_missing_combine() {
 
 #[test]
 fn greedy_gate_rejects_wrong_or_missing_attn_mm() {
-    // The decode gate grades the shipped classic prefill kernel; a candidate replay
-    // produced under LAGUNA_ATTN_MM_TENSOR ran the tensor kernel instead.
+    // The decode gate grades the shipped tensor prefill kernel; a candidate replay
+    // produced under LAGUNA_ATTN_MM_CLASSIC ran the classic simdgroup kernel
+    // instead.
     let (r, mut c) = valid_pair();
-    c.provenance.as_mut().unwrap().attn_mm = Some("tensor".to_string());
+    c.provenance.as_mut().unwrap().attn_mm = Some("classic".to_string());
     let err = greedy_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("attn_mm"), "unexpected error: {err}");
     // A candidate provenance missing the attn_mm field predates it — hard fail.
@@ -1775,11 +1837,11 @@ fn compare_pins_candidate_attn_dtype_per_tier() {
 #[test]
 fn compare_requires_reference_attn_mm() {
     let candidate = tiny_dump(Some(prov("fused")));
-    // Reference regenerated WITHOUT LAGUNA_ATTN_F32 (its mm branch ran the classic
-    // kernel instead of being bypassed) → hard fail every tier.
-    let mut classic_ref = prov("reference");
-    classic_ref.attn_mm = Some("classic".to_string());
-    let err = compare(&candidate, &tiny_dump(Some(classic_ref)), Tier::Strict).unwrap_err().to_string();
+    // Reference regenerated WITHOUT LAGUNA_ATTN_F32 (its mm branch ran the shipped
+    // tensor kernel instead of being bypassed) → hard fail every tier.
+    let mut tensor_ref = prov("reference");
+    tensor_ref.attn_mm = Some("tensor".to_string());
+    let err = compare(&candidate, &tiny_dump(Some(tensor_ref)), Tier::Strict).unwrap_err().to_string();
     assert!(err.contains("attn_mm"), "unexpected error: {err}");
     // Reference from a binary predating the attn_mm field must also hard-fail.
     let mut stale_ref = prov("reference");
@@ -1792,21 +1854,21 @@ fn compare_requires_reference_attn_mm() {
 fn compare_pins_candidate_attn_mm_per_tier() {
     let reference = tiny_dump(Some(prov("reference")));
 
-    // strict runs under LAGUNA_ATTN_F32 (f16 library bypassed): a "classic"
+    // strict runs under LAGUNA_ATTN_F32 (f16 library bypassed): a "tensor"
     // candidate (the shipped default, i.e. LAGUNA_ATTN_F32 forgotten) must be
     // rejected. It first clears strict's f32 attn_dtype pin to reach the attn_mm check.
     let mut p = prov("fused");
     p.attn_dtype = Some("f32".to_string());
-    // attn_mm defaults to "classic" — wrong for strict.
+    // attn_mm defaults to "tensor" — wrong for strict, which pins "f32-bypass".
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
     assert!(err.contains("attn_mm"), "unexpected error: {err}");
 
-    // mm and decode grade the shipped classic prefill kernel: a "tensor"
-    // (LAGUNA_ATTN_MM_TENSOR) or "f32-bypass" candidate ran the wrong path. (The
+    // mm and decode grade the shipped tensor prefill kernel: a "classic"
+    // (LAGUNA_ATTN_MM_CLASSIC) or "f32-bypass" candidate ran the wrong path. (The
     // mm candidate must be mm-active to reach the attn_mm check.)
     let mut p = prov("fused");
     p.seq_len = p.mm_min_seq;
-    p.attn_mm = Some("tensor".to_string());
+    p.attn_mm = Some("classic".to_string());
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
     assert!(err.contains("attn_mm"), "unexpected error: {err}");
     let mut p = prov("fused");
@@ -1930,6 +1992,75 @@ fn sdpa_missing_grandfathered_at_schema_version_1() {
 }
 
 #[test]
+fn compare_pins_candidate_flash_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // strict grades the candle sdpa prefill: a candidate on the default flash
+    // kernel (LAGUNA_FLASH_CLASSIC forgotten) must be rejected. It must first
+    // clear every other strict pin to reach the flash check (the last one).
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    p.attn_mm = Some("f32-bypass".to_string());
+    p.no_mm_id = true;
+    p.combine = Some("classic".to_string());
+    p.attn_glue = Some("classic".to_string());
+    // flash defaults to "fused" — wrong for strict.
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("flash"), "unexpected error: {err}");
+
+    // mm/decode grade the fused flash prefill: a "classic" candidate ran the
+    // wrong path (unless the gate run opts out via LAGUNA_PARITY_EXPECT_FLASH).
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq; // mm-active
+    p.flash = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("flash"), "unexpected error: {err}");
+    let mut p = prov("fused");
+    p.flash = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("flash"), "unexpected error: {err}");
+
+    // A reference that ran the flash kernel moved the oracle's anchor.
+    let mut r = prov("reference");
+    r.flash = Some("fused".to_string());
+    let err = compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("flash"), "unexpected error: {err}");
+}
+
+#[test]
+fn flash_missing_at_current_version_hard_fails() {
+    // A dump claiming the current schema version but missing flash came from a
+    // stale/doctored binary: hard fail, both sides.
+    let reference = tiny_dump(Some(prov("reference")));
+    let mut p = prov("fused");
+    p.flash = None;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no flash"), "unexpected error: {err}");
+
+    let mut r = prov("reference");
+    r.flash = None;
+    let err = compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no flash"), "unexpected error: {err}");
+}
+
+#[test]
+fn flash_missing_grandfathered_at_schema_version_2() {
+    // A v2 REFERENCE dump (written before the flash field existed) resolves the
+    // missing field to the grandfather "classic" — exactly what the reference
+    // pin expects, so pre-flash reference dumps stay valid. The current-build
+    // candidate carries flash "fused" and passes the decode expectation.
+    let mut r = prov("reference");
+    r.schema_version = 2;
+    r.flash = None;
+    compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .expect("v2 references without flash must be grandfathered to classic and pass");
+}
+
+#[test]
 fn v1_baseline_fields_hard_fail_missing_at_any_version() {
     // The version-1 baseline fields have no grandfather: missing is a hard
     // fail even from a dump that (correctly) claims schema version 1 — the
@@ -1975,6 +2106,9 @@ fn load_dump_defaults_missing_schema_version_to_v1() {
     assert_eq!(prov.sdpa, None);
     check_sdpa(&prov, "reference dump", "f16")
         .expect("missing sdpa at v1 must grandfather to f16");
+    assert_eq!(prov.flash, None);
+    check_flash(&prov, "reference dump", "classic")
+        .expect("missing flash at v1 must grandfather to classic");
 }
 
 #[test]
@@ -2003,7 +2137,8 @@ fn load_dump_rejects_future_schema_version() {
 /// The committed ppl reference fixture must stay valid under the current
 /// checks without regeneration — the whole point of schema versioning. This
 /// runs the exact reference-side pins `ppl_compare` applies (it is v1-shaped:
-/// no schema_version, no sdpa → grandfathered "f16").
+/// no schema_version, no sdpa → grandfathered "f16", no flash → grandfathered
+/// "classic").
 #[test]
 fn committed_ppl_reference_fixture_stays_valid() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference-ppl.json");
@@ -2016,6 +2151,7 @@ fn committed_ppl_reference_fixture_stays_valid() {
     check_attn_mm(&p, "reference-ppl.json", "f32-bypass").unwrap();
     check_attn_glue(&p, "reference-ppl.json", "classic").unwrap();
     check_sdpa(&p, "reference-ppl.json", "f16").unwrap();
+    check_flash(&p, "reference-ppl.json", "classic").unwrap();
 }
 
 #[test]
@@ -2212,10 +2348,10 @@ fn ppl_gate_rejects_wrong_or_missing_combine() {
 
 #[test]
 fn ppl_gate_rejects_wrong_or_missing_attn_mm() {
-    // The ppl gate grades the shipped classic prefill kernel; a candidate produced
-    // under LAGUNA_ATTN_MM_TENSOR ran the tensor kernel instead.
+    // The ppl gate grades the shipped tensor prefill kernel; a candidate produced
+    // under LAGUNA_ATTN_MM_CLASSIC ran the classic simdgroup kernel instead.
     let (r, mut c) = valid_ppl_pair();
-    c.provenance.as_mut().unwrap().attn_mm = Some("tensor".to_string());
+    c.provenance.as_mut().unwrap().attn_mm = Some("classic".to_string());
     let err = ppl_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("attn_mm"), "unexpected error: {err}");
     // A reference from a binary predating the attn_mm field must hard-fail (the

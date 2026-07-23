@@ -1,11 +1,10 @@
 // Vendored Metal-4 cooperative-tensor port of the f16-weight x f32-activation
 // attention PREFILL gemm — the tensor analogue of f16.metal's classic simdgroup
-// kernel_mul_mm_f16_f32_v. OPT-IN via LAGUNA_ATTN_MM_TENSOR (the classic kernel
-// is the shipped default; the tensor path's f16 activation staging flipped a
-// 0.6-margin reference decode decision outside the fork envelope — see
-// docs/parity.md §3b). When opted in it serves matmul_f16's mm branch
-// (ne11 >= 8); the decode gemv (ne11 < 8) never reaches here — it always runs
-// f16.metal's classic kernel_mul_mv_f16_f32_v.
+// kernel_mul_mm_f16_f32_v. The SHIPPED DEFAULT for matmul_f16's mm branch
+// (ne11 >= 8); LAGUNA_ATTN_MM_CLASSIC reverts to the classic simdgroup kernel
+// (the f16 activation staging here is one extra rounding over the classic
+// float tiles — see docs/parity.md §3b). The decode gemv (ne11 < 8) never
+// reaches here — it always runs f16.metal's classic kernel_mul_mv_f16_f32_v.
 //
 // One tensor instantiation, half operand tiles: the f32 activation is staged to
 // half (matmul2d over HALF cooperative tensors is the only instantiation the

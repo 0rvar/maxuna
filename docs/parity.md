@@ -298,18 +298,22 @@ kernels and they have different (both correct) numerical envelopes vs the f32
     `"f32"` (strict gates the legacy f32 attention path); mm/decode/ppl candidates
     must be `"f16"` (the shipped default). A dump missing the field came from a stale
     `logits-dump` binary and hard-fails (regenerate).
-  - `attn_mm` (the attention prefill gemm path) is pinned per side in EVERY tier
-    the same way: reference and strict candidates must be `"f32-bypass"`
+  - `attn_mm` (the attention prefill gemm path) is pinned per side in EVERY tier:
+    reference and strict candidates must be `"f32-bypass"`
     (`LAGUNA_ATTN_F32` routes attention through the legacy dequant-f32 QMatMul, so
-    the f16 library's mm branch never runs), while the mm/decode/ppl candidate paths
-    run the shipped classic simdgroup attention prefill gemm and must be
-    `"classic"`. A Metal-4 cooperative-tensor prefill gemm (`f16_t.metal`) exists as
-    an opt-in (`LAGUNA_ATTN_MM_TENSOR` → `"tensor"`), but it was rejected as the
-    default by the decode gate on 2026-07-23: its f16 activation staging flips a
-    0.6-margin reference decision at code-short step 29 (a flip the fork itself does
-    NOT make — the fork agrees with the reference there), so our drift exceeds the
-    fork envelope. It is kept for future numerics work. A dump missing the field is
-    a stale binary and hard-fails (regenerate).
+    the f16 library's mm branch never runs; the strict/reference envs additionally
+    pin `LAGUNA_ATTN_MM_CLASSIC=1` as belt-and-suspenders), while the mm/decode/ppl
+    candidate paths run the SHIPPED default — the Metal-4 cooperative-tensor
+    prefill gemm (`f16_t.metal`) — and must be `"tensor"`
+    (`LAGUNA_ATTN_MM_CLASSIC` reverts to the classic simdgroup gemm →
+    `"classic"`). History: tensor was REJECTED as default on 2026-07-23 morning
+    (its f16 activation staging flipped a 0.6-margin reference decision at
+    code-short step 29 — a flip the fork does not make), then UNLOCKED the same
+    day by the flash-attention kernel's f32 sdpa boundaries (the drift-attribution
+    experiment proved f16 sdpa was AMPLIFYING the staging noise; with flash, the
+    flash+tensor matrix passes all six gates) and flipped to default
+    owner-approved. A dump missing the field is a stale binary and hard-fails
+    (regenerate).
   - `attn_glue` (the attention-glue path: the fused softplus gate, the fused
     permute/cast copies, and the fused partial-rotary rope — all vendored kernels
     behind ONE kill-switch, `LAGUNA_ATTN_GLUE_CLASSIC`) is pinned per side in EVERY
@@ -328,15 +332,34 @@ kernels and they have different (both correct) numerical envelopes vs the f32
     blessed anchor ran the f16 kernel); mm/decode/ppl candidates expect `"f16"`
     by default. Introduced at provenance schema version 2 with grandfather
     `"f16"` (see the versioning note below), so pre-versioning dumps stay valid.
+  - `flash` (the prefill attention path: `"fused"` = the vendored flash
+    kernel in `src/ops/flash.metal` — f32 Q/output boundaries, f16 K/V
+    cache reads, in-kernel causal+SWA-window masking with block skip, no
+    mask tensor; `"classic"` = candle sdpa + materialized f16 mask, the
+    `LAGUNA_FLASH_CLASSIC` kill-switch) is pinned per side: references and
+    strict candidates must be `"classic"` (the gate script pins the env for
+    both — every blessed strict/reference anchor ran the classic path);
+    mm/decode/ppl candidates grade the shipped flash kernel and must be
+    `"fused"`, overridable via `LAGUNA_PARITY_EXPECT_FLASH` (the
+    `--flash-classic` gate flag sets env + override together for A/B runs).
+    Introduced at provenance schema version 3 with grandfather `"classic"`.
+    The flash path is value-identical to the `--sdpa-f32` experiment
+    configuration by construction (bitwise unit tests in `src/ops/flash.rs`
+    against the composed f32-sdpa reference), which the model-level gate
+    confirmed: flash-default mm cos and Δnll match the sdpa-f32-only matrix
+    column digit-for-digit.
   - **Experiment expectation overrides.** The mm/decode/ppl CANDIDATE
-    expectations for `sdpa` and `attn_mm` are overridable per gate run via
-    `LAGUNA_PARITY_EXPECT_SDPA` (e.g. `f32`) and `LAGUNA_PARITY_EXPECT_ATTN_MM`
-    (e.g. `tensor`), read by `tests/parity.rs`. This is how an opt-in path
-    (f32 sdpa, tensor attention prefill) gets graded against the real oracle
-    without editing the test; `parity-gate.ts --sdpa-f32` / `--attn-mm-tensor`
-    set the candidate env and the matching override together and print a
-    prominent EXPERIMENT banner. Reference-side and strict-tier pins are never
-    overridable — they anchor the oracle.
+    expectations for `sdpa`, `attn_mm`, and `flash` are overridable per gate
+    run via `LAGUNA_PARITY_EXPECT_SDPA` (e.g. `f32`),
+    `LAGUNA_PARITY_EXPECT_ATTN_MM` (e.g. `classic`), and
+    `LAGUNA_PARITY_EXPECT_FLASH` (e.g. `classic`), read by
+    `tests/parity.rs`. This is how a non-default path (f32 sdpa, classic
+    projections gemm, classic sdpa fallback) gets graded against the real
+    oracle without editing the test; `parity-gate.ts --sdpa-f32` /
+    `--attn-mm-classic` / `--flash-classic` set the candidate env and the
+    matching override together and print a prominent EXPERIMENT banner.
+    Reference-side and strict-tier pins are never overridable — they anchor
+    the oracle.
   - Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE must prove the mm_id path was
     actually active — `moe_impl == "fused"`, `seq_len >= mm_min_seq`,
     `no_mm_id == false` — else the gate hard-fails asking you to regenerate.
@@ -366,11 +389,12 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   `mm_min_seq`, `no_mm_id`, `attn_dtype`, `combine`, `attn_mm`, `attn_glue`), all
   REQUIRED with no grandfathering — the references regenerated at that era carry
   every one, so a v1 dump missing any of them is genuinely stale, not merely old.
-  A field introduced at version N (e.g. `sdpa`: N=2, grandfather `"f16"`) resolves
-  to its grandfather value when missing from a dump whose version predates N —
-  adding a field therefore no longer invalidates existing references — while
-  missing at/after N remains the stale-binary hard fail. A dump claiming a version
-  NEWER than the gate binary knows is rejected (rebuild the test binary).
+  A field introduced at version N (e.g. `sdpa`: N=2, grandfather `"f16"`;
+  `flash`: N=3, grandfather `"classic"`) resolves to its grandfather value when
+  missing from a dump whose version predates N — adding a field therefore no
+  longer invalidates existing references — while missing at/after N remains the
+  stale-binary hard fail. A dump claiming a version NEWER than the gate binary
+  knows is rejected (rebuild the test binary).
 
   **Why forced replay, not free-run.** Comparing two free-running greedy decodes
   cascades at the first near-tie: the moment the two engines pick different
