@@ -314,8 +314,11 @@ kernels and they have different (both correct) numerical envelopes vs the f32
     flash+tensor matrix passes all six gates) and flipped to default
     owner-approved. A dump missing the field is a stale binary and hard-fails
     (regenerate).
-  - `attn_glue` (the attention-glue path: the fused softplus gate, the fused
-    permute/cast copies, and the fused partial-rotary rope — all vendored kernels
+  - `attn_glue` (the attention-glue path: the fused softplus gate — which also
+    reads the decode sdpa's f16 output directly, an exact widen — the fused
+    permute/cast copies, and the fused partial-rotary rope, whose store can
+    round straight to f16 for k and decode q, folding the old standalone
+    post-rope casts; all vendored kernels
     behind ONE kill-switch, `LAGUNA_ATTN_GLUE_CLASSIC`) is pinned per side in EVERY
     tier: reference dumps and strict candidates must be `"classic"` (the gate
     script pins the env var for both — unlike `combine`, the Reference oracle

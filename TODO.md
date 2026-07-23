@@ -22,8 +22,9 @@
    f32, ggml's convention) after two rejected intermediates (all-f16 chain,
    cast-based hybrid) — full arc + lessons in docs/log.md. `LAGUNA_ATTN_F32`
    kill-switch; strict tier + reference dumps pin it.
-   (b) fuse the remaining attention glue (~6 ms sustained: QK-norm, rope,
-   softplus, casts around sdpa) — NEXT; (c) MoE mv_id gather latency (~14 ms
+   (b) fuse the remaining attention glue — DONE via 3(c) glue fusion + the
+   glue phase 2 ledger item (3 more cast dispatches/layer folded);
+   (c) MoE mv_id gather latency (~14 ms
    sustained vs ~7 ms bandwidth floor) folds into P2. Same-mode power
    calibration DONE 2026-07-22: decode parity vs fork CONFIRMED in both power
    modes (18.2/18.5 LPM, 38.6/39.2 full); fork's historical bench figures were
@@ -82,8 +83,16 @@
    301.5/303.3 with tensor (0.85x/0.87x fork); all six gates pass in both
    configs; the sdpa/mask/transpose+cast rows of the sub-budget above are
    gone or absorbed on the flash path.
-4. **MoE-block encoder takeover** (ledger item below) — concurrency +
-   range-tracked barriers; now also owns the demoted routing-glue fusion.
+4. **MoE-block encoder takeover — CLOSED 2026-07-23, premise REFUTED**
+   (ledger item below has the full analysis): a static trace of candle's
+   hazard tracker over one layer's 51 dispatches shows 37 barriers, all true
+   RAW dependencies (whole-buffer keying adds ~0-3 false barriers worst case,
+   <1% of GPU time), and the independent fat ops already share barrier-free
+   windows; empirical bracket `CANDLE_METAL_COMPUTE_PER_BUFFER=1` (one
+   encoder per dispatch, max serialization) leaves prefill IDENTICAL
+   (304.0 tok/s both ways). Scheduling is not where the remaining prefill
+   gap lives — the fork's edge is per-kernel efficiency. The demoted
+   routing-glue fusion dies with it (~1%, measured twice).
 5. **mmap + no-copy model load** (see ledger item below) — dev-velocity
    multiplier: every parity/bench cycle pays ~30 s/load today.
 6. **DFlash speculative decoding** — multiplies whatever decode speed exists,
@@ -207,8 +216,38 @@
     attention per-layer dispatch chain (48.6 ms). DECIDED (Orvar, 2026-07-22):
     vendored stays the default — insulates these two paths from upstream candle
     kernel changes; `LAGUNA_MV_CLASSIC` remains the escape hatch.
-- [ ] **MoE-block encoder takeover: concurrency + range-tracked barriers**
-  (deferred follow-up to P2, decided 2026-07-22) — the fork's 2x prefill edge on
+- [x] **MoE-block encoder takeover — CLOSED 2026-07-23, REFUTED before
+  build.** The re-measure-first clause below fired: a static simulation of
+  candle's verified tracker semantics (encoder.rs:104-149: RAW checked vs the
+  accumulated window, WAR/WAW on outputs; barrier = global
+  MTLBarrierScope::Buffers, window resets to the triggering dispatch) over
+  the full 51-dispatch default-prefill layer trace found 37 barriers — ALL
+  true producer→consumer RAW deps in a near-linear chain. Whole-buffer
+  keying adds ~0-3 false barriers worst case (<1% GPU time): candle's pool
+  only recycles buffers whose producing Tensor dropped (strong_count==1,
+  device.rs:294-311/472-486), so live producers never alias, and weights are
+  input-only (never enter the hazard write-set → read-read can't barrier).
+  The independent fat ops ({g,q,k,v} projections, mm_id gate/up,
+  combine+shared-expert matmuls) ALREADY sit together in barrier-free
+  windows; the hard RAW spine (flash, o_proj, mm_id-down, residuals) can't
+  be reordered around. The fork's mechanism was also re-read: its barrier is
+  EQUALLY coarse (one memory_barrier + full mem_ranges reset,
+  ggml-metal-common.cpp:124-153); its wins are byte-range precision (which
+  candle's allocator makes moot here) and reorder (which has nothing left to
+  pack); at batch=1 it encodes on 1-2 threads, warning >2 degrades.
+  EMPIRICAL BRACKET (2026-07-23, LPM): `CANDLE_METAL_COMPUTE_PER_BUFFER=1`
+  — one encoder per dispatch, i.e. maximal serialization + a fence-wait per
+  dispatch — leaves prefill-925 IDENTICAL at 304.0 tok/s (the 8-token decode
+  tail drops 26.8→19.3, confirming the knob works and only dispatch-scale
+  work cares). If 50x more fences cost prefill nothing, scheduling
+  improvements can't buy anything either. VERDICT: prefill is fat-kernel
+  compute-bound end to end; the remaining 0.86-0.90x fork gap is per-kernel
+  efficiency, not concurrency. Byte-range patch, own-encoder takeover, and
+  issue-order reorder are all dead ends here; the demoted routing-glue
+  fusion (~1%) dies with the item. Original premise + constraints kept below
+  for the record.
+  (original item, superseded:) deferred follow-up to P2, decided 2026-07-22
+  — the fork's 2x prefill edge on
   Metal is NOT fusion (it has no Metal topk_moe kernel; ~30 dispatches/block)
   but scheduling: one compute encoder with concurrent dispatch where a memory
   barrier is inserted ONLY when a dispatch's buffer ranges overlap a pending
@@ -239,15 +278,50 @@
   flipping the shared encoder's hazard state. Sequence AFTER 3(c) glue fusion:
   fewer, fatter kernels schedule better and the copies it removes are traffic
   concurrency could only overlap, not eliminate.
-- [ ] **Attention glue phase 2 — fold the remaining casts into neighbors**
-  (deferred from the 2026-07-23 glue fusion to keep unit boundaries): (a) fold
-  the post-sdpa f16→f32 cast into kernel_attn_gate (read f16 attn directly —
-  the widening is exact, so bit-identity holds); (b) fold the k-cache / q-sdpa
-  f16 casts into kernel_rope_neox's store (rounding the final f32 rope value
-  to f16 equals the separate cast's double rounding). Saves ~3 more
-  passes/layer over the largest attention tensors.
-- [ ] **Provenance schema version — kill the reference-regen tax** (proposed
-  2026-07-23, pending Orvar's go-ahead). Every new provenance field
+- [x] **Attention glue phase 2 — DONE 2026-07-23** (scope revised post-flash:
+  flash's f32 output had already killed the prefill post-sdpa cast, and the v
+  cast was already folded into permute_01_f16 — the map found prefill had
+  exactly ONE standalone traffic pass left). Landed: `kernel_rope_neox` is
+  templated on the store type (rope math stays f32; one RTNE rounding at the
+  f16 store = the old separate cast, passthrough dims included) —
+  `run_rope`/`Rope::apply_dt` take an out_dtype (F32/F16 only, enforced on
+  both the fused and chain paths); `kernel_attn_gate` templated on the attn
+  input type (f16 widened in-kernel, exact). Call-site policy: k rope-stores
+  f16 always on the fused path (feeds the f16 cache directly; the standalone
+  cast_f16(k) is gone); q rope-stores f16 only at seq==1 off the
+  LAGUNA_SDPA_F32 experiment (whose sdpa takes f32 q); flash prefill keeps
+  f32 q (flash requires it); decode consumes the sdpa f16 output straight
+  into the f16-input gate (post-sdpa cast_f32 gone). Decode v cast stays (v
+  is never roped — no fold target). No new kill-switch/provenance/schema:
+  bit-identical by construction, LAGUNA_ATTN_GLUE_CLASSIC path untouched.
+  Two new bitwise tests (rope f16-store vs f32+cast incl. n_rot=64
+  passthrough + q/k prefill/decode shapes; f16-input gate vs widen+f32
+  gate). All six gates PASS digit-exact at the pre-change anchors (strict
+  0.999057, mm 0.996564, decode 63/63/60 + 0 unexcused, Δnll 0.003426) with
+  references reused — model-level bit-identity confirmed. Bench (LPM):
+  prefill 304.7 → 304.0 @925 (flat), 303.8 → 311.9 @4k (+2.7%, the removed
+  k-cast pass scales with seq), decode 18.8 → 19.2 (±5% band, directionally
+  right — 3 dispatches/layer gone). Review round: Claude + Codex + GLM +
+  DeepSeek, zero correctness findings; applied hardening: dtype guard on the
+  rope chain fallback, q-decode shape added to the bitwise test.
+- [ ] **Prefill per-kernel efficiency vs fork — locate the ~0.9x gap**
+  (opened 2026-07-23 by the encoder-takeover refutation: scheduling is
+  exonerated, so the remaining prefill deficit — 304/312 vs the fork's
+  354/348 LPM — must live inside individual kernels). Plan: per-op GPU-time
+  comparison against the fork on the same shapes — our side via the existing
+  isolation benches (`prefill_attn_*`, mm_id/f16 bench modules) or xctrace;
+  fork side via GGML_METAL_PERF or xctrace on llama-bench. Suspects, by
+  share of prefill time: mm_id tensor-tile gemm vs ggml's mul_mm_id
+  (fork's simdgroup kernel may still win at Q4_K), the f16 projections
+  matmul2d vs ggml mul_mm_f16_f32, flash kernel vs ggml
+  flash_attn_ext_f16 (BQ/BK tiling + softmax layout differ), and candle's
+  rms_norm. NOTE the LPM caveat: compare ratios measured in the same power
+  mode only.
+- [x] **Provenance schema version — DONE 2026-07-23** (landed with the flash
+  work: PROVENANCE_SCHEMA_VERSION=3 in src/parity_schema.rs, `flash`
+  introduced at v3 grandfathered to "classic"; cached references survived
+  both the flash field and glue phase 2 with ZERO regen — the tax it was
+  built to kill). Original proposal: every new provenance field
   invalidates all cached/committed reference dumps (missing field = hard fail
   = ~40 min GPU regen; paid 3x now: combine, attn_mm, attn_glue). Fix: a
   PROVENANCE_SCHEMA_VERSION const shared by logits-dump and tests/parity.rs;

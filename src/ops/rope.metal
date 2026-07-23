@@ -53,16 +53,21 @@ typedef struct {
     int32_t pos;
 } rope_args;
 
-// src/dst: [heads, seq, head_dim] f32 contiguous. cos/sin: [max_ctx, n_rot/2]
-// f32 contiguous. One thread per (row, dim) element; threads with
-// n_rot/2 <= d < n_rot idle (their element is written by the paired thread at
-// d - n_rot/2, mirroring candle's one-thread-per-pair structure).
+// src: [heads, seq, head_dim] f32 contiguous. dst: same shape, OT (float or
+// half — the f16 variant computes the rotation in f32 exactly as the f32 one
+// and only ROUNDS THE FINAL STORE, one RTNE rounding, so it is bit-identical
+// to f32-rope + candle cast_f16; pass-through dims round identically). cos/sin:
+// [max_ctx, n_rot/2] f32 contiguous. One thread per (row, dim) element;
+// threads with n_rot/2 <= d < n_rot idle (their element is written by the
+// paired thread at d - n_rot/2, mirroring candle's one-thread-per-pair
+// structure).
+template <typename OT>
 kernel void kernel_rope_neox(
         constant rope_args & args   [[buffer(0)]],
         device const float * src    [[buffer(1)]],
         device const float * cos_t  [[buffer(2)]],
         device const float * sin_t  [[buffer(3)]],
-        device       float * dst    [[buffer(4)]],
+        device       OT    * dst    [[buffer(4)]],
         uint tid [[thread_position_in_grid]]) {
     const int n = args.heads * args.seq * args.head_dim;
     if ((int) tid >= n) {
@@ -72,8 +77,8 @@ kernel void kernel_rope_neox(
     const int row = (int) tid / args.head_dim; // h * seq + s
     if (d >= args.n_rot) {
         // Pass-through dims: the candle chain routes them through narrow + cat,
-        // pure copies.
-        dst[tid] = src[tid];
+        // pure copies (the f16 variant rounds them like candle's cast scalar).
+        dst[tid] = static_cast<OT>(src[tid]);
         return;
     }
     const int hlf = args.n_rot / 2; // (`half` is a Metal type keyword)
@@ -88,7 +93,16 @@ kernel void kernel_rope_neox(
     const int i_cs = (args.pos + s) * hlf + d;
     const float c = cos_t[i_cs];
     const float ss = sin_t[i_cs];
-    // candle reduce.metal `rope` body, verbatim (see file header).
-    dst[i1] = src[i1] * c - src[i2] * ss;
-    dst[i2] = src[i1] * ss + src[i2] * c;
+    // candle reduce.metal `rope` body, verbatim (see file header); the f32
+    // arithmetic is shared by both instantiations, only the store narrows.
+    dst[i1] = static_cast<OT>(src[i1] * c - src[i2] * ss);
+    dst[i2] = static_cast<OT>(src[i1] * ss + src[i2] * c);
 }
+
+// Per-instantiation typedefs: the output type is part of the kernel signature,
+// so (unlike ggml's char*-typed operands) one shared typedef cannot cover both.
+typedef decltype(kernel_rope_neox<float>) kernel_rope_neox_f32_t;
+typedef decltype(kernel_rope_neox<half>) kernel_rope_neox_f16_t;
+
+template [[host_name("kernel_rope_neox_f32")]] kernel kernel_rope_neox_f32_t kernel_rope_neox<float>;
+template [[host_name("kernel_rope_neox_f16")]] kernel kernel_rope_neox_f16_t kernel_rope_neox<half>;

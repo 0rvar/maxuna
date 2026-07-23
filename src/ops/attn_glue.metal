@@ -78,11 +78,15 @@ typedef struct {
 } attn_gate_args;
 
 // dst[h, s, d] = attn[h, s, d] * softplus_chain(gate[s, h]).
-// attn/dst are [n_head, seq, head_dim] f32 contiguous; gate is [seq, n_head]
-// f32 contiguous (the g_proj output layout). One thread per output element.
+// attn is [n_head, seq, head_dim] IT contiguous (float, or half for the decode
+// path's raw sdpa output — widened to f32 in-kernel, which is EXACT, so the
+// f16-input variant is bit-identical to cast_f32 + the f32 variant); dst is
+// the same shape f32; gate is [seq, n_head] f32 contiguous (the g_proj output
+// layout). One thread per output element.
+template <typename IT>
 kernel void kernel_attn_gate(
         constant attn_gate_args & args [[buffer(0)]],
-        device const float * attn      [[buffer(1)]],
+        device const IT    * attn      [[buffer(1)]],
         device const float * gate      [[buffer(2)]],
         device       float * dst       [[buffer(3)]],
         uint tid [[thread_position_in_grid]]) {
@@ -103,8 +107,16 @@ kernel void kernel_attn_gate(
     const float t = fma(e, 1.0f, 1.0f);
     const float tail = log(t);
     const float sp = relu + tail;
-    dst[tid] = attn[tid] * sp;
+    dst[tid] = static_cast<float>(attn[tid]) * sp;
 }
+
+// Per-instantiation typedefs: the input type is part of the kernel signature,
+// so one shared typedef cannot cover both.
+typedef decltype(kernel_attn_gate<float>) kernel_attn_gate_f32_t;
+typedef decltype(kernel_attn_gate<half>) kernel_attn_gate_f16_t;
+
+template [[host_name("kernel_attn_gate_f32")]] kernel kernel_attn_gate_f32_t kernel_attn_gate<float>;
+template [[host_name("kernel_attn_gate_f16")]] kernel kernel_attn_gate_f16_t kernel_attn_gate<half>;
 
 // Matches dispatch.rs PermuteArgs (#[repr(C)]). Source is [d0, d1, d2];
 // destination is [d1, d0, d2] (transpose of the first two dims). d0 == 1

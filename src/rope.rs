@@ -1,7 +1,7 @@
 use std::f64::consts::PI;
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 
 use crate::config::RopeKind;
 
@@ -92,21 +92,45 @@ impl Rope {
         Ok(Self { cos, sin, n_rot })
     }
 
-    /// q, k: [n_head, seq, head_dim]; positions pos..pos+seq.
+    /// q, k: [n_head, seq, head_dim]; positions pos..pos+seq. Both outputs f32.
     pub fn apply(&self, q: &Tensor, k: &Tensor, pos: usize) -> Result<(Tensor, Tensor)> {
-        Ok((self.rotate(q, pos)?, self.rotate(k, pos)?))
+        self.apply_dt(q, k, pos, DType::F32, DType::F32)
+    }
+
+    /// `apply` with per-tensor OUTPUT dtypes (f32 or f16). On the fused Metal
+    /// kernel an f16 request narrows only the final store (one RTNE rounding —
+    /// bit-identical to f32 rope + `cast_f16`), letting `AttnBlock::forward`
+    /// fold the standalone post-rope casts away: k feeds the f16 cache
+    /// directly, decode q feeds the f16 sdpa directly.
+    pub fn apply_dt(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        pos: usize,
+        q_dtype: DType,
+        k_dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        Ok((self.rotate(q, pos, q_dtype)?, self.rotate(k, pos, k_dtype)?))
     }
 
     /// Rotate the first `n_rot` dims of x (f32) with NEOX pairing (dim i with
-    /// i + n_rot/2); any trailing dims pass through untouched.
+    /// i + n_rot/2); any trailing dims pass through untouched. The result is
+    /// stored as `out_dtype` (f32, or f16 = the f32 result rounded once).
     ///
     /// On Metal the default is the fused single-pass kernel (ops::rope_neox),
     /// which folds the partial-rotary narrow/contiguous/cat glue into the rope
     /// itself and is bit-identical to the candle chain below (the attn_glue.rs
     /// bitwise test proves it). LAGUNA_ATTN_GLUE_CLASSIC (the shared
     /// attention-glue kill-switch) reverts to the chain; non-Metal devices
-    /// always run it.
-    fn rotate(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
+    /// always run it. (Fused-glue callers are the only ones that request f16;
+    /// the chain still honors it — via a trailing candle cast, the same
+    /// rounding — so the choice of path stays invisible.)
+    fn rotate(&self, x: &Tensor, pos: usize, out_dtype: DType) -> Result<Tensor> {
+        // F32/F16 is the contract on BOTH paths (the fused kernel enforces it;
+        // the chain must not silently accept more just because to_dtype can).
+        if !matches!(out_dtype, DType::F32 | DType::F16) {
+            anyhow::bail!("rope: out_dtype must be F32 or F16, got {out_dtype:?}");
+        }
         // (The fused kernel wants a contiguous input; AttnBlock always provides
         // one. A strided caller falls through to the chain, which narrows and
         // copies — the two paths are bit-identical, so the choice is invisible.)
@@ -114,7 +138,7 @@ impl Rope {
             && x.is_contiguous()
             && !crate::ops::attn_glue_classic()
         {
-            return crate::ops::rope_neox(x, &self.cos, &self.sin, pos, self.n_rot);
+            return crate::ops::rope_neox(x, &self.cos, &self.sin, pos, self.n_rot, out_dtype);
         }
         let (_, seq, head_dim) = x.dims3()?;
         let cos = self.cos.narrow(0, pos, seq)?;
@@ -130,7 +154,9 @@ impl Rope {
         } else {
             rotated
         };
-        Ok(out.squeeze(0)?.contiguous()?)
+        let out = out.squeeze(0)?.contiguous()?;
+        // f32 requests (every classic-path caller) leave the chain untouched.
+        Ok(if out_dtype == DType::F32 { out } else { out.to_dtype(out_dtype)? })
     }
 }
 

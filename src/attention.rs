@@ -215,13 +215,27 @@ impl AttnBlock {
             )
         };
 
-        let (q, k) = self.rope.apply(&q, &k, pos)?;
+        // On the fused-glue path rope stores its OUTPUT dtype directly (the
+        // kernel computes in f32 and rounds only the final store — bit-
+        // identical to f32 rope + cast_f16), folding the standalone post-rope
+        // casts away: k is stored f16 always (it flows straight to the f16
+        // cache), and q is stored f16 exactly where its consumer is the f16
+        // decode sdpa. q stays f32 for prefill (the flash kernel REQUIRES f32
+        // q, and the flash-classic route keeps its op sequence unchanged: rope
+        // f32 + the in-sdpa cast) and under the LAGUNA_SDPA_F32 experiment
+        // (whose sdpa consumes f32 q).
+        let (q, k) = if fused_glue {
+            let q_dt = if seq == 1 && !crate::ops::sdpa_f32() { DType::F16 } else { DType::F32 };
+            self.rope.apply_dt(&q, &k, pos, q_dt, DType::F16)?
+        } else {
+            self.rope.apply(&q, &k, pos)?
+        };
 
         // Cache in f16; sdpa runs in f16. The additive mask is pre-built and
         // hoisted by the caller (one per kind per forward; None at decode).
-        // The fused prefill path delivered v already f16 (cast folded into its
-        // permute above); k always casts here, post-rope.
-        let k16 = if fused_glue { crate::ops::cast_f16(&k)? } else { k.to_dtype(DType::F16)? };
+        // The fused paths delivered k (rope f16 store) and prefill v (cast
+        // folded into its permute above) already f16.
+        let k16 = if k.dtype() == DType::F16 { k } else { k.to_dtype(DType::F16)? };
         let v16 = if v.dtype() == DType::F16 {
             v
         } else if fused_glue {
@@ -242,8 +256,10 @@ impl AttnBlock {
         //    whose oldest→newest prefill view puts absolute position
         //    `pos - m + j` in column j.
         //  - Metal decode (seq == 1) and `LAGUNA_FLASH_CLASSIC`: candle's sdpa
-        //    (the pre-flash path, byte-for-byte, including LAGUNA_SDPA_F32),
-        //    consuming the materialized f16 mask.
+        //    (the pre-flash path, including LAGUNA_SDPA_F32), consuming the
+        //    materialized f16 mask. On the fused-glue decode route the entry/
+        //    exit casts are folded away (q arrives f16 from rope, the f16
+        //    output feeds the gate kernel raw) — bit-identical by construction.
         //  - non-Metal: the explicit f32 fallback (CPU tests, Reference
         //    oracle), consuming the raw `[seq, k_seq]` additive mask.
         let attn = if matches!(x_normed.device(), Device::Metal(_)) {
@@ -258,11 +274,15 @@ impl AttnBlock {
             }
         } else {
             self.manual_attention(&q, &k_all, &v_all, mask.map(|m| &m.raw), scale, seq)?
-        }; // [n_head, seq, head_dim] f32
+        }; // [n_head, seq, head_dim] f32 — except the fused-glue decode route,
+           // which hands over the raw f16 sdpa output (see sdpa_attention).
 
         // Softplus output gate, per-head, broadcast over head_dim, in f32. The
         // fused kernel collapses the softplus chain + gate copy + broadcast_mul
-        // into one pass over attn (bit-identical to the candle chain).
+        // into one pass over attn (bit-identical to the candle chain); its
+        // f16-input variant widens the fused decode route's f16 attn
+        // in-register (exact — the same bits the standalone widening produced),
+        // and the output is f32 either way.
         let attn = if fused_glue {
             crate::ops::attn_gate(&attn, &gate_logits)?
         } else {
@@ -283,11 +303,16 @@ impl AttnBlock {
         self.o_proj.forward(&out)
     }
 
-    /// Metal MLX fused attention. q [n_head, seq, hd] f32, k/v
-    /// [n_kv_head, K, hd] f16. GQA (n_head multiple of n_kv_head) is handled by
-    /// the kernel; k/v are not pre-tiled. The kernel runs in f16: q is cast
-    /// below, and `mask` arrives pre-materialized (f16, `[1, n_head, seq, k]`,
-    /// contiguous) from the hoisted `PrefillMask`. Returns [n_head, seq, hd] f32.
+    /// Metal MLX fused attention. q [n_head, seq, hd] — f32, or already f16 on
+    /// the fused-glue decode path (rope stored it f16; same bits as the cast
+    /// this method would otherwise run). k/v [n_kv_head, K, hd] f16. GQA
+    /// (n_head multiple of n_kv_head) is handled by the kernel; k/v are not
+    /// pre-tiled. The kernel runs in f16: q is cast below where still f32, and
+    /// `mask` arrives pre-materialized (f16, `[1, n_head, seq, k]`, contiguous)
+    /// from the hoisted `PrefillMask`. Returns [n_head, seq, hd] — f32, except
+    /// on the fused-glue decode path (seq == 1), where the raw f16 sdpa output
+    /// is returned for the f16-input gate kernel to widen in-register (exact —
+    /// same bits the standalone widening produced).
     fn sdpa_attention(
         &self,
         q: &Tensor,
@@ -306,7 +331,10 @@ impl AttnBlock {
         // needs no trailing contiguous; both casts are bit-identical to
         // to_dtype (RTNE narrowing, exact widening).
         let fused_glue = !crate::ops::attn_glue_classic();
-        let q = if fused_glue {
+        let seq = q.dim(1)?;
+        let q = if q.dtype() == DType::F16 {
+            q.unsqueeze(0)? // fused decode: rope stored q f16, metadata only
+        } else if fused_glue {
             crate::ops::cast_f16(q)?.unsqueeze(0)? // [1, n_head, seq, hd]
         } else {
             q.to_dtype(DType::F16)?.unsqueeze(0)?.contiguous()?
@@ -320,7 +348,13 @@ impl AttnBlock {
 
         let out = candle_nn::ops::sdpa(&q, &k, &v, mask, false, scale, 1.0)?;
         let out = out.squeeze(0)?;
-        Ok(if fused_glue { crate::ops::cast_f32(&out)? } else { out.to_dtype(DType::F32)? })
+        Ok(if fused_glue && seq == 1 {
+            out // f16, consumed directly by the f16-input gate kernel
+        } else if fused_glue {
+            crate::ops::cast_f32(&out)?
+        } else {
+            out.to_dtype(DType::F32)?
+        })
     }
 
     /// f32 sdpa experiment path (`LAGUNA_SDPA_F32`, non-default): the same

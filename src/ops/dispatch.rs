@@ -1427,13 +1427,16 @@ fn checked_elems(parts: &[usize], what: &str) -> Result<usize> {
     Ok(n)
 }
 
-/// Fused softplus output gate against `kernel_attn_gate` (attn_glue.metal):
-/// `dst[h,s,d] = attn[h,s,d] * softplus_chain(gate[s,h])`, replacing the
-/// 10-dispatch candle chain (softplus + transpose/reshape + broadcast_mul) with
-/// one pass over `attn`. `attn` is `[n_head, seq, head_dim]` f32 contiguous,
-/// `gate` is `[seq, n_head]` f32 contiguous (the g_proj output layout). The
-/// per-op rounding mirrors candle's chain exactly, so the result is
-/// bit-identical (see attn_glue.metal / the attn_glue.rs test).
+/// Fused softplus output gate against the `kernel_attn_gate_*` pair
+/// (attn_glue.metal): `dst[h,s,d] = attn[h,s,d] * softplus_chain(gate[s,h])`,
+/// replacing the 10-dispatch candle chain (softplus + transpose/reshape +
+/// broadcast_mul) with one pass over `attn`. `attn` is `[n_head, seq,
+/// head_dim]` contiguous, f32 or f16 (the decode path's raw sdpa output — the
+/// f16 variant widens in-kernel, exact, so it is bit-identical to `cast_f32` +
+/// the f32 variant); `gate` is `[seq, n_head]` f32 contiguous (the g_proj
+/// output layout). Output is always f32. The per-op rounding mirrors candle's
+/// chain exactly, so the result is bit-identical (see attn_glue.metal / the
+/// attn_glue.rs tests).
 pub(crate) fn run_attn_gate(attn: &Tensor, gate: &Tensor) -> Result<Tensor> {
     let cdev = attn.device().clone();
     let Device::Metal(mdev) = &cdev else {
@@ -1443,9 +1446,11 @@ pub(crate) fn run_attn_gate(attn: &Tensor, gate: &Tensor) -> Result<Tensor> {
     let (n_head, seq, head_dim) = attn
         .dims3()
         .map_err(|e| anyhow::anyhow!("attn must be rank-3 [n_head, seq, head_dim]: {e}"))?;
-    if attn.dtype() != DType::F32 {
-        bail!("attn must be f32, got {:?}", attn.dtype());
-    }
+    let kernel_name = match attn.dtype() {
+        DType::F32 => "kernel_attn_gate_f32",
+        DType::F16 => "kernel_attn_gate_f16",
+        dt => bail!("attn must be f32 or f16, got {dt:?}"),
+    };
     if !attn.is_contiguous() {
         bail!("attn must be contiguous");
     }
@@ -1466,7 +1471,7 @@ pub(crate) fn run_attn_gate(attn: &Tensor, gate: &Tensor) -> Result<Tensor> {
     let n = checked_elems(&[n_head, seq, head_dim], "attn_gate")?;
     glue_index_fits_i32(n)?;
 
-    let pipeline = pipelines::attn_glue_pipeline(mdev.device(), "kernel_attn_gate")?;
+    let pipeline = pipelines::attn_glue_pipeline(mdev.device(), kernel_name)?;
     let dst = mdev.new_buffer(n, DType::F32, "attn_gate")?;
 
     let (attn_guard, attn_layout) = attn.storage_and_layout();
@@ -1493,7 +1498,7 @@ pub(crate) fn run_attn_gate(attn: &Tensor, gate: &Tensor) -> Result<Tensor> {
         encoder.set_input_buffer(
             1,
             Some(attn_storage.buffer()),
-            attn_layout.start_offset() * DType::F32.size_in_bytes(),
+            attn_layout.start_offset() * attn.dtype().size_in_bytes(),
         );
         encoder.set_input_buffer(
             2,
@@ -1575,18 +1580,23 @@ pub(crate) fn run_permute_cast(x: &Tensor, out_dtype: DType) -> Result<Tensor> {
     ))
 }
 
-/// Vendored partial-rotary NEOX rope against `kernel_rope_neox` (rope.metal):
-/// rotates the first `n_rot` dims of `x` `[heads, seq, head_dim]` f32 with
-/// candle's by-halves rope math and passes the rest through, in ONE read+write
-/// of `x` — replacing the narrow/contiguous/rope/cat chain. `cos`/`sin` are the
-/// full `[max_ctx, n_rot/2]` f32 tables; `pos` selects the starting row.
-/// Bit-identical to the candle chain (see rope.metal / the attn_glue.rs test).
+/// Vendored partial-rotary NEOX rope against the `kernel_rope_neox_*` pair
+/// (rope.metal): rotates the first `n_rot` dims of `x` `[heads, seq, head_dim]`
+/// f32 with candle's by-halves rope math and passes the rest through, in ONE
+/// read+write of `x` — replacing the narrow/contiguous/rope/cat chain.
+/// `out_dtype` picks the store width (f32, or f16 — the rotation still runs in
+/// f32 and only the final store rounds, one RTNE rounding, bit-identical to
+/// f32-rope + `cast_f16`; pass-through dims round the same way). `cos`/`sin`
+/// are the full `[max_ctx, n_rot/2]` f32 tables; `pos` selects the starting
+/// row. Bit-identical to the candle chain (see rope.metal / the attn_glue.rs
+/// tests).
 pub(crate) fn run_rope(
     x: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
     pos: usize,
     n_rot: usize,
+    out_dtype: DType,
 ) -> Result<Tensor> {
     let cdev = x.device().clone();
     let Device::Metal(mdev) = &cdev else {
@@ -1605,6 +1615,11 @@ pub(crate) fn run_rope(
     if n_rot == 0 || n_rot % 2 != 0 || n_rot > head_dim {
         bail!("n_rot ({n_rot}) must be even and in 2..=head_dim ({head_dim})");
     }
+    let kernel_name = match out_dtype {
+        DType::F32 => "kernel_rope_neox_f32",
+        DType::F16 => "kernel_rope_neox_f16",
+        dt => bail!("rope output dtype must be f32 or f16, got {dt:?}"),
+    };
     let half = n_rot / 2;
     // Checked: a caller-supplied pos near usize::MAX must not wrap the row
     // bound (release builds wrap unchecked usize adds).
@@ -1635,8 +1650,8 @@ pub(crate) fn run_rope(
     glue_index_fits_i32(n)?;
     glue_index_fits_i32(checked_elems(&[end, half], "rope tables")?)?;
 
-    let pipeline = pipelines::rope_pipeline(mdev.device(), "kernel_rope_neox")?;
-    let dst = mdev.new_buffer(n, DType::F32, "rope")?;
+    let pipeline = pipelines::rope_pipeline(mdev.device(), kernel_name)?;
+    let dst = mdev.new_buffer(n, out_dtype, "rope")?;
 
     let (x_guard, x_layout) = x.storage_and_layout();
     let Storage::Metal(x_storage) = &*x_guard else {
@@ -1687,7 +1702,13 @@ pub(crate) fn run_rope(
     drop(cos_guard);
     drop(sin_guard);
 
-    Ok(output_tensor(dst, mdev, n, (heads, seq, head_dim)))
+    let storage = MetalStorage::new(dst, mdev.clone(), n, out_dtype);
+    Ok(Tensor::from_storage(
+        Storage::Metal(storage),
+        (heads, seq, head_dim),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 /// The flash prefill kernel's fixed tile geometry (flash.metal): BQ=32 query

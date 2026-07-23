@@ -180,7 +180,7 @@ trap documented here.
 - The first forward folds in the one-time Metal weight upload — never report
   first-forward prefill numbers as steady-state.
 
-## Perf state (2026-07-22)
+## Perf state (2026-07-23)
 
 POWER MODE CAVEAT: this machine runs in macOS Low Power Mode during dev
 sessions (owner's choice — full power = coil whine + fans). Same-mode 2×2
@@ -202,18 +202,19 @@ Warm steady-state, fused path, vs fork `llama-bench`, pmset-verified 2×2
 | | ours LPM | fork LPM | ours full | fork full |
 |---|---|---|---|---|
 | decode (256-tok sustained / tg128) | ~19 tok/s | 18.5 | (stale: ~38.6) | 39.2 |
-| prefill short (630-925 tok / pp512) | ~305 tok/s | 354 | (stale: ~415) | 990 |
-| prefill 4k (4007 tok / pp4096) | ~304 tok/s | 348 | (stale: ~345) | 793 |
+| prefill short (630-925 tok / pp512) | ~304 tok/s | 354 | (stale: ~415) | 990 |
+| prefill 4k (4007 tok / pp4096) | ~312 tok/s | 348 | (stale: ~345) | 793 |
 
 LPM decode PASSES the fork (~1.02-1.04x; 18.8-19.2 across runs, ±5% LPM
 noise); the "ours full" column predates all of the 2026-07-23 work.
 Prefill "ours" LPM figures are 2026-07-23 post flash attention + tensor
-projections as default (174 → 305 @925, ~155 → 304 @4k over two days;
-0.86x/0.87x fork — 4k runs at the same per-token rate as 925 because the
+projections + glue phase 2 (174 → 304 @925, ~155 → 312 @4k over two days;
+0.86x/0.90x fork — 4k now runs FASTER per-token than 925 because the
 T² sdpa/mask term is gone). The mixed-operand matmul2d escape hatch is
-PROBED AND CLOSED (compiles but classic-speed, see docs/log.md); remaining
-prefill levers are encoder takeover and glue phase 2 (TODO priority
-list).
+PROBED AND CLOSED (compiles but classic-speed, see docs/log.md).
+Encoder/scheduling work is a REFUTED dead end (see gaps below); the only
+remaining prefill lever is per-kernel efficiency vs the fork (TODO ledger
+item).
 
 Prefill: the vendored two-pass mm_id kernel (tensor `matmul2d` default) took
 prefill ~60 → ~188 tok/s (3.1x; ~174 re-measured 2026-07-22 in LPM). Decode:
@@ -249,11 +250,17 @@ schema v3 (missing field grandfathers to "classic" for v≤2 dumps). Decode
 port is a ledger item).
 
 Known remaining gaps (see TODO.md priority list for the plan):
-- **Prefill (0.86x/0.87x fork post flash + tensor-default)**: next levers
-  are encoder takeover (range-tracked barriers + reorder — candle already
-  runs ONE concurrent encoder our ops ride; see the corrected TODO ledger
-  item) and glue phase 2 (fold remaining f16 casts into gate/rope
-  kernels). Routing glue measured ~1% — do NOT "fuse routing" for perf.
+- **Prefill (0.86x/0.90x fork)**: encoder takeover is CLOSED-REFUTED
+  (2026-07-23): a static trace of candle's hazard tracker over the
+  51-dispatch layer found 37 barriers, all TRUE RAW deps, and
+  `CANDLE_METAL_COMPUTE_PER_BUFFER=1` (maximal serialization) leaves
+  prefill IDENTICAL — scheduling/concurrency/reorder buy nothing; do NOT
+  reopen without new evidence. Glue phase 2 is DONE (rope stores f16
+  directly for k always + decode q; attn_gate reads the decode sdpa f16
+  output; all bit-identical, no new switches). Routing glue measured ~1% —
+  do NOT "fuse routing" for perf. The remaining gap is PER-KERNEL
+  efficiency vs ggml's kernels (mm_id tile gemm, f16 projections, flash,
+  rms_norm) — profiling plan in the TODO ledger.
 - **Decode (LPM: ~19 vs fork 18.5 — ahead; full-power numbers stale)**:
   remaining levers are the MoE mv_id gather (~14 ms sustained vs ~7 ms
   bandwidth floor), then DFlash.

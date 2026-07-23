@@ -4,6 +4,59 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — glue phase 2 shipped (last standalone casts folded); encoder takeover REFUTED before build
+
+**Glue phase 2 (revised scope).** The territory map showed the ledger item
+predated flash and had half-died: flash's f32 output already killed the
+prefill post-sdpa cast, and the v cast was already folded into
+permute_01_f16. What actually remained: ONE standalone traffic pass on the
+whole default prefill path (`cast_f16(k)` after rope) and three small decode
+casts. Landed: `kernel_rope_neox` templated on the store type (rope math
+stays f32, one RTNE rounding at the f16 store — bit-identical to the old
+rope→cast chain, passthrough dims included; `Rope::apply_dt` picks per-call
+dtypes) and `kernel_attn_gate` templated on the attn input type (f16 widened
+in-kernel, exact). Policy: k rope-stores f16 always (feeds the f16 cache
+directly); q rope-stores f16 only at seq==1 — flash requires f32 q at
+prefill, and LAGUNA_SDPA_F32's sdpa takes f32 q so the experiment branch
+keeps f32 too; decode's sdpa f16 output goes straight into the f16-input
+gate. Decode v cast stays (never roped, no fold target). No new
+kill-switch/provenance: bit-identical by construction under the existing
+LAGUNA_ATTN_GLUE_CLASSIC umbrella. Two new bitwise unit tests; all six
+gates PASS digit-exact at the pre-change anchors with references reused
+(second consecutive zero-regen change — the schema-version machinery and
+the bit-identity playbook are compounding). Bench (LPM): 304.7 → 304.0
+@925 (flat), 303.8 → 311.9 @4k (+2.7% — the folded k-cast pass scales with
+seq), decode 18.8 → 19.2 (3 dispatches/layer gone; ±5% band). Review round
+(Claude + Codex + GLM + DeepSeek): zero correctness findings; hardening
+applied (dtype guard on the rope chain fallback so both routes enforce the
+F32/F16 contract; q-decode shape added to the bitwise test).
+
+**Encoder takeover: premise refuted, item closed.** The ledger said
+"re-measure before investing" — it was right to. A static simulation of
+candle's hazard tracker (semantics verified line-by-line at the pin:
+RAW/WAR/WAW keyed on whole buffer pointers vs the accumulated window;
+barrier = global MTLBarrierScope::Buffers that resets the window) over the
+full 51-dispatch default-prefill layer: 37 barriers, ALL true
+producer→consumer dependencies — the layer is a near-linear RAW chain.
+Whole-buffer keying adds ~0-3 false barriers worst case (<1% of GPU time)
+because candle's pool only recycles dropped-producer buffers
+(strong_count==1) and weights never enter the write-set. The independent
+fat ops ({g,q,k,v} projections, mm_id gate/up, combine+shared-expert)
+already share barrier-free windows. The fork's mechanism re-read: its
+barrier is equally coarse (full mem_ranges reset); its wins — byte-range
+precision and reorder — have nothing to bite on here, and at batch=1 it
+encodes on 1-2 threads. Empirical bracket sealed it:
+`CANDLE_METAL_COMPUTE_PER_BUFFER=1` (one encoder per dispatch = maximal
+serialization + per-dispatch fences) left prefill-925 IDENTICAL at 304.0
+tok/s. If 50x more fences cost nothing, no scheduling improvement can gain
+anything. Verdict: prefill is fat-kernel compute-bound; the remaining
+0.86x/0.90x fork gap lives INSIDE kernels. Byte-range patch, own-encoder
+takeover, issue-order reorder, and the demoted routing-glue fusion are all
+dead ends — closed with the analysis in the ledger, replaced by a
+per-kernel-efficiency profiling item (compare mm_id tile gemm, f16
+projections, flash, rms_norm against ggml's per-op times, same power
+mode).
+
 ## 2026-07-23 — flash attention shipped: vendored steel kernel, in-kernel SWA masking, T² term gone; tensor projections pass the full gate matrix (+14% prefill on top)
 
 **What landed.** Prefill (seq>1) attention no longer calls candle's sdpa: a
