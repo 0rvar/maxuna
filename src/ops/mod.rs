@@ -6,6 +6,7 @@ pub mod flash;
 pub mod mm_id;
 pub mod mv_id;
 mod pipelines;
+pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use combine::combine;
@@ -14,6 +15,7 @@ pub use f16::matmul_f16;
 pub use flash::flash_attn;
 pub use mm_id::mul_mm_id;
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
+pub use silu_mul::silu_mul;
 
 pub use crate::gguf::ExpertStack;
 
@@ -92,6 +94,19 @@ pub(crate) fn candle_fast_math_disabled() -> bool {
         Ok(v) => !matches!(v.as_str(), "true" | "t" | "yes" | "y" | "1"),
         Err(_) => false,
     })
+}
+
+/// `LAGUNA_ACT_CLASSIC=1` reverts the routed-expert SwiGLU activation from the
+/// vendored fused kernel (`ops::silu_mul`) back to candle's `silu(gate) * up`
+/// two-op chain. The fused kernel is bit-identical to that chain by construction,
+/// so this is a safety kill-switch and provenance anchor, not a correctness tier.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling MoE switches
+/// (`combine_classic`, `no_mm_id`): any value enables it — only leaving it unset
+/// keeps the fused path.
+pub fn act_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_ACT_CLASSIC").is_some())
 }
 
 /// `LAGUNA_ATTN_GLUE_CLASSIC=1` reverts the attention glue — the fused softplus

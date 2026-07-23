@@ -241,6 +241,12 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// `flash` records the prefill attention kernel: "fused" (the vendored flash
 /// kernel, the Metal default) or "classic" (the candle sdpa chain, under
 /// `LAGUNA_FLASH_CLASSIC`); env-derived for every runner, like `attn_glue`.
+/// `act` records the routed-expert SwiGLU activation path: "classic" for the
+/// Reference oracle (its ReferenceExperts always runs the candle `silu(gate) * up`
+/// chain — the same math the fused runner's classic path uses, so "classic" is the
+/// honest label, unlike `combine`'s distinct "reference" index_add path), else
+/// "fused" (the shipped vendored `ops::silu_mul` kernel) or "classic" (under
+/// `LAGUNA_ACT_CLASSIC`) for the fused runner.
 /// `schema_version` stamps which field set this dump carries
 /// (`laguna::parity_schema`): the gate resolves a field missing from an older
 /// dump to its grandfather value instead of hard-failing, so adding a field
@@ -288,6 +294,19 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         // LAGUNA_FLASH_CLASSIC). Env-derived for every runner, like attn_glue;
         // parity-gate.ts pins "classic" for reference and strict dumps.
         "flash": if laguna::ops::flash_classic() { "classic" } else { "fused" },
+        // Routed-expert SwiGLU activation path. The Reference oracle's
+        // ReferenceExperts always runs the candle silu*mul chain (it never
+        // dispatches ops::silu_mul), so it is "classic" unconditionally — the same
+        // value the grandfather resolves pre-v4 dumps to, keeping cached references
+        // valid. The fused runner is env-derived ("classic" under LAGUNA_ACT_CLASSIC,
+        // else the shipped fused kernel).
+        "act": if matches!(moe_impl, "reference" | "ref") {
+            "classic"
+        } else if laguna::ops::act_classic() {
+            "classic"
+        } else {
+            "fused"
+        },
     })
 }
 

@@ -310,10 +310,25 @@ Known remaining gaps (see TODO.md priority list for the plan):
   efficiency vs ggml's kernels (mm_id tile gemm, f16 projections, flash,
   rms_norm) — profiling plan in the TODO ledger.
 - **Decode (LPM: ~19 vs fork 18.5 — ahead; full-power numbers stale)**:
-  remaining levers are the MoE mv_id gather (~14 ms sustained vs ~7 ms
-  bandwidth floor), then DFlash.
+  the mv_id gather lever is CLOSED-REFUTED (2026-07-23): in-mode
+  measurement shows the whole decode token is at the LPM DRAM wall
+  (~165-205 GB/s — lm_head, expert gathers, everything; the old "~7 ms
+  floor" divided LPM bytes by a FULL-POWER bandwidth anchor; 8.6 GB/token
+  ÷ 185 GB/s reconciles the 52 ms token exactly). Never compare
+  bandwidth anchors across power modes. The fused silu·mul glue lever is
+  SHIPPED (WP-G2, 2026-07-23): `ops::silu_mul` (`src/ops/silu_mul.metal`)
+  collapses the two candle elementwise dispatches at moe.rs ~:280 into one
+  bit-identical pass (kill-switch `LAGUNA_ACT_CLASSIC`; provenance `act`,
+  schema v4; combine-style per-tier gate) — measured perf-NEUTRAL
+  end-to-end (the ablation's 2.47 ms attribution was DVFS/order noise;
+  kept as default: strictly not slower, one fewer dispatch). Decode is
+  bandwidth-complete; the only remaining decode lever is DFlash
+  acceptance/coverage.
 - `LAGUNA_BENCH` env var enables a warm-up forward for steady-state timing.
   Bench ≥ 256 decode tokens — sub-second runs report boost-clock fiction.
+  Microbench harness defaults (LAGUNA_BENCH_WARMUP=10/ITERS=50) ride the
+  DVFS burst window and can overstate up to 3x — use 30/150 and plateau
+  MEANS for any bandwidth claim.
 
 ## DFlash (SHIPPED 2026-07-23)
 

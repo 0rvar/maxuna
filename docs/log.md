@@ -4,6 +4,55 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — MoE gather arc: the "~7 ms recoverable gather gap" REFUTED (cross-power-mode artifact); decode is bandwidth-complete; silu·mul fusion shipped perf-neutral
+
+The ledger's decode lever ("mv_id gather ~14 ms sustained vs ~7 ms bandwidth
+floor") died under in-mode measurement, and the post-mortem matters more than
+the number.
+
+**The refutation (WP-G1 phase 0, verified by orchestrator re-run).** Four new
+decode_bench benches (isolated all-expert mul_mv_id at exact decode geometry;
+plain-mv row sweep 1024→100352; cumulative stage ablation; gate/up concurrency
+probe). In LPM, EVERYTHING sustains 162-205 GB/s: expert-sized gathers
+(gate q4_K 193-204, down 162-168, q6_K 168-183) AND the lm_head-sized matvec
+(185). The prior arc's "lm_head = 0.685 ms ≈ 365 GB/s ≈ bandwidth-optimal" was
+a FULL-POWER number — the same matvec is 1.363 ms in LPM (÷2.1 clamp ≈ 0.65 —
+the arithmetic closes). The "~7 ms floor" divided LPM byte volume by that
+full-power anchor. In-mode: 2.4-2.9 GB/token of routed weights ÷ 185 GB/s
+≈ 13 ms = exactly the measured gather block. Total token traffic ~8.6 GB ÷
+185 GB/s also reconciles the whole 52 ms decode token. No missing half; no
+kernel inefficiency (row sweep shows no size cliff — everything converges to
+the same DRAM wall); gate/up don't overlap because a single gather already
+saturates (pair = 1.10x single). NEVER compare bandwidth anchors across power
+modes — this is the power-calibration trap's microbench edition. Related trap
+caught same session: the microbench defaults (WARMUP=10/ITERS=50) ride the
+DVFS burst and overstate up to 3x (one gather read 580 GB/s at 50 iters,
+collapsing to 193 at 150) — bandwidth claims need 30/150 + plateau means.
+
+**The salvage that wasn't (WP-G2).** Stage ablation attributed 2.47 ms/token
+to the silu·mul glue (two candle elementwise dispatches over ~40 KB tensors),
+so a fused kernel followed the combine playbook: `ops::silu_mul`, candle's
+`usilu` copied verbatim + separate f32 multiply, combine pragma block,
+bit-identical proven by test, `LAGUNA_ACT_CLASSIC` kill-switch, provenance
+`act` at schema v4 with "classic" grandfathering (committed references stayed
+valid — zero regeneration; the schema-versioning payoff, second time).
+End-to-end it is DEAD EVEN: A/B/B/A 256-tok real-model decode fused 19.6/19.0
+vs classic 19.4/19.3 tok/s, greedy output bitwise identical across paths. The
+2.47 ms was an ablation ARTIFACT: the isolation A/B flips sign with run order
+(whichever config runs first reads ~1.6 ms slower), and true 2-dispatch
+overhead is ~0.2 ms. Kept as default anyway (vendored-mv precedent: strictly
+not slower, one fewer dispatch, insulation). All six parity gates PASS at the
+existing anchors. LESSON, now a ledger rule: cross-check any stage-ablation
+delta with an end-to-end A/B/B/A before building on it — ablation deltas at
+the ~2 ms scale are within this machine's order/DVFS noise.
+
+**Net decode position.** ~19 tok/s LPM is the DRAM wall for this model's
+~8.6 GB/token; the fork sits at the same wall (18.5, same serial structure,
+no fusion — territory-mapped llama-graph.cpp/ggml-metal this session). The
+only remaining decode lever is architectural: fewer bytes per emitted token,
+i.e. DFlash acceptance/coverage (previous entry). Full-power runs ~2x by
+clock, not by headroom.
+
 ## 2026-07-23 — DFlash perf arc: drafter f16 (code greedy 24.2 → 27.6), wall-clock auto-pause (prose 0.94x → 1.09x/parity), expert-union probe REFUTED, upstream offset-bug issue drafted
 
 Four-lever follow-up to the DFlash ship (next entry down), all landed same day.

@@ -144,7 +144,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_CLASSIC" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_SDPA_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k === "LAGUNA_FLASH_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
+    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_CLASSIC" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_SDPA_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k === "LAGUNA_FLASH_CLASSIC" || k === "LAGUNA_ACT_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("LAGUNA_PARITY_")) continue;
@@ -163,14 +163,18 @@ function baseEnv(): Record<string, string> {
  * (softplus gate / permute-cast copies / partial-rotary rope) to the candle
  * chains (`LAGUNA_ATTN_GLUE_CLASSIC=1`), so the oracle stays on the exact path
  * its artifacts were blessed with (the fused kernels are bit-identical, so
- * these only anchor provenance). `LAGUNA_ATTN_MM_CLASSIC=1` is pinned too,
+ * these only anchor provenance). The routed-expert SwiGLU activation is pinned
+ * to the candle chain (`LAGUNA_ACT_CLASSIC=1`) for the same reason — defensive
+ * here, since the Reference oracle's ReferenceExperts always runs the candle
+ * chain regardless of the switch, but it keeps the env parallel with the other
+ * classic pins. `LAGUNA_ATTN_MM_CLASSIC=1` is pinned too,
  * defensively: under `LAGUNA_ATTN_F32` the f16 mm branch never runs (provenance
  * stays "f32-bypass"), but the pin keeps the oracle off the tensor gemm even if
  * the attention pin ever changes. Candidate dumps use baseEnv() and run
  * whatever path their tier is gating.
  */
 function referenceEnv(): Record<string, string> {
-  return { ...baseEnv(), LAGUNA_ATTN_F32: "1", LAGUNA_ATTN_MM_CLASSIC: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1", LAGUNA_FLASH_CLASSIC: "1" };
+  return { ...baseEnv(), LAGUNA_ATTN_F32: "1", LAGUNA_ATTN_MM_CLASSIC: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1", LAGUNA_FLASH_CLASSIC: "1", LAGUNA_ACT_CLASSIC: "1" };
 }
 
 /** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */
@@ -289,7 +293,10 @@ async function fixtureTokens(id: string): Promise<string> {
  *  the oracle executes the attention glue, anchored to the candle chains),
  *  AND flash=="classic" (referenceEnv() pins LAGUNA_FLASH_CLASSIC=1 —
  *  grandfathered for dumps predating schema v3, whose binaries all ran the
- *  candle sdpa prefill). A
+ *  candle sdpa prefill),
+ *  AND act=="classic" (the Reference oracle's ReferenceExperts always runs the
+ *  candle silu*mul chain — grandfathered for dumps predating schema v4, whose
+ *  binaries all ran that chain). A
  *  dump missing any field predates it and the Rust gate hard-fails on it, so
  *  regenerate here instead of failing after an expensive candidate run. `kind`
  *  (when given) must also match. Any parse/shape problem returns false
@@ -310,6 +317,7 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     const version = typeof p.schema_version === "number" ? p.schema_version : 1;
     const sdpa = p.sdpa ?? (version < 2 ? "f16" : undefined);
     const flash = p.flash ?? (version < 3 ? "classic" : undefined);
+    const act = p.act ?? (version < 4 ? "classic" : undefined);
     return (
       p.moe_impl === "reference" &&
       p.attn_dtype === "f32" &&
@@ -317,7 +325,8 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
       p.attn_mm === "f32-bypass" &&
       p.attn_glue === "classic" &&
       sdpa === "f16" &&
-      flash === "classic"
+      flash === "classic" &&
+      act === "classic"
     );
   } catch {
     return false;
@@ -482,14 +491,16 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // combine to the candle chain, LAGUNA_ATTN_GLUE_CLASSIC=1 pins the
   // attention glue (softplus gate / permute-cast / rope) to the candle chains
   // (both bit-identical to their fused kernels, so these only match the
-  // oracle's blessed path), and LAGUNA_FLASH_CLASSIC=1 pins prefill attention
-  // to the candle sdpa chain (the path the 0.999 anchor was blessed with).
-  // mm runs the default mm_id prefill
+  // oracle's blessed path), LAGUNA_FLASH_CLASSIC=1 pins prefill attention
+  // to the candle sdpa chain (the path the 0.999 anchor was blessed with), and
+  // LAGUNA_ACT_CLASSIC=1 pins the routed-expert SwiGLU activation to the candle
+  // silu*mul chain (bit-identical to the fused kernel, so it only matches the
+  // oracle's blessed path). mm runs the default mm_id prefill
   // (code-short's 58 tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
   // Only the mm candidate picks up the experiment flags (candidateEnv); strict
   // stays pinned to the exact env its 0.999 anchor was blessed with.
   const env = tier === "strict"
-    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1", LAGUNA_ATTN_MM_CLASSIC: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1", LAGUNA_FLASH_CLASSIC: "1" }
+    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1", LAGUNA_ATTN_MM_CLASSIC: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1", LAGUNA_FLASH_CLASSIC: "1", LAGUNA_ACT_CLASSIC: "1" }
     : candidateEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);

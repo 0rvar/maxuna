@@ -278,6 +278,14 @@ struct CombineArgs {
     n_out: i32,
 }
 
+/// Matches the Metal `silu_mul_args` struct (src/ops/silu_mul.metal).
+/// `#[repr(C)]` pins the layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SiluMulArgs {
+    n: i32,
+}
+
 /// candle's `fast_sum` threadgroup width for a `top_k`-wide reduction:
 /// `min(pipeline_max, next_pow2(top_k/2))`. The combine kernels reproduce it so
 /// the simd_sum lane partition matches candle's reduction order bit-for-bit, but
@@ -1333,6 +1341,81 @@ pub(crate) fn run_combine(
     drop(l2_resolved);
 
     Ok(output_tensor(dst, mdev, out_length, (seq, n_out)))
+}
+
+/// Fused SwiGLU activation against the `kernel_moe_silu_mul` kernel
+/// (silu_mul.metal): `act = silu(gate) * up`, one pass over the two operands.
+/// `gate` and `up` are same-shape, same-length f32 contiguous tensors (the MoE
+/// up/gate expert-matvec outputs, `[seq, top_k, expert_ff]`); the result has the
+/// same shape and dtype. Bit-identical to the candle `silu(gate) * up` chain it
+/// replaces (silu_mul.rs `fused_matches_candle_bitwise` proves it), so the fused
+/// path is safe under every parity tier. Metal only; the caller's kill-switch is
+/// the candle chain (`LAGUNA_ACT_CLASSIC`).
+pub(crate) fn run_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    let cdev = gate.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("silu_mul requires gate on a Metal device");
+    };
+
+    if gate.dtype() != DType::F32 {
+        bail!("gate must be f32, got {:?}", gate.dtype());
+    }
+    if up.dtype() != DType::F32 {
+        bail!("up must be f32, got {:?}", up.dtype());
+    }
+    if gate.dims() != up.dims() {
+        bail!("gate shape {:?} must equal up shape {:?}", gate.dims(), up.dims());
+    }
+    if !gate.is_contiguous() {
+        bail!("gate must be contiguous");
+    }
+    if !up.is_contiguous() {
+        bail!("up must be contiguous");
+    }
+    if !gate.device().same_device(up.device()) {
+        bail!("gate and up must live on the same Metal device");
+    }
+    let shape = gate.shape().clone();
+    let n = checked_elems(shape.dims(), "silu_mul")?;
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::silu_mul_pipeline(mdev.device(), "kernel_moe_silu_mul")?;
+    let dst = mdev.new_buffer(n, DType::F32, "silu_mul")?;
+
+    let (gate_guard, gate_layout) = gate.storage_and_layout();
+    let Storage::Metal(gate_storage) = &*gate_guard else {
+        bail!("gate is not on a Metal device");
+    };
+    let (up_guard, up_layout) = up.storage_and_layout();
+    let Storage::Metal(up_storage) = &*up_guard else {
+        bail!("up is not on a Metal device");
+    };
+
+    let args = SiluMulArgs { n: n as i32 };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(gate_storage.buffer()),
+            gate_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(up_storage.buffer()),
+            up_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(gate_guard);
+    drop(up_guard);
+
+    Ok(output_tensor(dst, mdev, n, shape))
 }
 
 /// Matches the Metal `attn_gate_args` struct (src/ops/attn_glue.metal).

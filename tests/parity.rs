@@ -150,6 +150,13 @@ struct Provenance {
     /// earlier binary ran the candle sdpa prefill, so a v1/v2 dump missing the
     /// field resolves to "classic"; missing at v3+ is the stale-binary hard fail.
     flash: Option<String>,
+    /// Routed-expert SwiGLU activation path: "fused" (the vendored `ops::silu_mul`
+    /// kernel, the Metal default) or "classic" (the candle `silu(gate) * up` chain,
+    /// `LAGUNA_ACT_CLASSIC`, which the Reference oracle also runs). Introduced at
+    /// schema version 4 with grandfather "classic" — every earlier binary ran the
+    /// candle chain, so a v1..v3 dump missing the field resolves to "classic";
+    /// missing at v4+ is the stale-binary hard fail.
+    act: Option<String>,
 }
 
 impl Provenance {
@@ -248,6 +255,12 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
             // the version-aware check); present-but-not-a-string is malformed.
             flash: match p.get("flash") {
                 Some(d) => Some(d.as_str().context("provenance `flash` is not a string")?.to_string()),
+                None => None,
+            },
+            // Absent in schema-version-1..3 dumps (grandfathered to "classic" by
+            // the version-aware check); present-but-not-a-string is malformed.
+            act: match p.get("act") {
+                Some(d) => Some(d.as_str().context("provenance `act` is not a string")?.to_string()),
                 None => None,
             },
         })),
@@ -605,6 +618,19 @@ fn expected_flash() -> String {
     std::env::var("LAGUNA_PARITY_EXPECT_FLASH").unwrap_or_else(|_| "fused".to_string())
 }
 
+/// Enforce the routed-expert SwiGLU activation path recorded in one side's
+/// provenance. `want` is "classic" for the Reference-oracle side (its
+/// ReferenceExperts always runs the candle `silu(gate) * up` chain) and for
+/// strict-tier candidates (produced under `LAGUNA_ACT_CLASSIC=1`, the candle chain
+/// the strict anchor was blessed with), and "fused" for the mm/decode/ppl
+/// candidates that grade the shipped vendored `ops::silu_mul` kernel. Introduced
+/// at schema version 4: a v1..v3 dump missing the field is grandfathered to
+/// "classic" by `check_field` — that keeps the pre-`act` reference dumps valid,
+/// since the reference side expects "classic".
+fn check_act(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "act", p.act.as_deref(), want)
+}
+
 fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
@@ -633,6 +659,8 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             // The oracle's prefill is pinned off the flash kernel
             // (LAGUNA_FLASH_CLASSIC=1, parity-gate.ts referenceEnv()).
             check_flash(p, "reference dump", "classic")?;
+            // The oracle's ReferenceExperts always runs the candle silu*mul chain.
+            check_act(p, "reference dump", "classic")?;
         }
         Some(p) => bail!(
             "reference dump provenance.moe_impl is {:?}, expected \"reference\": the reference side \
@@ -799,6 +827,21 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     };
     if let Some(p) = &candidate.provenance {
         check_flash(p, "candidate dump", &want_flash)?;
+    }
+
+    // EVERY tier also pins the CANDIDATE's routed-expert activation path (like
+    // combine): strict grades the candle silu*mul chain (candidate produced under
+    // LAGUNA_ACT_CLASSIC=1 → "classic"), mm/decode grade the shipped fused
+    // ops::silu_mul kernel ("fused"). The fused kernel is bit-identical to the
+    // chain, so — like combine — strict pins classic purely as the blessed-anchor
+    // discipline. Candidate provenance is already proven Some by the attn_dtype
+    // check above.
+    let want_act = match tier {
+        Tier::Strict => "classic",
+        Tier::Mm | Tier::Decode => "fused",
+    };
+    if let Some(p) = &candidate.provenance {
+        check_act(p, "candidate dump", want_act)?;
     }
 
     // Non-finite candidate logits are a hard failure in EVERY tier: a NaN/Inf
@@ -1054,6 +1097,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_attn_glue(p, "reference-greedy.json", "classic")?;
             check_sdpa(p, "reference-greedy.json", "f16")?;
             check_flash(p, "reference-greedy.json", "classic")?;
+            check_act(p, "reference-greedy.json", "classic")?;
         }
         Some(p) => bail!(
             "reference-greedy.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate \
@@ -1077,6 +1121,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_attn_glue(p, "candidate-greedy.json", "fused")?;
             check_sdpa(p, "candidate-greedy.json", &expected_sdpa())?;
             check_flash(p, "candidate-greedy.json", &expected_flash())?;
+            check_act(p, "candidate-greedy.json", "fused")?;
         }
         Some(p) => bail!(
             "candidate-greedy.json (replay) provenance.moe_impl is {:?}, expected \"fused\"; the \
@@ -1300,6 +1345,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_attn_glue(p, "reference-ppl.json", "classic")?;
             check_sdpa(p, "reference-ppl.json", "f16")?;
             check_flash(p, "reference-ppl.json", "classic")?;
+            check_act(p, "reference-ppl.json", "classic")?;
         }
         Some(p) => bail!(
             "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
@@ -1322,6 +1368,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_attn_glue(p, "candidate-ppl.json", "fused")?;
             check_sdpa(p, "candidate-ppl.json", &expected_sdpa())?;
             check_flash(p, "candidate-ppl.json", &expected_flash())?;
+            check_act(p, "candidate-ppl.json", "fused")?;
         }
         Some(p) => bail!(
             "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
@@ -1444,6 +1491,10 @@ fn prov(moe_impl: &str) -> Provenance {
         // pinned off the flash kernel); fused candidates run the shipped flash
         // prefill. Strict-tier candidate tests override this to "classic".
         flash: Some(if moe_impl == "reference" { "classic" } else { "fused" }.to_string()),
+        // Reference's ReferenceExperts always runs the candle silu*mul chain;
+        // fused candidates run the shipped fused ops::silu_mul kernel. Strict-tier
+        // candidate tests override this to "classic".
+        act: Some(if moe_impl == "reference" { "classic" } else { "fused" }.to_string()),
     }
 }
 
@@ -2061,6 +2112,77 @@ fn flash_missing_grandfathered_at_schema_version_2() {
 }
 
 #[test]
+fn compare_pins_candidate_act_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // strict grades the candle silu*mul chain: a candidate on the default fused
+    // activation kernel (LAGUNA_ACT_CLASSIC forgotten) must be rejected. It must
+    // first clear every other strict pin to reach the act check (the last one).
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    p.attn_mm = Some("f32-bypass".to_string());
+    p.no_mm_id = true;
+    p.combine = Some("classic".to_string());
+    p.attn_glue = Some("classic".to_string());
+    p.flash = Some("classic".to_string());
+    // act defaults to "fused" — wrong for strict.
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("act"), "unexpected error: {err}");
+
+    // mm/decode grade the fused activation kernel: a "classic" candidate ran the
+    // candle chain instead.
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq; // mm-active
+    p.act = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("act"), "unexpected error: {err}");
+    let mut p = prov("fused");
+    p.act = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("act"), "unexpected error: {err}");
+
+    // A reference that recorded the fused activation moved the oracle's anchor
+    // (the Reference runner must always be the candle chain → "classic").
+    let mut r = prov("reference");
+    r.act = Some("fused".to_string());
+    let err = compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("act"), "unexpected error: {err}");
+}
+
+#[test]
+fn act_missing_at_current_version_hard_fails() {
+    // A dump claiming the current schema version but missing act came from a
+    // stale/doctored binary: hard fail, both sides.
+    let reference = tiny_dump(Some(prov("reference")));
+    let mut p = prov("fused");
+    p.act = None;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no act"), "unexpected error: {err}");
+
+    let mut r = prov("reference");
+    r.act = None;
+    let err = compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no act"), "unexpected error: {err}");
+}
+
+#[test]
+fn act_missing_grandfathered_at_schema_version_3() {
+    // A v3 REFERENCE dump (written before the act field existed) resolves the
+    // missing field to the grandfather "classic" — exactly what the reference
+    // pin expects, so pre-act reference dumps stay valid. The current-build
+    // candidate carries act "fused" and passes the decode expectation.
+    let mut r = prov("reference");
+    r.schema_version = 3;
+    r.act = None;
+    compare(&tiny_dump(Some(prov("fused"))), &tiny_dump(Some(r)), Tier::Decode)
+        .expect("v3 references without act must be grandfathered to classic and pass");
+}
+
+#[test]
 fn v1_baseline_fields_hard_fail_missing_at_any_version() {
     // The version-1 baseline fields have no grandfather: missing is a hard
     // fail even from a dump that (correctly) claims schema version 1 — the
@@ -2109,6 +2231,9 @@ fn load_dump_defaults_missing_schema_version_to_v1() {
     assert_eq!(prov.flash, None);
     check_flash(&prov, "reference dump", "classic")
         .expect("missing flash at v1 must grandfather to classic");
+    assert_eq!(prov.act, None);
+    check_act(&prov, "reference dump", "classic")
+        .expect("missing act at v1 must grandfather to classic");
 }
 
 #[test]
@@ -2344,6 +2469,23 @@ fn ppl_gate_rejects_wrong_or_missing_combine() {
     r.provenance.as_mut().unwrap().combine = None;
     let err = ppl_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("no combine"), "unexpected error: {err}");
+}
+
+#[test]
+fn ppl_gate_rejects_wrong_or_missing_act() {
+    // The ppl gate grades the shipped fused activation; a candidate produced under
+    // LAGUNA_ACT_CLASSIC=1 ran the candle silu*mul chain instead.
+    let (r, mut c) = valid_ppl_pair();
+    c.provenance.as_mut().unwrap().act = Some("classic".to_string());
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("act"), "unexpected error: {err}");
+    // A reference from a binary at the current schema version but missing the act
+    // field is stale/doctored and must hard-fail (the oracle records act "classic";
+    // the field proves it).
+    let (mut r, c) = valid_ppl_pair();
+    r.provenance.as_mut().unwrap().act = None;
+    let err = ppl_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no act"), "unexpected error: {err}");
 }
 
 #[test]

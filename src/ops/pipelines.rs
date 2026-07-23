@@ -53,6 +53,11 @@ const F16_T_MIXED_SOURCE: &str = include_str!("f16_t_mixed.metal");
 /// its per-op rounding stays bit-identical to the candle broadcast/affine/sum
 /// chain it replaces (see combine.metal).
 const COMBINE_SOURCE: &str = include_str!("combine.metal");
+/// Vendored fused MoE SwiGLU-activation kernel (the routed-expert silu*mul glue).
+/// Own library (no Metal-4 dependency); compiled with FP contraction/reassociation
+/// disabled so its per-op rounding stays bit-identical to the candle silu + mul
+/// chain it replaces (see silu_mul.metal).
+const SILU_MUL_SOURCE: &str = include_str!("silu_mul.metal");
 /// Vendored fused attention-glue kernels (softplus gate + permute/cast copies).
 /// Own library (no Metal-4 dependency); compiled with FP contraction disabled so
 /// its per-op rounding stays bit-identical to the candle elementwise/copy chains
@@ -189,6 +194,11 @@ pub(crate) fn f16_t_mixed_pipeline(device: &Device, name: &str) -> Result<Comput
 /// Pipeline for a `combine.metal` kernel (vendored fused MoE weighted combine).
 pub(crate) fn combine_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, COMBINE_SOURCE, "combine", name)
+}
+
+/// Pipeline for a `silu_mul.metal` kernel (vendored fused MoE SwiGLU activation).
+pub(crate) fn silu_mul_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, SILU_MUL_SOURCE, "silu_mul", name)
 }
 
 /// Pipeline for an `attn_glue.metal` kernel (fused softplus gate / permute-cast).

@@ -270,14 +270,20 @@ impl ExpertFfn for FusedExperts {
         //     f16 cast, so the rescale is required.
         let needs_rescale = use_mm && crate::ops::mm_id_variant().casts_activation_f16();
 
-        // silu(gate)*up via candle ops. Vendored fused kernels (a full
-        // silu/mul/L2/rescale one, and a plain elementwise silu*mul) were tried
-        // and abandoned: even ~1e-6 differences in how the activation is computed
-        // cascade through the MoE router (near-tie expert flips downstream) to
-        // ~1e-3 final-logit divergence, below the strict gate. Any reimplementation
-        // of the activation cascades, so it stays on candle's ops, which the f32
-        // reference oracle also uses. See docs/parity.md §3b and TODO.md.
-        let act = (silu(&gate)? * up)?; // [seq, top_k, expert_ff]
+        // silu(gate)*up fused into one vendored pass (`ops::silu_mul`), which is
+        // BIT-IDENTICAL to candle's `silu(gate) * up` chain by construction — the
+        // silu expression and the multiply keep candle's exact per-op rounding
+        // boundaries (see silu_mul.metal). Bit-identity is what makes this safe on
+        // every parity tier: an earlier NON-identical fused activation was abandoned
+        // because ~1e-6 differences cascaded through the MoE router (near-tie expert
+        // flips) to ~1e-3 final-logit divergence, but a bitwise match cannot cascade.
+        // `LAGUNA_ACT_CLASSIC` reverts to the candle two-op chain (the reference
+        // oracle's ReferenceExperts also runs that chain). See docs/parity.md §3b.
+        let act = if crate::ops::act_classic() {
+            (silu(&gate)? * up)?
+        } else {
+            crate::ops::silu_mul(&gate, &up)?
+        }; // [seq, top_k, expert_ff]
 
         // Routing weights, f32 [seq, top_k]; the fused combine takes this shape,
         // the classic candle chain reshapes to [seq, top_k, 1] for broadcasting.
@@ -1138,6 +1144,370 @@ mod tests {
                 "caveats: layer 0's dense SwiGLU (ff 12288) approximated by a MoE eval; \
                  {N_DISTINCT} distinct MoE layers looped {PASSES}x (SLC caveat as in \
                  moe_decode_ffn_bench)"
+            );
+        }
+
+        // --- decode expert-gather attribution benches (WP-G1) --------------
+        //
+        // The decode MoE budget's biggest line item is the routed expert
+        // gather: three `mul_mv_id` launches per layer (gate/up/down) over
+        // ~50 MiB of q4_K weights each token-layer (~2.4 GB over 47 layers).
+        // `moe_decode_ffn_bench` derives "mv_id gather + silu*mul + combine" at
+        // ~13.7 ms/token (LPM), ~180 GB/s effective against ~2.4 GB — half the
+        // ~365 GB/s the q6_K lm_head matvec sustains at the same seq==1. These
+        // benches localize the missing half: is it kernel-internal streaming at
+        // expert geometry, inter-dispatch boundaries, or a wrong byte floor?
+        // Synthetic weights at production geometry; never load a model file.
+
+        /// Effective bandwidth: `bytes` moved in `ms` milliseconds, as GB/s
+        /// (decimal GB, matching how the lm_head/prefill numbers are quoted).
+        fn eff_gbps(bytes: usize, ms: f64) -> f64 {
+            bytes as f64 / (ms * 1e-3) / 1e9
+        }
+
+        /// q4_K/q6_K weight bytes of ONE `[n_out, k]` expert row-plane: the ggml
+        /// packing this bench measures against — `k/block_size` super-blocks per
+        /// output row, `type_size` bytes each (q4_K 144/256 = 0.5625 B/weight,
+        /// q6_K 210/256 = 0.8203 B/weight). Mirrors `dispatch::run`'s
+        /// `bytes_per_row = k / block_size * type_size`.
+        fn expert_bytes(dt: GgmlDType, n_out: usize, k: usize) -> usize {
+            n_out * (k / dt.block_size()) * dt.type_size()
+        }
+
+        /// A `[n_out, k]` stack of `N_EXPERT` tiled quantized experts at dtype
+        /// `dt` — `tiled_stack` generalized past q4_K for the q6_K gather
+        /// variants. Same zero-copy construction (buffer retained before the
+        /// storage moves into the QTensor); weight VALUES are timing-irrelevant.
+        fn tiled_stack_dt(dev: &Device, n_out: usize, k: usize, seed: u64, dt: GgmlDType) -> ExpertStack {
+            let one = det_tensor(&[n_out, k], seed, 0.5);
+            let qt = QTensor::quantize(&one, dt).unwrap();
+            let bytes = qt.data().unwrap();
+            let mut all = Vec::with_capacity(bytes.len() * N_EXPERT);
+            for _ in 0..N_EXPERT {
+                all.extend_from_slice(&bytes);
+            }
+            let storage = QStorage::from_data(Cow::Owned(all), dev, dt).unwrap();
+            let buffer = match &storage {
+                QStorage::Metal(qms) => Some(Arc::new(qms.buffer().clone())),
+                _ => None,
+            };
+            let qtensor = Arc::new(QTensor::new(storage, (N_EXPERT, n_out, k)).unwrap());
+            ExpertStack {
+                qtensor: Some(qtensor),
+                buffer,
+                base_off: 0,
+                mmap: None,
+                dtype: dt,
+                n_expert: N_EXPERT,
+                n_out,
+                k,
+            }
+        }
+
+        /// A rank-2 `[n_out, k]` quantized weight sharing one allocation between a
+        /// retained Metal buffer and a QTensor (the `qlinear_with_buffer` / lm_head
+        /// zero-copy shape), built from `n_out/1024` tiled quantized row-blocks so
+        /// large weights quantize fast. `n_out` must be a multiple of 1024.
+        fn tiled_plain(
+            dev: &Device,
+            n_out: usize,
+            k: usize,
+            seed: u64,
+            dt: GgmlDType,
+        ) -> (Arc<candle_metal_kernels::metal::Buffer>, Arc<QTensor>) {
+            const TILE: usize = 1024;
+            assert!(n_out.is_multiple_of(TILE), "n_out {n_out} must be a multiple of {TILE}");
+            let one = det_tensor(&[TILE, k], seed, 0.5);
+            let qt = QTensor::quantize(&one, dt).unwrap();
+            let bytes = qt.data().unwrap();
+            let mut all = Vec::with_capacity(bytes.len() * (n_out / TILE));
+            for _ in 0..n_out / TILE {
+                all.extend_from_slice(&bytes);
+            }
+            let storage = QStorage::from_data(Cow::Owned(all), dev, dt).unwrap();
+            let buffer = match &storage {
+                QStorage::Metal(qms) => Arc::new(qms.buffer().clone()),
+                _ => panic!("tiled_plain weights require Metal storage"),
+            };
+            let qtensor = Arc::new(QTensor::new(storage, (n_out, k)).unwrap());
+            (buffer, qtensor)
+        }
+
+        /// A pool of `n` distinct random `[1, top_k]` u32 id vectors (values in
+        /// `0..n_expert`), on device. Rotating through the pool between launches
+        /// makes each launch gather a DIFFERENT ~50 MiB slice of the 256-expert
+        /// stack (>> any SLC), so back-to-back isolated launches stay DRAM-bound
+        /// instead of re-reading one cache-resident set — the reason these benches
+        /// aren't fooled into reporting cache bandwidth.
+        fn ids_pool(dev: &Device, n: usize, top_k: usize, n_expert: usize, seed: u64) -> Vec<Tensor> {
+            (0..n)
+                .map(|p| {
+                    let mut s = seed
+                        .wrapping_add(p as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(1);
+                    let ids: Vec<u32> = (0..top_k)
+                        .map(|_| {
+                            s ^= s << 13;
+                            s ^= s >> 7;
+                            s ^= s << 17;
+                            (s % n_expert as u64) as u32
+                        })
+                        .collect();
+                    Tensor::from_vec(ids, (1, top_k), dev).unwrap()
+                })
+                .collect()
+        }
+
+        /// Amortized GPU timing: each timed batch issues `inner` calls to
+        /// `launch` (each pushing its output tensor(s) into `outs`, kept alive for
+        /// the whole batch so candle can't recycle a buffer a still-pending
+        /// dispatch reads), then drains the batch with ONE readback of the last
+        /// output. Dividing by `inner` amortizes the command-buffer flush, so the
+        /// result is the kernel+encode cost of one unit, NOT the per-launch
+        /// GPU->CPU sync latency (measure that separately with `inner == 1`). A
+        /// unit may issue more than one kernel (the concurrency pair does two).
+        fn bench_amortized(
+            name: &str,
+            inner: usize,
+            mut launch: impl FnMut(usize, &mut Vec<Tensor>),
+        ) -> f64 {
+            let (warm, iters) = iter_counts();
+            let mut sink = 0f32;
+            for _ in 0..warm {
+                let mut outs = Vec::new();
+                for i in 0..inner {
+                    launch(i, &mut outs);
+                }
+                sink += read_scalar(outs.last().unwrap());
+            }
+            let mut times = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let mut outs = Vec::new();
+                let t = Instant::now();
+                for i in 0..inner {
+                    launch(i, &mut outs);
+                }
+                sink += read_scalar(outs.last().unwrap());
+                times.push(t.elapsed().as_secs_f64() * 1e3 / inner as f64);
+            }
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+            eprintln!(
+                "{name}: mean {mean:.4} ms/unit, min {min:.4} ms/unit (inner {inner}, {iters} iters, sink {sink:.1})"
+            );
+            mean
+        }
+
+        /// Bench 1: ONE isolated `mul_mv_id` launch at the exact decode geometry,
+        /// looped back-to-back with nothing between (ids rotate so the gather stays
+        /// DRAM-bound). Reports ms/launch and effective GB/s counting only the
+        /// `top_k` gathered experts' bytes, for gate/up ([1024,3072], x_per_row=1)
+        /// and down ([3072,1024], x_per_row=top_k), q4_K and q6_K. The decisive
+        /// read: ~350 GB/s says the kernel streams fine and the decode gap lives at
+        /// the pipeline boundaries; ~180 GB/s says the kernel itself under-streams
+        /// at expert geometry (the lm_head conclusion does not transfer). The
+        /// `inner == 1` gate row exposes the per-launch sync latency for contrast.
+        #[test]
+        #[ignore = "perf bench"]
+        fn decode_expert_gather_mv_bench() {
+            let dev = metal();
+            const INNER: usize = 128;
+            eprintln!("building isolated gate/down expert stacks (q4_K + q6_K)...");
+            let ids = ids_pool(&dev, 64, TOP_K, N_EXPERT, 0xABCDE);
+            let x_gate = det_tensor(&[1, 1, HIDDEN], 0x4242, 1.7).to_device(&dev).unwrap();
+            let x_down = det_tensor(&[1, TOP_K, EXPERT_FF], 0x4243, 1.7).to_device(&dev).unwrap();
+
+            let run_gather = |label: &str, stack: &ExpertStack, x: &Tensor, inner: usize| {
+                let mut c = 0usize;
+                let ms = bench_amortized(label, inner, |_, outs| {
+                    let id = &ids[c % ids.len()];
+                    c += 1;
+                    outs.push(mv_id::mul_mv_id(stack, x, id).unwrap());
+                });
+                let gathered = TOP_K * expert_bytes(stack.dtype, stack.n_out, stack.k);
+                eprintln!(
+                    "  {label}: {ms:.4} ms/launch, {:.1} GB/s (gathered {TOP_K} experts = {:.2} MiB)",
+                    eff_gbps(gathered, ms),
+                    gathered as f64 / (1usize << 20) as f64,
+                );
+            };
+
+            let gate_q4 = tiled_stack_dt(&dev, EXPERT_FF, HIDDEN, 0xA001, GgmlDType::Q4K);
+            let down_q4 = tiled_stack_dt(&dev, HIDDEN, EXPERT_FF, 0xA002, GgmlDType::Q4K);
+            let gate_q6 = tiled_stack_dt(&dev, EXPERT_FF, HIDDEN, 0xA003, GgmlDType::Q6K);
+            let down_q6 = tiled_stack_dt(&dev, HIDDEN, EXPERT_FF, 0xA004, GgmlDType::Q6K);
+
+            run_gather("gate q4_K [1024,3072] amortized", &gate_q4, &x_gate, INNER);
+            run_gather("gate q4_K [1024,3072] sync-per-launch", &gate_q4, &x_gate, 1);
+            run_gather("down q4_K [3072,1024] amortized", &down_q4, &x_down, INNER);
+            run_gather("gate q6_K [1024,3072] amortized", &gate_q6, &x_gate, INNER);
+            run_gather("down q6_K [3072,1024] amortized", &down_q6, &x_down, INNER);
+            eprintln!(
+                "read: ~350 GB/s => kernel streams fine, gap is pipeline boundaries; \
+                 ~180 GB/s => the mv_id kernel under-streams at expert geometry. The \
+                 amortized-vs-sync-per-launch gate delta is the per-dispatch sync/boundary cost."
+            );
+        }
+
+        /// Bench 2: plain `mul_mv` (q6_K, seq==1) over a GROWING output-row count
+        /// at fixed k=3072 — effective GB/s vs weight size. Locates where the
+        /// matvec kernel climbs off cache onto the DRAM floor; the expert row
+        /// plane (n_out 1024/3072) and the lm_head (100352) sit on the same curve,
+        /// so it says whether an expert-sized matvec is inherently slower than the
+        /// lm_head or just cache-cold. Same weight reused each launch, so small
+        /// sizes (< SLC) report CACHE bandwidth by design; the large end is the
+        /// true DRAM number.
+        #[test]
+        #[ignore = "perf bench"]
+        fn decode_plain_mv_rowsweep_bench() {
+            let dev = metal();
+            const INNER: usize = 64;
+            const K: usize = HIDDEN; // 3072, the model's hidden dim / lm_head k.
+            let dt = GgmlDType::Q6K;
+            let x = det_tensor(&[1, K], 0x1234, 1.0).to_device(&dev).unwrap();
+            eprintln!("plain q6_K mv, seq==1, k={K}, growing n_out:");
+            for &n_out in &[1024usize, 3072, 4096, 16384, 100352] {
+                let (buffer, _qt) = tiled_plain(&dev, n_out, K, 0x900 + n_out as u64, dt);
+                let ms = bench_amortized(&format!("plain mv q6_K [{n_out}x{K}]"), INNER, |_, outs| {
+                    outs.push(crate::ops::mul_mv(&buffer, dt, n_out, K, &x).unwrap());
+                });
+                let bytes = expert_bytes(dt, n_out, K);
+                eprintln!(
+                    "  n_out {n_out:>6}: {ms:.4} ms/launch, {:.1} GB/s ({:.2} MiB weight{})",
+                    eff_gbps(bytes, ms),
+                    bytes as f64 / (1usize << 20) as f64,
+                    if bytes < (32 << 20) { ", may be SLC-resident" } else { "" },
+                );
+            }
+        }
+
+        /// Bench 3: cumulative stage ablation of the decode routed block, built
+        /// from the SAME ops `FusedExperts::forward` runs at seq==1 (mv_id gate,
+        /// mv_id up, candle silu*mul, mv_id down, `ops::combine`) — production has
+        /// `use_mm=false` and `needs_rescale=false` at seq==1, so this IS that
+        /// path minus routing. Each stage adds one operation; the deltas expose
+        /// per-boundary drain/launch cost. Chains run `N_DISTINCT*PASSES` (48)
+        /// layer-evals and scale to 47; stage (d) should reconcile with
+        /// `moe_decode_ffn_bench`'s derived "mv_id gather + silu*mul + combine".
+        #[test]
+        #[ignore = "perf bench"]
+        fn decode_moe_stage_ablation_bench() {
+            let dev = metal();
+            let evals = N_DISTINCT * PASSES;
+            eprintln!("building {N_DISTINCT} q4_K expert triples (gate/up/down)...");
+            struct Triple {
+                gate: ExpertStack,
+                up: ExpertStack,
+                down: ExpertStack,
+            }
+            let triples: Vec<Triple> = (0..N_DISTINCT)
+                .map(|il| {
+                    let s = 0x7000 + il as u64 * 64;
+                    Triple {
+                        gate: tiled_stack_dt(&dev, EXPERT_FF, HIDDEN, s + 1, GgmlDType::Q4K),
+                        up: tiled_stack_dt(&dev, EXPERT_FF, HIDDEN, s + 2, GgmlDType::Q4K),
+                        down: tiled_stack_dt(&dev, HIDDEN, EXPERT_FF, s + 3, GgmlDType::Q4K),
+                    }
+                })
+                .collect();
+            let xs: Vec<Tensor> = (0..evals)
+                .map(|i| det_tensor(&[1, 1, HIDDEN], 0x8000 + i as u64, 1.7).to_device(&dev).unwrap())
+                .collect();
+            let ids = ids_pool(&dev, evals, TOP_K, N_EXPERT, 0x8888);
+            let ws: Vec<Tensor> = (0..evals)
+                .map(|i| det_tensor(&[1, TOP_K], 0x9000 + i as u64, 0.3).to_device(&dev).unwrap())
+                .collect();
+
+            let gate_up = bench(&format!("(a) gate+up x{evals}"), || {
+                let mut last = None;
+                for i in 0..evals {
+                    let t = &triples[i % N_DISTINCT];
+                    let _g = mv_id::mul_mv_id(&t.gate, &xs[i], &ids[i]).unwrap();
+                    let u = mv_id::mul_mv_id(&t.up, &xs[i], &ids[i]).unwrap();
+                    last = Some((_g, u));
+                }
+                read_scalar(&last.unwrap().1)
+            });
+            let plus_act = bench(&format!("(b) gate+up+silu*mul x{evals}"), || {
+                let mut last = None;
+                for i in 0..evals {
+                    let t = &triples[i % N_DISTINCT];
+                    let g = mv_id::mul_mv_id(&t.gate, &xs[i], &ids[i]).unwrap();
+                    let u = mv_id::mul_mv_id(&t.up, &xs[i], &ids[i]).unwrap();
+                    last = Some((silu(&g).unwrap() * u).unwrap());
+                }
+                read_scalar(&last.unwrap())
+            });
+            let plus_down = bench(&format!("(c) +down x{evals}"), || {
+                let mut last = None;
+                for i in 0..evals {
+                    let t = &triples[i % N_DISTINCT];
+                    let g = mv_id::mul_mv_id(&t.gate, &xs[i], &ids[i]).unwrap();
+                    let u = mv_id::mul_mv_id(&t.up, &xs[i], &ids[i]).unwrap();
+                    let act = (silu(&g).unwrap() * u).unwrap();
+                    last = Some(mv_id::mul_mv_id(&t.down, &act, &ids[i]).unwrap());
+                }
+                read_scalar(&last.unwrap())
+            });
+            let plus_combine = bench(&format!("(d) +combine x{evals}"), || {
+                let mut last = None;
+                for i in 0..evals {
+                    let t = &triples[i % N_DISTINCT];
+                    let g = mv_id::mul_mv_id(&t.gate, &xs[i], &ids[i]).unwrap();
+                    let u = mv_id::mul_mv_id(&t.up, &xs[i], &ids[i]).unwrap();
+                    let act = (silu(&g).unwrap() * u).unwrap();
+                    let down = mv_id::mul_mv_id(&t.down, &act, &ids[i]).unwrap();
+                    last = Some(crate::ops::combine(&down, None, &ws[i]).unwrap());
+                }
+                read_scalar(&last.unwrap())
+            });
+
+            let scale47 = |ms: f64| ms * MOE_LAYERS as f64 / evals as f64;
+            eprintln!("{MOE_LAYERS}-layer-equivalent per token (cumulative):");
+            eprintln!("  (a) gate+up:            {:.3} ms", scale47(gate_up));
+            eprintln!("  (b) +silu*mul:          {:.3} ms  (Δ {:.3})", scale47(plus_act), scale47(plus_act - gate_up));
+            eprintln!("  (c) +down:              {:.3} ms  (Δ {:.3})", scale47(plus_down), scale47(plus_down - plus_act));
+            eprintln!("  (d) +combine:           {:.3} ms  (Δ {:.3})", scale47(plus_combine), scale47(plus_combine - plus_down));
+            eprintln!(
+                "  (d) reconciles with moe_decode_ffn_bench's derived \
+                 'mv_id gather + silu*mul + combine' (~13.7 ms LPM)."
+            );
+        }
+
+        /// Bench 4: concurrency probe. gate and up are independent (distinct dsts,
+        /// shared read-only x/ids) and candle uses a concurrent encoder, so they
+        /// COULD overlap. Time one gate launch vs a gate+up pair (identical shapes,
+        /// so T(up)==T(gate)); ratio pair/(2*single) < 1 means real overlap, ~1
+        /// means serialized OR already bandwidth-saturated on a single launch (no
+        /// spare bandwidth to overlap into — read alongside bench 1's GB/s).
+        #[test]
+        #[ignore = "perf bench"]
+        fn decode_gather_concurrency_bench() {
+            let dev = metal();
+            const INNER: usize = 128;
+            let gate = tiled_stack_dt(&dev, EXPERT_FF, HIDDEN, 0xC001, GgmlDType::Q4K);
+            let up = tiled_stack_dt(&dev, EXPERT_FF, HIDDEN, 0xC002, GgmlDType::Q4K);
+            let ids = ids_pool(&dev, 64, TOP_K, N_EXPERT, 0xC0DE);
+            let x = det_tensor(&[1, 1, HIDDEN], 0x4242, 1.7).to_device(&dev).unwrap();
+
+            let mut c = 0usize;
+            let single = bench_amortized("gate alone", INNER, |_, outs| {
+                let id = &ids[c % ids.len()];
+                c += 1;
+                outs.push(mv_id::mul_mv_id(&gate, &x, id).unwrap());
+            });
+            let mut c = 0usize;
+            let pair = bench_amortized("gate;up pair", INNER, |_, outs| {
+                let id = &ids[c % ids.len()];
+                c += 1;
+                outs.push(mv_id::mul_mv_id(&gate, &x, id).unwrap());
+                outs.push(mv_id::mul_mv_id(&up, &x, id).unwrap());
+            });
+            eprintln!(
+                "single {single:.4} ms, pair {pair:.4} ms; pair/(2*single) = {:.3} \
+                 (< 1 overlap, ~1 serialized or bandwidth-saturated)",
+                pair / (2.0 * single)
             );
         }
 

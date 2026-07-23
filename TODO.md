@@ -24,8 +24,10 @@
    kill-switch; strict tier + reference dumps pin it.
    (b) fuse the remaining attention glue — DONE via 3(c) glue fusion + the
    glue phase 2 ledger item (3 more cast dispatches/layer folded);
-   (c) MoE mv_id gather latency (~14 ms
-   sustained vs ~7 ms bandwidth floor) folds into P2. Same-mode power
+   (c) MoE mv_id gather latency — CLOSED-REFUTED 2026-07-23 (the "~7 ms
+   floor" was a cross-power-mode artifact; see the gather phase-0 ledger
+   item below: everything is at the LPM DRAM wall; salvage = silu·mul
+   fusion item). Same-mode power
    calibration DONE 2026-07-22: decode parity vs fork CONFIRMED in both power
    modes (18.2/18.5 LPM, 38.6/39.2 full); fork's historical bench figures were
    LPM; prefill gap is mode-independent 0.42-0.49x (2×2 matrix + traps in
@@ -611,6 +613,91 @@ implementation — never silently drop scope.
     `fwd_mv` threads the caller's offset correctly). Ready-to-post issue
     draft with repro: `candle-issue-qmatmul-offset.md` (posting alongside
     the residency-set PR is Orvar's call).
+- [x] **MoE mv_id gather phase-0 — CLOSED 2026-07-23, premise REFUTED by
+  in-mode measurement.** The "~14 ms gather vs ~7 ms bandwidth floor" gap
+  does not exist: the floor divided LPM byte volume (2.4-2.9 GB/token
+  routed weights, q4_K 0.5625 / q6_K 0.8203 B/weight) by a FULL-POWER
+  bandwidth anchor (the 0.685 ms lm_head = ~365 GB/s figure; the same
+  matvec measures 1.363 ms in LPM ≈ the 2.1x clamp). Measured in-mode
+  (new decode_bench benches: decode_expert_gather_mv_bench,
+  decode_plain_mv_rowsweep_bench, decode_moe_stage_ablation_bench,
+  decode_gather_concurrency_bench; WARMUP=30/ITERS=150 plateau means —
+  defaults ride the DVFS burst and overstate up to 3x): expert gathers
+  sustain 162-204 GB/s, the lm_head-sized matvec 185 GB/s — the SAME
+  DRAM wall, no size cliff (row sweep converges to the wall), and
+  8.6 GB/token ÷ 185 GB/s reconciles the whole 52 ms decode token.
+  Gate/up do NOT overlap (pair = 1.1x single — a single gather already
+  saturates). Verified independently by orchestrator re-run. Conclusion:
+  the gather is bandwidth-optimal for its byte volume; only byte-count
+  or overhead levers remain. Stage ablation found ONE: silu·mul glue =
+  2.47 ms/token (two candle elementwise dispatches over [10,1024] —
+  overhead-bound, not compute), next item.
+- [x] **Fused silu·mul kernel (decode MoE glue)** — SHIPPED (WP-G2). One
+  vendored pass `ops::silu_mul` (`src/ops/silu_mul.metal`, own runtime-compiled
+  library) replaces the two candle elementwise dispatches at moe.rs ~:280
+  (`silu(gate) * up`), on BOTH the mv and mm branches (the activation is
+  computed once, before the `needs_rescale` split, so the L2 rescale sits AFTER
+  it and the fused op is identical on both paths). BIT-IDENTICAL to candle's
+  `silu(gate) * up` chain: candle's `usilu` (`x / (1 + exp(-x))`) copied
+  verbatim then a separate f32 multiply, with the combine-playbook pragma block
+  (`math_mode(fast)` + `fp contract(off)`/`reassociate(off)`) pinning the
+  boundary rounding — proved by `ops::silu_mul::tests::fused_matches_candle_bitwise`
+  (decode seq=1 + prefill seq=8/512, wide-magnitude signed inputs). Kill-switch
+  `LAGUNA_ACT_CLASSIC` reverts to the candle chain. Provenance `act` field
+  (schema v4, grandfather "classic"), enforced per tier like `combine` (strict
+  pins classic, mm/decode pin fused, reference pins classic). The earlier
+  abandonment (retired-kernels note above) was a NON-identical activation;
+  bit-identity cannot cascade through the router. Measured: decode is DEAD
+  EVEN (A/B/B/A 256-tok real-model: fused 19.6/19.0 vs classic 19.4/19.3
+  tok/s LPM; greedy output bitwise identical across paths) — WP-G1's
+  2.47 ms silu·mul attribution was an ablation ARTIFACT of the same
+  order/DVFS noise its report warned about elsewhere (the isolation A/B
+  flips sign with run order; true 2-dispatch overhead ≈ 0.2 ms). Kept as
+  default per the vendored-mv precedent: strictly not slower, one fewer
+  dispatch, insulated from candle elementwise changes. All six parity
+  gates PASS at the existing anchors, zero reference regeneration (the
+  grandfathering paid off). LESSON: cross-check any stage-ablation delta
+  against an end-to-end A/B/B/A before building on it.
+- [ ] **Signed bounds-guard hardening in the older glue kernels** — GLM review
+  (silu·mul round) spotted the pattern: `if ((int) tid >= n)` guards in
+  attn_glue.metal (:94, :137) and rope.metal (:73) let a stray thread at
+  tid == 2^31 wrap negative and slip past the guard into a one-element OOB
+  write — reachable ONLY at n == i32::MAX (glue_index_fits_i32 permits it;
+  production maxima ~5M, so latent, not live). silu_mul.metal already uses
+  the unsigned compare (fixed same round). One-line fixes; guard change
+  cannot affect in-bounds math (bit-identity contracts unaffected), but
+  land them as their own commit with the suite re-run.
+- [ ] **Attention-weight quantization probe (biggest remaining decode lever,
+  real quality risk)** — the official GGUF ships attention F16: ~5.6 GB of
+  the ~8.6 GB/token decode traffic (65%). Q8_0 attention would cut
+  ~2.6 GB/token → theoretical decode ~19 → ~27 LPM. Measurement-first:
+  (1) preview with the FORK — quantize attention (llama-quantize from F16
+  + published imatrix, or an existing third-party quant, e.g. unsloth
+  dynamic if it covers this model) and bench fork decode + ppl delta
+  before building anything; (2) only if quality survives the ppl/greedy
+  gates, port: loader (mmap f16-plane assumptions), quantized-attn
+  matvec/gemm paths (vendored mv covers q4_K/q6_K; q8_0 needs a variant).
+  CAUTION: llama.cpp's Q4_K_M normally quantizes attention — the model
+  authors keeping F16 suggests measured sensitivity; treat the ppl gate
+  as the decider, not an afterthought.
+- [ ] **Long-context decode traffic (KV quantization)** — at 32k ctx the 12
+  full-attention layers read ~1.6 GB/token of f16 KV on top of weights
+  (SWA caps the other 36 at window 512); scales linearly toward the 256k
+  design target. Levers: quantized KV cache (q8_0 KV halves it; fork
+  supports cache-type-k/v as prior art), plus the existing decode
+  vec-kernel port item above. Invisible in all current short-ctx benches —
+  needs a long-ctx decode bench first.
+- [ ] **DFlash acceptance/coverage** — the only remaining short-ctx decode
+  lever given the DRAM wall: each accepted draft amortizes the full
+  ~8.6 GB/token weight read. Prose/reasoning-stream acceptance is the
+  ceiling (measured: thinking-heavy generations pause to ≈parity; boilerplate
+  code hits 1.3-1.5x). Directions: draft-length/p_min policy tuning per
+  measured stretch, drafter-side improvements. (Auto-pause already
+  guarantees the ≥parity floor.)
+- [ ] **Full-power re-bench** — the CLAUDE.md "ours full" columns predate the
+  2026-07-23 work (flash/tensor prefill, DFlash, silu_mul). One
+  pmset-verified full-power pass over decode/prefill/spec refreshes the
+  table (owner runs high power occasionally — piggyback on such a session).
 - [ ] **HTTP server** (OpenAI-compatible /v1/chat/completions) so coding agents can
   connect; v1 is CLI-only per scope decision.
 - [ ] **Self-quantized Q5/Q6 tier** — official GGUF repo only ships Q4_K_M (75.2GB),
