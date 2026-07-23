@@ -16,5 +16,11 @@
 // Only instantiated for q4_K/q6_K (the production experts); mm_kernel_instantiated
 // in dispatch.rs restricts TensorHp to those dtypes, and the
 // instantiation_matrix_matches_metal test cross-checks that against THIS file.
+
+// Re-assert the math-mode pin for the concatenated TensorHp library (mm_id.metal
+// already sets it at ITS file scope; repeating the same value here is a no-op
+// that keeps this fragment self-describing). See mm_id.metal for the rationale.
+#pragma METAL fp math_mode(fast)
+
 template [[host_name("kernel_mul_mm_id_q4_K_f32_t_hp")]] kernel mul_mm_id_t kernel_mul_mm_id_t<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32_t_hp")]] kernel mul_mm_id_t kernel_mul_mm_id_t<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;

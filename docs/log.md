@@ -4,6 +4,108 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — attention glue fusion SHIPPED: prefill 238→262 @925, decode 18.2→19.1 (passes the fork in LPM)
+
+**What shipped.** Three fused Metal kernels replacing ~275 ms/forward of
+candle-op glue traffic in the attention block, each bit-identical by
+construction to the chain it replaces (the combine playbook: exact per-op
+rounding replication, f32::to_bits equality tests vs the live candle chain):
+`kernel_attn_gate` (the ~10-dispatch softplus chain + broadcast_mul → one
+pass; candle's affine is fma, exp/log plain fast-math intrinsics, fp
+contract/reassociate off), `kernel_permute_cast_*` (transpose+contiguous+
+f16-cast collapsed to one pass each), `kernel_rope_neox` (partial rotary
+internal to the kernel — no narrow/contiguous/cat; body is candle's rope
+template verbatim, deliberately compiled WITHOUT fp pragmas in its own
+library to inherit candle's contraction decisions). Kill-switch
+`LAGUNA_ATTN_GLUE_CLASSIC`; provenance `attn_glue` enforced per tier (fused
+for mm/decode/ppl candidates, classic pinned for strict + references).
+Dispatches per attention layer: prefill 26→10 (full) / 20→10 (SWA), decode
+22→7 — the fused gate/rope/cast run at seq==1 too, which subsumed the old
+P1(b) decode-glue item and bought decode 18.2 → 19.1 tok/s: LPM decode now
+PASSES the fork (18.5). Prefill: 238.5 → 262.1 @925, 235.8 → 255.6 @4k
+(0.74x fork LPM, from 0.49x at yesterday's open).
+
+**Gate.** All six grades PASS at the exact known-good anchors (strict
+0.999057, mm 0.996987, decode 62/64+2exc / 64/64 / 59/64+5exc, Δnll
+0.001937) — bit-identity confirmed at model level. References were
+regenerated only because the new provenance field hard-fails on dumps that
+predate it (the enforcement working as designed, but the 3rd ~40-min regen
+tax paid for a field addition — schema-version grandfathering proposed in
+TODO to make it the last). reference-ppl mean_nll bit-identical across the
+regen (4th time), which is live proof the classic fallback reproduces the
+pre-fusion chain exactly.
+
+**Review round (Claude + Codex + GLM + DeepSeek) and the math-mode arc.**
+No live bugs; the substantive find (DeepSeek, corroborated) was that all our
+vendored libraries compile with nil MTLCompileOptions while candle pins
+MathMode::Fast explicitly (private factory, unreachable at the pinned rev —
+consistent with the combine-arc finding). Research vs the MSL v4.1 spec:
+nil options resolve to Fast/Fast by documented default (fastMathEnabled
+bridging), so behavior already matched — the exposure was only a future OS
+default flip. Hardening applied: `#pragma METAL fp math_mode(fast)` at file
+scope in all NINE vendored .metal sources (spec §1.6; bad options in the
+recognized `METAL fp` namespace hard-error, so compiling proves it honored —
+the reassociate(off) precedent), plus a load-time hard error if
+CANDLE_METAL_ENABLE_FAST_MATH is set falsy (candle would compile
+Relaxed/Precise while our libs stay pinned Fast — mixed modes silently void
+every bitwise contract). Checked the FORK's compile too
+(ggml-metal-device.m:228): `[MTLCompileOptions new]` defaults, i.e. also
+Fast — refuting the hypothesis that fast-math explains the tensor-gemm
+envelope difference (it is common-mode across candidate, reference, and
+fork; the open per-op question — where our envelope IS spent, sdpa-in-f16
+being the prime suspect — is a TODO item). Other hardening from the round:
+overflow-checked size products (checked_elems), same-device checks
+(Device::same_device exists at the pinned rev), offset-view bitwise test,
+fail-fast attn_glue in isReferenceDump. Deferred sweeps + phase-2 cast
+folding: TODO ledger.
+
+**Tooling.** `scripts/bench.ts` checked in (the guarded bench protocol —
+pgrep model-binary guard, pmset verification at start AND end with
+mode-stamped results, committed bench prompts in
+tests/fixtures/bench-prompts/, --gate chaining). Writing it immediately
+caught a real bug: parity-gate's process guard pattern matched a reviewer's
+`git diff -- src/bin/logits-dump.rs` command line as a "model process";
+both guards now require actual binary-path signatures.
+
+## 2026-07-23 — mixed-operand matmul2d probed and CLOSED; encoder-takeover premise corrected; glue fusion begins
+
+**Mixed-operand probe (the tensor-gemm escape hatch): dead, conclusively.**
+The hope was `matmul2d` with f16 weight tiles × f32 activation tiles — tensor
+speed with zero activation rounding, sidestepping the decode-gate rejection.
+Two agents ran in parallel and *disagreed*: web research found four projects
+(llama.cpp #17986, whisper.cpp #3601, ollama ×2) hitting an "Input types must
+match cooperative tensor types" static_assert and concluded mixed operands are
+compiler-rejected; the empirical probe on THIS toolchain compiled and ran fine
+(`src/ops/f16_t_mixed.metal` — the SDK header's dtype table lists
+float×half→float; the assert those projects hit applies to mismatched 16-bit
+pairs). Empirics beat literature — but the answer is still no: the mixed
+kernel is BIT-IDENTICAL to classic (rel_l2 exactly 0.0, all six shapes) and
+classic-SPEED (~1.02-1.07x, vs 1.6-2x for half tiles). A float operand
+forfeits f16 tensor-core issue and lowers to the same K-ascending f32
+simdgroup MMA sequence classic hand-codes — the bit-identity and the missing
+speedup are the same fact. There is no rounding-free tensor speedup; the 2x
+is inseparable from f16 activation staging, which the decode envelope
+rejects. Projections stay classic; probe kernel + tests kept as evidence
+(test-only, never production-selected). Trap for future matmul2d work:
+f16_t.metal's `mm.run(sB, sA, ..)` vs `<tA, tB, float>` destination template
+order is accidental-harmless with same-type tiles and WRONG with distinct
+types; the mixed kernel carries the corrected order.
+
+**Encoder-takeover premise corrected (territory map).** TODO's claim that
+"candle's eager op-per-encoder submission serializes all of it" is false at
+our pinned rev: candle shares ONE Concurrent-dispatch encoder across ~50
+dispatches with whole-buffer-pointer hazard tracking, and our custom ops
+already ride it. The fork's real edge is byte-RANGE hazard granularity (candle
+emits a full memoryBarrier that resets the whole concurrent set on any
+pointer-level hazard, so a dependency chain degrades to serial) plus graph
+reorder into concurrent windows. Realizable prize = range-tracking + reorder
+only; details and risks (buffer-pool pointer aliasing, prev_ce_outputs fence
+protocol, vendoring prerequisite) recorded in the TODO ledger item. The
+strategically load-bearing corollary: the ~275 ms attention glue is a TRAFFIC
+problem — concurrency would only overlap those copies, fusion removes them —
+so 3(c) glue fusion sequences BEFORE any takeover, which then schedules
+fewer, fatter kernels.
+
 ## 2026-07-23 — tensor attention gemm: 2x in isolation, REJECTED as default by the decode gate; kept as opt-in
 
 **Arc.** The attention sub-budget put the prefill projections (classic

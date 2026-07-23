@@ -1,33 +1,29 @@
-// Vendored Metal-4 cooperative-tensor port of the f16-weight x f32-activation
-// attention PREFILL gemm — the tensor analogue of f16.metal's classic simdgroup
-// kernel_mul_mm_f16_f32_v. OPT-IN via LAGUNA_ATTN_MM_TENSOR (the classic kernel
-// is the shipped default; the tensor path's f16 activation staging flipped a
-// 0.6-margin reference decode decision outside the fork envelope — see
-// docs/parity.md §3b). When opted in it serves matmul_f16's mm branch
-// (ne11 >= 8); the decode gemv (ne11 < 8) never reaches here — it always runs
-// f16.metal's classic kernel_mul_mv_f16_f32_v.
+// MIXED-OPERAND probe variant of f16_t.metal's cooperative-tensor attention
+// prefill gemm: the weight tile stays half (the stored dtype — zero extra
+// rounding) but the activation tile stays FLOAT instead of being staged to
+// half. MetalPerformancePrimitives documents `float(left) x half(right) ->
+// float` as a supported matmul2d combination (MPPTensorOpsMatMul2d.h's dtype
+// table), which is exactly this kernel's operand order: left = activations
+// (float), right = weights (half), f32 accumulate. If it holds most of the
+// tensor path's speed it removes the f16 activation rounding that kept
+// f16_t.metal opt-in (see that file's header) — the only remaining drift vs
+// the classic simdgroup kernel would be tile accumulation order.
 //
-// One tensor instantiation, half operand tiles: the f32 activation is staged to
-// half (matmul2d over HALF cooperative tensors is the only instantiation the
-// mm_id.metal probe test validates), the stored f16 weight is widened to half,
-// products accumulate in f32, output is f32. So the activation is rounded to
-// half here — one extra f16 rounding over the classic kernel's float tiles —
-// which puts this path in the fork's own prefill precision class (~2e-4 vs the
-// classic kernel; the graduated f16.rs numerics test pins < 5e-4). Attention
-// activations are post-RMSNorm and bounded, so no rescale guard is needed (the
-// fork stages them half unguarded too).
+// TEST-ONLY REACHABILITY: dispatched exclusively through
+// dispatch.rs::run_matmul_f16_variant's `TensorMixed` arm, which no production
+// selection ever passes. Its own library (pipelines.rs::f16_t_mixed_pipeline),
+// compiled lazily on first dispatch — the mm_id_t_hp isolation pattern — so a
+// toolchain that rejects mixed-operand matmul2d fails only this probe, never
+// the default (or the half-tile tensor) library.
 //
-// The tile geometry (NR0=64 out-rows, NR1=32 tokens, NK=32), the ROW-MAJOR
-// (NK-strided) tile stores, the matmul2d descriptor and the cooperative-tensor
-// store are the validated mm_id.metal::kernel_mul_mm_id_t layout. Only the input
-// addressing (dense f16 weight + f32 activation, no per-expert gather / dequant)
-// and the output store (dense [t, n_out], no token-slot scatter) are the
-// dense-kernel forms from f16.metal.
-//
-// DELIBERATELY a SEPARATE library from f16.metal: this file needs Metal-4
-// (<metal_tensor> + matmul2d), so it is compiled lazily on first tensor-path
-// dispatch (src/ops/pipelines.rs::f16_t_pipeline) and the classic f16.metal
-// library stays Metal-4-free. Mirrors the mm_id.metal / mm_id_t_hp.metal split.
+// Byte-for-byte f16_t.metal except: sb is a float tile (the staging store is a
+// straight float2x4 copy, no half conversion), tB is a float tensor, and the
+// destination cooperative tensor is requested with the REAL left/right operand
+// order <decltype(tB), decltype(tA)> — f16_t.metal passes <tA, tB>, harmless
+// there because both tiles share one type, but with distinct element types the
+// order selects the dtype combination. Threadgroup memory stays 8192 B:
+// sa 64x32 half = 4096, sb 32x32 float = 4096, and the store-back float tile
+// reuses the full region (64x32 float = 8192).
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -63,11 +59,10 @@ typedef struct {
     int16_t  r3;
 } mm_args;
 
-// Dense f16-weight gemm on the cooperative-tensor path: half operand tiles,
-// f32 accumulate, f32 output. Grid: (ceil(ne1/NR1), ceil(ne0/NR0), 1); 128
-// threads (4 simdgroups); 8192 B threadgroup memory (sa+sb half tiles, the
-// store-back reuses the region as an NR0 x NR1 float tile).
-kernel void kernel_mul_mm_f16_f32_t(
+// Dense f16-weight gemm, mixed cooperative-tensor operands: half weight tile x
+// FLOAT activation tile, f32 accumulate, f32 output. Grid: (ceil(ne1/NR1),
+// ceil(ne0/NR0), 1); 128 threads (4 simdgroups); 8192 B threadgroup memory.
+kernel void kernel_mul_mm_f16_f32_t_mixed(
         constant mm_args   & args [[buffer(0)]],
         device const char * src0  [[buffer(1)]],
         device const char * src1  [[buffer(2)]],
@@ -78,7 +73,7 @@ kernel void kernel_mul_mm_f16_f32_t(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     threadgroup half  * sa = (threadgroup half  *)(shmem);
-    threadgroup half  * sb = (threadgroup half  *)(shmem + sizeof(half) * 64 * 32);
+    threadgroup float * sb = (threadgroup float *)(shmem + sizeof(half) * 64 * 32);
     threadgroup float * sc = (threadgroup float *)(shmem);
 
     constexpr int NR0 = 64;
@@ -111,14 +106,16 @@ kernel void kernel_mul_mm_f16_f32_t(
         + args.nb11*(r1 + lr1)
         + args.nb10*iy);
 
-    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK,  NR0));
-    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NR1, NK ));
+    auto tA = tensor<threadgroup half,  dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK,  NR0));
+    auto tB = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NR1, NK ));
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(NR1, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
+    // run(sB, sA, cT): left = float activations, right = half weights, so the
+    // destination is requested for <left = tB, right = tA> in that order.
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         // widen f16 weight + store to threadgroup memory, row-major (NK-strided).
@@ -138,14 +135,15 @@ kernel void kernel_mul_mm_f16_f32_t(
             }
         }
 
-        // stage the f32 activation to half (the one f16 rounding of this path).
+        // stage the f32 activation UNROUNDED (the whole point of this probe:
+        // no half conversion — a straight float copy).
         {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
 
             const short ly = (tiitg/NL1)%8;
 
-            *(threadgroup half2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (half2x4)(*((device const float2x4 *) y));
+            *(threadgroup float2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = *((device const float2x4 *) y);
         }
 
         x += 2;

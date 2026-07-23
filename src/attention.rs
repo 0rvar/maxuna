@@ -180,16 +180,32 @@ impl AttnBlock {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
+        // Fused attention-glue kernels (Metal): each is bit-identical to the
+        // candle chain it replaces (ops::attn_glue bitwise tests), so this is a
+        // pure dispatch/traffic optimization. LAGUNA_ATTN_GLUE_CLASSIC reverts
+        // every glue site (here, sdpa_attention, and Rope::rotate) to the
+        // candle chains; non-Metal devices always run them.
+        let fused_glue =
+            matches!(x_normed.device(), Device::Metal(_)) && !crate::ops::attn_glue_classic();
+
         // To [head, seq, head_dim] for rope + attention. At seq==1 (decode) the
         // [1, head, dim] and [head, 1, dim] layouts share byte order, so a reshape
         // (metadata only) is bit-identical to transpose+contiguous and drops three
         // copy dispatches per layer on the hot decode path. seq>1 (prefill) is a
-        // real permutation, so it keeps the transpose+contiguous.
+        // real permutation: one fused permute-copy pass each for q/k (which must
+        // stay f32 for rope), and for v a single permute+f16-cast pass that also
+        // absorbs the cache-append cast (v is not roped).
         let (q, k, v) = if seq == 1 {
             (
                 q.reshape((self.n_head, 1, self.head_dim))?,
                 k.reshape((self.n_kv_head, 1, self.head_dim))?,
                 v.reshape((self.n_kv_head, 1, self.head_dim))?,
+            )
+        } else if fused_glue {
+            (
+                crate::ops::permute_01(&q)?,
+                crate::ops::permute_01(&k)?,
+                crate::ops::permute_01_f16(&v)?, // [n_kv, seq, hd] f16, cache-ready
             )
         } else {
             (
@@ -203,7 +219,17 @@ impl AttnBlock {
 
         // Cache in f16; sdpa runs in f16. The additive mask is pre-built and
         // hoisted by the caller (one per kind per forward; None at decode).
-        let (k_all, v_all) = cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?)?;
+        // The fused prefill path delivered v already f16 (cast folded into its
+        // permute above); k always casts here, post-rope.
+        let k16 = if fused_glue { crate::ops::cast_f16(&k)? } else { k.to_dtype(DType::F16)? };
+        let v16 = if v.dtype() == DType::F16 {
+            v
+        } else if fused_glue {
+            crate::ops::cast_f16(&v)?
+        } else {
+            v.to_dtype(DType::F16)?
+        };
+        let (k_all, v_all) = cache.append(&k16, &v16)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
 
         // sdpa is a Metal-only kernel; fall back to an explicit f32 attention on
@@ -216,15 +242,23 @@ impl AttnBlock {
             self.manual_attention(&q, &k_all, &v_all, mask.map(|m| &m.raw), scale, seq)?
         }; // [n_head, seq, head_dim] f32
 
-        // Softplus output gate, per-head, broadcast over head_dim, in f32.
-        let gate = softplus(&gate_logits)?.transpose(0, 1)?.reshape((self.n_head, seq, 1))?;
-        let attn = attn.broadcast_mul(&gate)?;
+        // Softplus output gate, per-head, broadcast over head_dim, in f32. The
+        // fused kernel collapses the softplus chain + gate copy + broadcast_mul
+        // into one pass over attn (bit-identical to the candle chain).
+        let attn = if fused_glue {
+            crate::ops::attn_gate(&attn, &gate_logits)?
+        } else {
+            let gate = softplus(&gate_logits)?.transpose(0, 1)?.reshape((self.n_head, seq, 1))?;
+            attn.broadcast_mul(&gate)?
+        };
 
         // Back to [seq, n_head*head_dim] then o_proj. Same seq==1 shortcut: the
         // [head, 1, dim] -> [1, head*dim] regroup is byte-identical to
         // transpose+contiguous+reshape, so decode skips the copy.
         let out = if seq == 1 {
             attn.reshape((seq, self.n_head * self.head_dim))?
+        } else if fused_glue {
+            crate::ops::permute_01(&attn)?.reshape((seq, self.n_head * self.head_dim))?
         } else {
             attn.transpose(0, 1)?.contiguous()?.reshape((seq, self.n_head * self.head_dim))?
         };
@@ -244,7 +278,16 @@ impl AttnBlock {
         mask: Option<&Tensor>,
         scale: f32,
     ) -> Result<Tensor> {
-        let q = q.to_dtype(DType::F16)?.unsqueeze(0)?.contiguous()?; // [1, n_head, seq, hd]
+        // Metal-only path, so the glue switch alone picks the cast kernels. q
+        // arrives contiguous (rope output / decode reshape), so the fused cast
+        // needs no trailing contiguous; both casts are bit-identical to
+        // to_dtype (RTNE narrowing, exact widening).
+        let fused_glue = !crate::ops::attn_glue_classic();
+        let q = if fused_glue {
+            crate::ops::cast_f16(q)?.unsqueeze(0)? // [1, n_head, seq, hd]
+        } else {
+            q.to_dtype(DType::F16)?.unsqueeze(0)?.contiguous()?
+        };
         // k/v stay as the cache's narrowed views: rows within a head are
         // contiguous and only the head dimension carries the max_ctx gap, which
         // sdpa handles via the per-head k/v stride it is passed. Materializing a
@@ -253,7 +296,8 @@ impl AttnBlock {
         let v = v_all.unsqueeze(0)?;
 
         let out = candle_nn::ops::sdpa(&q, &k, &v, mask, false, scale, 1.0)?;
-        Ok(out.squeeze(0)?.to_dtype(DType::F32)?)
+        let out = out.squeeze(0)?;
+        Ok(if fused_glue { crate::ops::cast_f32(&out)? } else { out.to_dtype(DType::F32)? })
     }
 
     /// Explicit softmax(q·kᵀ·scale + mask)·v in q's dtype (f32), GQA via a

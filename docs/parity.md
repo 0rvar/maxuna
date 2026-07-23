@@ -310,6 +310,17 @@ kernels and they have different (both correct) numerical envelopes vs the f32
     NOT make — the fork agrees with the reference there), so our drift exceeds the
     fork envelope. It is kept for future numerics work. A dump missing the field is
     a stale binary and hard-fails (regenerate).
+  - `attn_glue` (the attention-glue path: the fused softplus gate, the fused
+    permute/cast copies, and the fused partial-rotary rope — all vendored kernels
+    behind ONE kill-switch, `LAGUNA_ATTN_GLUE_CLASSIC`) is pinned per side in EVERY
+    tier: reference dumps and strict candidates must be `"classic"` (the gate
+    script pins the env var for both — unlike `combine`, the Reference oracle
+    EXECUTES the attention glue, so its anchor is the env pin, not a separate code
+    path), while mm/decode/ppl candidates grade the shipped fused kernels and must
+    be `"fused"`. Each fused kernel is BIT-IDENTICAL to the candle chain it
+    replaces (proven by `f32::to_bits` tests in `src/ops/attn_glue.rs` against the
+    live chains), so the pin anchors provenance rather than a numerical tier. A
+    dump missing the field is a stale binary and hard-fails (regenerate).
   - Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE must prove the mm_id path was
     actually active — `moe_impl == "fused"`, `seq_len >= mm_min_seq`,
     `no_mm_id == false` — else the gate hard-fails asking you to regenerate.

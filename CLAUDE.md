@@ -201,19 +201,20 @@ Warm steady-state, fused path, vs fork `llama-bench`, pmset-verified 2×2
 
 | | ours LPM | fork LPM | ours full | fork full |
 |---|---|---|---|---|
-| decode (256-tok sustained / tg128) | ~18.2 tok/s | 18.5 | ~38.6 | 39.2 |
-| prefill short (630-925 tok / pp512) | ~228 tok/s | 354 | (stale: ~415) | 990 |
-| prefill 4k (4007 tok / pp4096) | ~237 tok/s | 348 | (stale: ~345) | 793 |
+| decode (256-tok sustained / tg128) | ~19.1 tok/s | 18.5 | (stale: ~38.6) | 39.2 |
+| prefill short (630-925 tok / pp512) | ~262 tok/s | 354 | (stale: ~415) | 990 |
+| prefill 4k (4007 tok / pp4096) | ~256 tok/s | 348 | (stale: ~345) | 793 |
 
-Decode is at parity with the fork in BOTH modes (0.98x). Prefill "ours" LPM
-figures are 2026-07-23 post combine-fusion + mask-hoisting (174 → ~230-238
-@925, ~155 → 236 @4k in one day); the full-power ours column predates both.
-The remaining prefill gap (~0.67x fork) is led by the attention projections
-gemm — the cooperative-tensor port is ~2x in isolation but REJECTED as
-default by the decode gate (drift outside the fork envelope; opt-in
-`LAGUNA_ATTN_MM_TENSOR`, see docs/log.md; mixed-operand matmul2d is the open
-follow-up) — plus the transpose/cast/rope glue and serial scheduling vs
-ggml's concurrent encoder.
+LPM decode now PASSES the fork (1.03x, post glue-fusion 2026-07-23); the
+"ours full" column predates all of the 2026-07-23 work. Prefill "ours" LPM
+figures are 2026-07-23 post combine-fusion + mask-hoisting + attention glue
+fusion (174 → 262 @925, ~155 → 256 @4k in one day; ~0.74x fork). The
+remaining prefill gap is led by the attention projections gemm — the
+cooperative-tensor port is ~2x in isolation but REJECTED as default by the
+decode gate (drift outside the fork envelope; opt-in `LAGUNA_ATTN_MM_TENSOR`;
+mixed-operand matmul2d PROBED AND CLOSED — compiles but classic-speed, see
+docs/log.md) — plus sdpa/serial-scheduling vs ggml's range-tracked concurrent
+encoder (see the corrected encoder-takeover ledger item in TODO.md).
 
 Prefill: the vendored two-pass mm_id kernel (tensor `matmul2d` default) took
 prefill ~60 → ~188 tok/s (3.1x; ~174 re-measured 2026-07-22 in LPM). Decode:
@@ -231,18 +232,20 @@ One CPU↔GPU sync/token, routing on-GPU, transpose-contiguous copies are
 metadata reshapes at seq==1.
 
 Known remaining gaps (see TODO.md priority list for the plan):
-- **Prefill (0.53-0.60x fork after combine fusion)**: the measured budget says
-  attention is ~46% of the forward (transpose/contiguous copies, mask
-  materialization, f16 casts, rope narrow/cat on full layers — the fork runs
-  flash-attention on permute VIEWS with none of that), plus serial scheduling
-  vs ggml's concurrent encoder. Routing glue measured ~1% — do NOT "fuse
-  routing" for perf. The MoE combine tail is DONE (src/ops/combine.metal,
-  bit-identical to candle's chain by construction, bitwise-tested;
-  LAGUNA_COMBINE_CLASSIC kill-switch; provenance-enforced per tier).
-- **Decode (parity with fork in both modes — 18.2 vs 18.5 LPM, 38.6 vs 39.2
-  full)**: remaining levers to PASS the fork are the MoE mv_id gather (~14 ms
-  sustained vs ~7 ms bandwidth floor), attention glue fusion (~6 ms
-  sustained), then DFlash.
+- **Prefill (~0.74x fork after combine fusion + mask hoisting + glue
+  fusion)**: the attention glue traffic is now fused
+  (src/ops/attn_glue.metal + rope.metal, bit-identical by construction,
+  LAGUNA_ATTN_GLUE_CLASSIC kill-switch, `attn_glue` provenance per tier),
+  as is the MoE combine tail (src/ops/combine.metal). Remaining levers:
+  encoder takeover (range-tracked barriers + reorder — candle already runs
+  ONE concurrent encoder our ops ride; see the corrected TODO ledger item),
+  glue phase 2 (fold remaining f16 casts into gate/rope kernels), and the
+  blocked projections-gemm question (per-op drift attribution TODO decides
+  whether sdpa precision buys the envelope back). Routing glue measured ~1%
+  — do NOT "fuse routing" for perf.
+- **Decode (LPM: 19.1 vs fork 18.5 — ahead post glue fusion; full-power
+  numbers stale)**: remaining levers are the MoE mv_id gather (~14 ms
+  sustained vs ~7 ms bandwidth floor), then DFlash.
 - `LAGUNA_BENCH` env var enables a warm-up forward for steady-state timing.
   Bench ≥ 256 decode tokens — sub-second runs report boost-clock fiction.
 

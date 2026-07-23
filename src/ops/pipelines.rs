@@ -41,11 +41,28 @@ const F16_SOURCE: &str = include_str!("f16.metal");
 /// the classic default the mm branch never asks for this library, so it never
 /// compiles.
 const F16_T_SOURCE: &str = include_str!("f16_t.metal");
+/// PROBE: the mixed-operand (half weight tile x FLOAT activation tile)
+/// cooperative-tensor variant of `f16_t.metal`. Test-only reachability
+/// (`run_matmul_f16_variant`'s `TensorMixed` arm); its own lazily compiled
+/// library — the `mm_id_t_hp` isolation pattern — so a toolchain that rejects
+/// mixed-operand `matmul2d` fails only this probe, never the default or the
+/// half-tile tensor library.
+const F16_T_MIXED_SOURCE: &str = include_str!("f16_t_mixed.metal");
 /// Vendored fused MoE weighted-combine kernels (the routed-expert combine tail).
 /// Own library (no Metal-4 dependency); compiled with FP contraction disabled so
 /// its per-op rounding stays bit-identical to the candle broadcast/affine/sum
 /// chain it replaces (see combine.metal).
 const COMBINE_SOURCE: &str = include_str!("combine.metal");
+/// Vendored fused attention-glue kernels (softplus gate + permute/cast copies).
+/// Own library (no Metal-4 dependency); compiled with FP contraction disabled so
+/// its per-op rounding stays bit-identical to the candle elementwise/copy chains
+/// it replaces (see attn_glue.metal).
+const ATTN_GLUE_SOURCE: &str = include_str!("attn_glue.metal");
+/// Vendored NEOX rope kernel with internal partial rotary. A SEPARATE library
+/// from attn_glue.metal because that file's fp pragmas are file-scoped and the
+/// rope rotation must instead compile under the same default math mode as
+/// candle's own rope kernel to stay bit-identical (see rope.metal).
+const ROPE_SOURCE: &str = include_str!("rope.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -83,6 +100,20 @@ fn compiled_pipeline(
     source_key: &'static str,
     name: &str,
 ) -> Result<ComputePipeline> {
+    // The vendored kernels' bit-identity contracts assume candle's kernels
+    // compile in candle's default fast-math mode; our sources are pinned
+    // `math_mode(fast)`. A falsy CANDLE_METAL_ENABLE_FAST_MATH would move
+    // candle to Relaxed/Precise while ours stay fast — a silent break of every
+    // bitwise contract, so refuse to run rather than warn (the same
+    // fail-closed stance the parity provenance system takes).
+    if crate::ops::candle_fast_math_disabled() {
+        anyhow::bail!(
+            "CANDLE_METAL_ENABLE_FAST_MATH is set falsy: candle would compile its Metal kernels \
+             Relaxed/Precise while laguna's vendored libraries are pinned math_mode(fast), \
+             silently breaking their bitwise-identity contracts (combine/attn_glue/rope). \
+             Unset the variable — the two compile modes cannot be mixed."
+        );
+    }
     let key = device.registry_id();
     let mut cache = cache().lock().unwrap();
 
@@ -144,7 +175,23 @@ pub(crate) fn f16_t_pipeline(device: &Device, name: &str) -> Result<ComputePipel
     compiled_pipeline(device, F16_T_SOURCE, "f16_t", name)
 }
 
+/// Pipeline for an `f16_t_mixed.metal` kernel (the mixed-operand matmul2d
+/// probe). Own library, compiled lazily on first (test-only) dispatch.
+pub(crate) fn f16_t_mixed_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, F16_T_MIXED_SOURCE, "f16_t_mixed", name)
+}
+
 /// Pipeline for a `combine.metal` kernel (vendored fused MoE weighted combine).
 pub(crate) fn combine_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, COMBINE_SOURCE, "combine", name)
+}
+
+/// Pipeline for an `attn_glue.metal` kernel (fused softplus gate / permute-cast).
+pub(crate) fn attn_glue_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, ATTN_GLUE_SOURCE, "attn_glue", name)
+}
+
+/// Pipeline for a `rope.metal` kernel (vendored partial-rotary NEOX rope).
+pub(crate) fn rope_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, ROPE_SOURCE, "rope", name)
 }

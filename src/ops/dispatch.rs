@@ -982,17 +982,39 @@ pub(crate) fn run_plain_mv(
 /// the only f16 in the chain). Dispatches per the fork's host split: the gemv
 /// for t <= 8 tokens, the tiled gemm above (`F16_MM_MIN_SEQ`).
 pub(crate) fn run_matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
-    run_matmul_f16_variant(weight, x, !crate::ops::attn_mm_tensor())
+    let kernel = if crate::ops::attn_mm_tensor() {
+        F16MmKernel::Tensor
+    } else {
+        F16MmKernel::Classic
+    };
+    run_matmul_f16_variant(weight, x, kernel)
+}
+
+/// Which prefill (ne11 > 8) mm-branch kernel `run_matmul_f16_variant`
+/// dispatches. Production only ever selects the first two (`run_matmul_f16`);
+/// `TensorMixed` is reachable exclusively from the f16.rs probe tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum F16MmKernel {
+    /// Classic simdgroup kernel, float tiles (`f16.metal`) — shipped default.
+    Classic,
+    /// Metal-4 cooperative-tensor kernel, half operand tiles (`f16_t.metal`) —
+    /// the `LAGUNA_ATTN_MM_TENSOR` opt-in.
+    Tensor,
+    /// Mixed-operand cooperative-tensor probe: half weight tile x FLOAT
+    /// activation tile (`f16_t_mixed.metal`). No env switch, no production
+    /// selection — constructed only by the f16.rs tests (hence dead in
+    /// non-test builds).
+    #[allow(dead_code)]
+    TensorMixed,
 }
 
 /// `run_matmul_f16` with the prefill (ne11 >= 8) mm-branch kernel chosen
-/// explicitly: `mm_classic` true runs the classic simdgroup kernel (the shipped
-/// default), false the Metal-4 cooperative-tensor kernel. Production derives the
-/// flag from the cached `LAGUNA_ATTN_MM_TENSOR` opt-in switch (`run_matmul_f16`);
-/// the f16.rs tests call this with an explicit variant because the switch is a
-/// process-global `OnceLock`. The decode gemv branch is identical for both
+/// explicitly. Production derives the kernel from the cached
+/// `LAGUNA_ATTN_MM_TENSOR` opt-in switch (`run_matmul_f16`); the f16.rs tests
+/// call this with an explicit kernel because the switch is a process-global
+/// `OnceLock`. The decode gemv branch is identical for every kernel choice
 /// (classic mv).
-pub(crate) fn run_matmul_f16_variant(weight: &Tensor, x: &Tensor, mm_classic: bool) -> Result<Tensor> {
+pub(crate) fn run_matmul_f16_variant(weight: &Tensor, x: &Tensor, kernel: F16MmKernel) -> Result<Tensor> {
     let cdev = x.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("matmul_f16 requires x on a Metal device");
@@ -1070,8 +1092,10 @@ pub(crate) fn run_matmul_f16_variant(weight: &Tensor, x: &Tensor, mm_classic: bo
             // Default is the classic simdgroup kernel (float tiles, 12288 B; the
             // store-back tile reuses the region); LAGUNA_ATTN_MM_TENSOR opts into
             // the Metal-4 cooperative-tensor kernel (half operand tiles, 8192 B
-            // smem). Same MmArgs, grid and threads either way — only the kernel,
-            // its library, and the tile smem differ.
+            // smem); the test-only TensorMixed probe keeps the activation tile
+            // float (half sa 4096 + float sb 4096 = the same 8192 B). Same
+            // MmArgs, grid and threads for all — only the kernel, its library,
+            // and the tile smem differ.
             let args = MmArgs {
                 ne00: k as i32,
                 ne02: 1,
@@ -1088,10 +1112,17 @@ pub(crate) fn run_matmul_f16_variant(weight: &Tensor, x: &Tensor, mm_classic: bo
                 r2: 1,
                 r3: 1,
             };
-            let (pipeline, smem) = if mm_classic {
-                (pipelines::f16_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_v")?, 12288)
-            } else {
-                (pipelines::f16_t_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_t")?, 8192)
+            let (pipeline, smem) = match kernel {
+                F16MmKernel::Classic => {
+                    (pipelines::f16_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_v")?, 12288)
+                }
+                F16MmKernel::Tensor => {
+                    (pipelines::f16_t_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_t")?, 8192)
+                }
+                F16MmKernel::TensorMixed => (
+                    pipelines::f16_t_mixed_pipeline(mdev.device(), "kernel_mul_mm_f16_f32_t_mixed")?,
+                    8192,
+                ),
             };
             encoder.set_compute_pipeline_state(&pipeline);
             encoder.set_bytes(0, &args);
@@ -1295,6 +1326,338 @@ pub(crate) fn run_combine(
     drop(l2_resolved);
 
     Ok(output_tensor(dst, mdev, out_length, (seq, n_out)))
+}
+
+/// Matches the Metal `attn_gate_args` struct (src/ops/attn_glue.metal).
+/// `#[repr(C)]` pins the layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttnGateArgs {
+    n_head: i32,
+    seq: i32,
+    head_dim: i32,
+}
+
+/// Matches the Metal `permute_args` struct (src/ops/attn_glue.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PermuteArgs {
+    d0: i32,
+    d1: i32,
+    d2: i32,
+}
+
+/// Matches the Metal `rope_args` struct (src/ops/rope.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeArgs {
+    heads: i32,
+    seq: i32,
+    head_dim: i32,
+    n_rot: i32,
+    pos: i32,
+}
+
+/// Linear one-thread-per-element launch shared by the attention-glue kernels:
+/// `n` threads in threadgroups of up to 256 (bounds-checked in the kernels, so
+/// the rounded-up tail is harmless).
+fn dispatch_linear(
+    encoder: &ComputeCommandEncoder,
+    pipeline: &candle_metal_kernels::metal::ComputePipeline,
+    n: usize,
+) {
+    let width = pipeline.max_total_threads_per_threadgroup().min(256);
+    let grid = mtl_size!(n.div_ceil(width), 1, 1);
+    let threads = mtl_size!(width, 1, 1);
+    encoder.dispatch_thread_groups(grid, threads);
+}
+
+/// The attention-glue kernels address their tensors with i32 index math; refuse
+/// a launch whose flat element count would wrap. (Production maxima are ~5M.)
+fn glue_index_fits_i32(n: usize) -> Result<()> {
+    if n > i32::MAX as usize {
+        bail!("attn-glue index math overflows i32: {n} elements exceed i32::MAX");
+    }
+    Ok(())
+}
+
+/// Overflow-checked product of size components. The glue-op guards
+/// (`glue_index_fits_i32`, table-extent bounds) must see the TRUE mathematical
+/// value: an unchecked usize product wraps in release builds, which could carry
+/// a wrapped (small) count past the guard. Not reachable from real tensors
+/// (candle cannot hold one that large), but the guards should not be
+/// circumventable in principle.
+fn checked_elems(parts: &[usize], what: &str) -> Result<usize> {
+    let mut n = 1usize;
+    for &p in parts {
+        n = n
+            .checked_mul(p)
+            .ok_or_else(|| anyhow::anyhow!("{what}: element count {parts:?} overflows usize"))?;
+    }
+    Ok(n)
+}
+
+/// Fused softplus output gate against `kernel_attn_gate` (attn_glue.metal):
+/// `dst[h,s,d] = attn[h,s,d] * softplus_chain(gate[s,h])`, replacing the
+/// 10-dispatch candle chain (softplus + transpose/reshape + broadcast_mul) with
+/// one pass over `attn`. `attn` is `[n_head, seq, head_dim]` f32 contiguous,
+/// `gate` is `[seq, n_head]` f32 contiguous (the g_proj output layout). The
+/// per-op rounding mirrors candle's chain exactly, so the result is
+/// bit-identical (see attn_glue.metal / the attn_glue.rs test).
+pub(crate) fn run_attn_gate(attn: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    let cdev = attn.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("attn_gate requires attn on a Metal device");
+    };
+
+    let (n_head, seq, head_dim) = attn
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("attn must be rank-3 [n_head, seq, head_dim]: {e}"))?;
+    if attn.dtype() != DType::F32 {
+        bail!("attn must be f32, got {:?}", attn.dtype());
+    }
+    if !attn.is_contiguous() {
+        bail!("attn must be contiguous");
+    }
+    if gate.dims2().map_err(|e| anyhow::anyhow!("gate must be rank-2 [seq, n_head]: {e}"))?
+        != (seq, n_head)
+    {
+        bail!("gate shape {:?} must be [seq, n_head] = [{seq}, {n_head}]", gate.dims());
+    }
+    if gate.dtype() != DType::F32 {
+        bail!("gate must be f32, got {:?}", gate.dtype());
+    }
+    if !gate.is_contiguous() {
+        bail!("gate must be contiguous");
+    }
+    if !attn.device().same_device(gate.device()) {
+        bail!("attn and gate must live on the same Metal device");
+    }
+    let n = checked_elems(&[n_head, seq, head_dim], "attn_gate")?;
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::attn_glue_pipeline(mdev.device(), "kernel_attn_gate")?;
+    let dst = mdev.new_buffer(n, DType::F32, "attn_gate")?;
+
+    let (attn_guard, attn_layout) = attn.storage_and_layout();
+    let Storage::Metal(attn_storage) = &*attn_guard else {
+        bail!("attn is not on a Metal device");
+    };
+    let (gate_guard, gate_layout) = gate.storage_and_layout();
+    let Storage::Metal(gate_storage) = &*gate_guard else {
+        bail!("gate is not on a Metal device");
+    };
+
+    let args = AttnGateArgs {
+        n_head: n_head as i32,
+        seq: seq as i32,
+        head_dim: head_dim as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(attn_storage.buffer()),
+            attn_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(gate_storage.buffer()),
+            gate_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(attn_guard);
+    drop(gate_guard);
+
+    Ok(output_tensor(dst, mdev, n, (n_head, seq, head_dim)))
+}
+
+/// Fused transpose(0,1)+contiguous with optional dtype conversion, against the
+/// `kernel_permute_cast_*` family (attn_glue.metal): `x` `[d0, d1, d2]`
+/// contiguous becomes `[d1, d0, d2]` contiguous in ONE pass, converting per
+/// `out_dtype` (f32→f32 copy, f32→f16 RTNE, f16→f32 exact — candle's cast
+/// scalar). `d0 == 1` degenerates to a plain (optionally casting) copy, which
+/// is how the shape-preserving `cast_*` wrappers use it.
+pub(crate) fn run_permute_cast(x: &Tensor, out_dtype: DType) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("permute_cast requires x on a Metal device");
+    };
+
+    let (d0, d1, d2) = x
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("x must be rank-3 [d0, d1, d2]: {e}"))?;
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    let name = match (x.dtype(), out_dtype) {
+        (DType::F32, DType::F32) => "kernel_permute_cast_f32_f32",
+        (DType::F32, DType::F16) => "kernel_permute_cast_f32_f16",
+        (DType::F16, DType::F32) => "kernel_permute_cast_f16_f32",
+        (from, to) => bail!("no permute_cast kernel for {from:?} -> {to:?}"),
+    };
+    let n = checked_elems(&[d0, d1, d2], "permute_cast")?;
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::attn_glue_pipeline(mdev.device(), name)?;
+    let dst = mdev.new_buffer(n, out_dtype, "permute_cast")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+
+    let args = PermuteArgs {
+        d0: d0 as i32,
+        d1: d1 as i32,
+        d2: d2 as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(x_storage.buffer()),
+            x_layout.start_offset() * x.dtype().size_in_bytes(),
+        );
+        encoder.set_output_buffer(2, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(x_guard);
+
+    let storage = MetalStorage::new(dst, mdev.clone(), n, out_dtype);
+    Ok(Tensor::from_storage(
+        Storage::Metal(storage),
+        (d1, d0, d2),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// Vendored partial-rotary NEOX rope against `kernel_rope_neox` (rope.metal):
+/// rotates the first `n_rot` dims of `x` `[heads, seq, head_dim]` f32 with
+/// candle's by-halves rope math and passes the rest through, in ONE read+write
+/// of `x` — replacing the narrow/contiguous/rope/cat chain. `cos`/`sin` are the
+/// full `[max_ctx, n_rot/2]` f32 tables; `pos` selects the starting row.
+/// Bit-identical to the candle chain (see rope.metal / the attn_glue.rs test).
+pub(crate) fn run_rope(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    pos: usize,
+    n_rot: usize,
+) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("rope requires x on a Metal device");
+    };
+
+    let (heads, seq, head_dim) = x
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("x must be rank-3 [heads, seq, head_dim]: {e}"))?;
+    if x.dtype() != DType::F32 {
+        bail!("x must be f32, got {:?}", x.dtype());
+    }
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    if n_rot == 0 || n_rot % 2 != 0 || n_rot > head_dim {
+        bail!("n_rot ({n_rot}) must be even and in 2..=head_dim ({head_dim})");
+    }
+    let half = n_rot / 2;
+    // Checked: a caller-supplied pos near usize::MAX must not wrap the row
+    // bound (release builds wrap unchecked usize adds).
+    let end = pos
+        .checked_add(seq)
+        .ok_or_else(|| anyhow::anyhow!("rope pos + seq ({pos} + {seq}) overflows usize"))?;
+    for (name, t) in [("cos", cos), ("sin", sin)] {
+        let (rows, cols) = t
+            .dims2()
+            .map_err(|e| anyhow::anyhow!("{name} must be rank-2 [max_ctx, n_rot/2]: {e}"))?;
+        if cols != half {
+            bail!("{name} has {cols} columns, expected n_rot/2 = {half}");
+        }
+        if end > rows {
+            bail!("{name} has {rows} rows, need pos + seq = {end}");
+        }
+        if t.dtype() != DType::F32 {
+            bail!("{name} must be f32, got {:?}", t.dtype());
+        }
+        if !t.is_contiguous() {
+            bail!("{name} must be contiguous");
+        }
+        if !x.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as x");
+        }
+    }
+    let n = checked_elems(&[heads, seq, head_dim], "rope")?;
+    glue_index_fits_i32(n)?;
+    glue_index_fits_i32(checked_elems(&[end, half], "rope tables")?)?;
+
+    let pipeline = pipelines::rope_pipeline(mdev.device(), "kernel_rope_neox")?;
+    let dst = mdev.new_buffer(n, DType::F32, "rope")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let (cos_guard, cos_layout) = cos.storage_and_layout();
+    let Storage::Metal(cos_storage) = &*cos_guard else {
+        bail!("cos is not on a Metal device");
+    };
+    let (sin_guard, sin_layout) = sin.storage_and_layout();
+    let Storage::Metal(sin_storage) = &*sin_guard else {
+        bail!("sin is not on a Metal device");
+    };
+
+    let args = RopeArgs {
+        heads: heads as i32,
+        seq: seq as i32,
+        head_dim: head_dim as i32,
+        n_rot: n_rot as i32,
+        pos: pos as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(x_storage.buffer()),
+            x_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(cos_storage.buffer()),
+            cos_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            3,
+            Some(sin_storage.buffer()),
+            sin_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(x_guard);
+    drop(cos_guard);
+    drop(sin_guard);
+
+    Ok(output_tensor(dst, mdev, n, (heads, seq, head_dim)))
 }
 
 #[cfg(test)]

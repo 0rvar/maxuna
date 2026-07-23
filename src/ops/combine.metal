@@ -43,6 +43,11 @@
 // so these compiling proves they are honored; together they close every
 // fast-math transform that could touch a bit (the per-lane partition is at most
 // two elements wide, so the add chain has no reassociation freedom either).
+// `#pragma METAL fp math_mode(fast)` additionally pins the library math-mode
+// axis to the value nil compile options resolve to today (candle's own kernels
+// are compiled with explicit MTLMathMode::Fast), so a future OS default change
+// cannot move this library's mode; the clang fp pragmas above constrain
+// contraction/reassociation WITHIN that mode.
 //
 // A SEPARATE library from mm_id.metal / mv.metal / f16.metal (own runtime
 // compile via src/ops/pipelines.rs, no Metal-4 dependency).
@@ -51,6 +56,7 @@
 
 using namespace metal;
 
+#pragma METAL fp math_mode(fast)
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 

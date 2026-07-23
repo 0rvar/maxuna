@@ -229,7 +229,14 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// its own per-expert index_add), else "fused" (default) or "classic" (under
 /// LAGUNA_COMBINE_CLASSIC) for the fused runner. The gate enforces it per
 /// side/tier (like `attn_dtype`), so a dump predating the field cannot pass as
-/// current. Additive: readers that ignore it still parse older/newer dumps.
+/// current. `attn_glue` records the attention-glue path (softplus gate /
+/// permute-cast copies / partial-rotary rope): "fused" (the shipped vendored
+/// kernels, default) or "classic" (the candle chains, under
+/// LAGUNA_ATTN_GLUE_CLASSIC). Unlike `combine`, BOTH runners execute the
+/// attention glue — the Reference oracle's anchor is the env pin, not a
+/// separate code path — so the value is env-derived for every runner and the
+/// gate expects "classic" on reference dumps. Additive: readers that ignore
+/// these still parse older/newer dumps.
 fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
     let attn_dtype = match model.attn_dtype() {
         DType::F32 => "f32",
@@ -257,6 +264,10 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         } else {
             "fused"
         },
+        // Attention glue runs in BOTH runners (the oracle is anchored by the
+        // env pin, not a separate code path), so this is env-derived for every
+        // runner; parity-gate.ts pins "classic" for reference and strict dumps.
+        "attn_glue": if laguna::ops::attn_glue_classic() { "classic" } else { "fused" },
     })
 }
 

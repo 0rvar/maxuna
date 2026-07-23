@@ -47,13 +47,33 @@
    (a) **mask hoisting — DONE 2026-07-23** (48 builds/forward → 2 per chunk,
    byte-identical, no kill-switch; prefill 211 → 228 @925, 184 → 237 @4k;
    docs/log.md entry). (b) projections: cooperative-tensor f16 gemm port —
-   NEXT, prototype first (decision pending: f32-operand tensor tiles vs
-   fork-style f16-staged activations, which shift numerics — see the
-   mm_id `_t_hp`-was-slower precedent before committing). (c) the remaining
-   ~275 ms of glue (transposes, rope narrow/cat on full layers, gate, sdpa
-   casts) — likely lands with the encoder takeover / layout rework. Subsumes
-   the old P1(b) decode glue fusion (~6 ms sustained) — attack both seq
-   regimes together.
+   PORTED then REVERTED to opt-in (gate-rejected as default; ledger item), and
+   the mixed-operand escape hatch is PROBED AND CLOSED (bit-identical but
+   classic-speed; ledger item) — projections stay on the classic simdgroup
+   gemm; no further lever known short of loosening the decode envelope.
+   (c) **glue fusion — DONE 2026-07-23**: three fused kernels, each
+   bit-identical by construction (combine playbook): fused softplus-gate
+   (kernel_attn_gate, ~10-op candle chain + broadcast_mul → 1), fused
+   permute+cast copies (kernel_permute_cast_*, transpose+contiguous+f16-cast
+   in one pass), vendored partial-rotary rope (kernel_rope_neox, no
+   narrow/cat). Kill-switch `LAGUNA_ATTN_GLUE_CLASSIC`, provenance `attn_glue`
+   enforced per tier. Prefill dispatches/attn-layer 26 → 10 (full) and
+   20 → 10 (SWA); decode 22 → 7 (the fused gate/rope/cast run at seq==1 too —
+   subsumed the old P1(b) decode glue item). Measured (LPM): prefill 238.5 →
+   262.1 @925, 235.8 → 255.6 @4k; decode 18.2 → 19.1 (now 1.03x the fork's
+   18.5). All six gates PASS at the exact known-good anchors (bit-identity
+   confirmed at model level); references regenerated for the attn_glue
+   provenance field, reference-ppl mean_nll bit-identical 4th regen running.
+   Review round: 4 reviewers (Claude/Codex/GLM/DeepSeek); hardening applied:
+   `#pragma METAL fp math_mode(fast)` in all 9 vendored .metal sources (pins
+   the documented nil-options default against future OS flips; the fork also
+   compiles Fast — checked ggml-metal-device.m), load-time hard error if
+   CANDLE_METAL_ENABLE_FAST_MATH is set falsy (mixed-mode would silently void
+   every bitwise-identity contract), overflow-checked size products +
+   same-device checks in the glue dispatches, offset-view bitwise test,
+   fail-fast attn_glue in isReferenceDump. Glue was a TRAFFIC problem, not
+   scheduling (territory map): fusion removed the copies concurrency could
+   only have overlapped; the takeover now schedules fewer, fatter kernels.
 4. **MoE-block encoder takeover** (ledger item below) — concurrency +
    range-tracked barriers; now also owns the demoted routing-glue fusion.
 5. **mmap + no-copy model load** (see ledger item below) — dev-velocity
@@ -186,15 +206,63 @@
   barrier is inserted ONLY when a dispatch's buffer ranges overlap a pending
   write (ggml-metal-ops.cpp mem_ranges :150-210), graph reorder into concurrent
   sets (ggml-metal-common.cpp:209/375), and multi-threaded command-buffer
-  encoding (ggml-metal-context.m:550, up to 8 threads). Candle's eager op-per-
-  encoder submission serializes all of it — e.g. the shared expert and the tiny
-  routing kernels could overlap the heavy expert GEMMs but don't. Taking over
-  encoding of the whole MoE block inside our dispatch layer (all ops between
-  ffn_norm and the residual add issued into one concurrent encoder with
-  ggml-style range tracking) is the remaining big prefill lever after routing-
-  glue fusion + map0 sharing land. Requires every op in the block to be an
-  owned kernel (or a candle op we re-encode) — the strategic endgame of
-  vendoring.
+  encoding (ggml-metal-context.m:550, up to 8 threads).
+  PREMISE CORRECTED 2026-07-23 (territory map): candle does NOT do eager
+  op-per-encoder submission at our pinned rev — it already shares ONE
+  Concurrent-dispatch encoder across ~50 dispatches (commands.rs:160-190,
+  `CANDLE_METAL_COMPUTE_PER_BUFFER`), with its own hazard tracking on
+  untracked buffers (encoder.rs:104-149) — and our custom ops already ride
+  that encoder and participate in its hazard tracking (dispatch.rs
+  set_input_buffer/set_output_buffer). What candle LACKS vs the fork is (a)
+  BYTE-RANGE hazard granularity — candle keys on whole buffer pointers and
+  one hazard emits a memoryBarrier(Buffers) that resets the ENTIRE concurrent
+  set, so a dependency-chained forward degrades to serial — and (b) graph
+  reorder pulling independent nodes into the same concurrent window. So the
+  realizable prize is range-tracking + reorder only; re-measure with a GPU
+  trace how much overlap candle already achieves before investing. Known
+  constraints from the map: buffer extraction for dense tensors is already
+  solved (storage_and_layout → MetalStorage::buffer, no QStorage-style trick
+  needed); candle's buffer POOL recycles pointers, so any range tracker must
+  survive pointer aliasing of just-freed buffers; running our OWN encoder
+  (vs riding candle's) requires replicating the prev_ce_outputs cross-encoder
+  fence protocol (commands.rs:340-382) or risking silent RAW corruption; and
+  reordering candle-issued ops requires vendoring them — a takeover that only
+  wraps our own kernels buys little because interleaved candle ops keep
+  flipping the shared encoder's hazard state. Sequence AFTER 3(c) glue fusion:
+  fewer, fatter kernels schedule better and the copies it removes are traffic
+  concurrency could only overlap, not eliminate.
+- [ ] **Attention glue phase 2 — fold the remaining casts into neighbors**
+  (deferred from the 2026-07-23 glue fusion to keep unit boundaries): (a) fold
+  the post-sdpa f16→f32 cast into kernel_attn_gate (read f16 attn directly —
+  the widening is exact, so bit-identity holds); (b) fold the k-cache / q-sdpa
+  f16 casts into kernel_rope_neox's store (rounding the final f32 rope value
+  to f16 equals the separate cast's double rounding). Saves ~3 more
+  passes/layer over the largest attention tensors.
+- [ ] **Provenance schema version — kill the reference-regen tax** (proposed
+  2026-07-23, pending Orvar's go-ahead). Every new provenance field
+  invalidates all cached/committed reference dumps (missing field = hard fail
+  = ~40 min GPU regen; paid 3x now: combine, attn_mm, attn_glue). Fix: a
+  PROVENANCE_SCHEMA_VERSION const shared by logits-dump and tests/parity.rs;
+  a dump missing a field but stamped with a schema version OLDER than the one
+  that introduced it is grandfathered to that field's classic-era value (the
+  only path its binary had); missing at current version stays a hard fail
+  (true stale-binary). Preserves the stale-binary defense, makes references
+  durable across field additions.
+- [ ] **Sweep the pre-glue dispatches for the review-round hardening**
+  (2026-07-23): run_combine (and any other pre-existing multi-input dispatch)
+  still has unchecked size products and no same-device check on secondary
+  inputs (weights/col_l2) — same latent pattern the glue ops just got fixed
+  for (checked_elems + Device::same_device). Also isReferenceDump in
+  parity-gate.ts fail-fasts on moe_impl/attn_dtype/combine/attn_glue but not
+  attn_mm ("f32-bypass") — the Rust gate catches it, but only after an
+  expensive candidate run.
+- [ ] **Per-op drift attribution** (idea 2026-07-23, motivated by the tensor
+  gemm rejection): measure WHERE the fused pipeline's envelope is spent, op
+  by op (candidate sdpa-in-f16 vs the fork's flash-attn accumulation is the
+  prime suspect; Track A per-layer taps are the machinery). Outcome decides
+  the drift-budget swap: if sdpa is the big spender, a higher-precision sdpa
+  epilogue might buy the headroom that lets tensor projections pass the
+  decode gate — potentially better than the mm_id-to-_t_hp swap.
 - [ ] **Track B dumps for text-mixed / long-swa** — the full-logit reference-vs-
   fused gate ran only on code-short (greedy covers the other two fixtures);
   generate the remaining dumps if fused ever changes.
@@ -312,10 +380,23 @@ implementation — never silently drop scope.
   is 4th in the fork's top-10) — so our drift exceeds the fork envelope. (mm passed
   but headroom shrank to 8e-4 / cos 0.995842; ppl consumed 79% of its bound.) The
   tensor kernel is kept as opt-in `LAGUNA_ATTN_MM_TENSOR`; the classic simdgroup
-  gemm stays the default. Candidate follow-up: probe `matmul2d` with MIXED operands
-  (f16 weight tiles × f32 activation tiles), which would eliminate the activation
-  rounding entirely and could clear the decode envelope; until then classic stays
-  default.
+  gemm stays the default.
+  MIXED-OPERAND FOLLOW-UP PROBED AND CLOSED 2026-07-23: `matmul2d` with f16
+  weight tiles × f32 activation tiles COMPILES (the SDK header's dtype table
+  lists float×half→float; the "input types must match" static_assert that bit
+  llama.cpp/whisper.cpp/ollama applies to mismatched 16-bit pairs, not this
+  combo) and is bit-IDENTICAL to the classic kernel (rel_l2 exactly 0.0 on all
+  six shapes) — but it is also classic-SPEED (~1.02-1.07x): a float operand
+  forfeits f16 tensor-core issue and lowers to the same K-ascending f32
+  simdgroup MMA sequence classic hand-codes (which is exactly why the bits
+  match). The tensor path's 2x is inseparable from half-operand staging, so
+  there is no rounding-free tensor speedup; classic stays default. Probe kept
+  as evidence: `src/ops/f16_t_mixed.metal` + `f16_tensor_mixed_matches_classic`
+  / `f16_tensor_mixed_vs_classic_timing` in f16.rs (test-only, never
+  production-selected). Operand-order trap for future matmul2d work: f16_t.metal
+  passes `mm.run(sB, sA, ..)` with a `<tA, tB, float>` destination template —
+  harmless with same-type tiles, wrong with distinct types; the mixed kernel's
+  corrected order is the reference.
 - [x] **Combine-library reassociation hardening — RESOLVED via source pragma**
   (2026-07-22). The fused combine kernels' bit-identity to candle's chain rests
   on the rescale multiply chain (`r1 = d*l; r2 = r1*2^-15; r3 = r2*ww`) NOT

@@ -1,3 +1,4 @@
+pub mod attn_glue;
 pub mod combine;
 mod dispatch;
 pub mod f16;
@@ -5,6 +6,7 @@ pub mod mm_id;
 pub mod mv_id;
 mod pipelines;
 
+pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use combine::combine;
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
@@ -55,6 +57,41 @@ pub fn combine_classic() -> bool {
 /// dump provenance. Reflects the same cached `mm_id_variant()` the hot path uses.
 pub fn active_mm_variant_name() -> &'static str {
     mm_id_variant().name()
+}
+
+/// Whether `CANDLE_METAL_ENABLE_FAST_MATH` is set FALSY — the one environment
+/// under which candle compiles its Metal kernels Relaxed/Precise instead of its
+/// default Fast/Fast. The vendored libraries are pinned `math_mode(fast)` at
+/// the source level (see the .metal headers), so under that env every
+/// bitwise-identity contract (combine, attn_glue, rope) would break SILENTLY —
+/// `pipelines::compiled_pipeline` therefore hard-fails on the first vendored
+/// kernel use rather than let a mixed-mode process run. Truthiness mirrors
+/// candle's own parse (candle-metal-kernels utils.rs `is_truthy`: exactly
+/// "true"/"t"/"yes"/"y"/"1" are truthy; anything else — "0", "false", "" — is
+/// falsy). Cached (read once), like the sibling env switches.
+pub(crate) fn candle_fast_math_disabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("CANDLE_METAL_ENABLE_FAST_MATH") {
+        Ok(v) => !matches!(v.as_str(), "true" | "t" | "yes" | "y" | "1"),
+        Err(_) => false,
+    })
+}
+
+/// `LAGUNA_ATTN_GLUE_CLASSIC=1` reverts the attention glue — the fused softplus
+/// gate (`ops::attn_gate`), the fused permute/cast copies
+/// (`ops::permute_01`/`cast_*`), and the fused partial-rotary rope
+/// (`ops::rope_neox`) — back to the candle chains they replace
+/// (softplus + broadcast_mul, transpose().contiguous() + to_dtype, and the
+/// narrow/contiguous/rope/cat rope path). ONE switch covers all three: each
+/// fused kernel is bit-identical to its candle chain by construction, so this
+/// is a safety kill-switch and provenance anchor, not a correctness tier.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`combine_classic`, `no_mm_id`): any value enables it — only leaving it
+/// unset keeps the fused path.
+pub fn attn_glue_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_GLUE_CLASSIC").is_some())
 }
 
 /// `LAGUNA_ATTN_MM_TENSOR=1` opts the attention PREFILL gemm — the mm branch

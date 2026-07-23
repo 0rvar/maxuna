@@ -23,6 +23,12 @@
 
 using namespace metal;
 
+// Pin the library math-mode axis to the value nil compile options resolve to
+// today (and that candle's kernels are explicitly compiled with), so a future
+// OS default change cannot silently alter this library's codegen. clang
+// hard-errors on bad `METAL fp` options, so compiling proves it is honored.
+#pragma METAL fp math_mode(fast)
+
 #define QK_K 256
 
 // N_R0_Q4_K / N_R0_Q6_K = 2, N_SG_Q4_K / N_SG_Q6_K = 2 (ggml-metal-impl.h). The

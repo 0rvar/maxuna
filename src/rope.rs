@@ -99,7 +99,23 @@ impl Rope {
 
     /// Rotate the first `n_rot` dims of x (f32) with NEOX pairing (dim i with
     /// i + n_rot/2); any trailing dims pass through untouched.
+    ///
+    /// On Metal the default is the fused single-pass kernel (ops::rope_neox),
+    /// which folds the partial-rotary narrow/contiguous/cat glue into the rope
+    /// itself and is bit-identical to the candle chain below (the attn_glue.rs
+    /// bitwise test proves it). LAGUNA_ATTN_GLUE_CLASSIC (the shared
+    /// attention-glue kill-switch) reverts to the chain; non-Metal devices
+    /// always run it.
     fn rotate(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
+        // (The fused kernel wants a contiguous input; AttnBlock always provides
+        // one. A strided caller falls through to the chain, which narrows and
+        // copies — the two paths are bit-identical, so the choice is invisible.)
+        if matches!(x.device(), Device::Metal(_))
+            && x.is_contiguous()
+            && !crate::ops::attn_glue_classic()
+        {
+            return crate::ops::rope_neox(x, &self.cos, &self.sin, pos, self.n_rot);
+        }
         let (_, seq, head_dim) = x.dims3()?;
         let cos = self.cos.narrow(0, pos, seq)?;
         let sin = self.sin.narrow(0, pos, seq)?;

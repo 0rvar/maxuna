@@ -119,6 +119,14 @@ struct Provenance {
     /// dumps predating the field — the gate hard-fails on that per side (same
     /// reasoning as `attn_dtype`).
     attn_mm: Option<String>,
+    /// Attention-glue path (fused softplus gate / permute-cast copies /
+    /// partial-rotary rope): "fused" (the shipped vendored kernels) or "classic"
+    /// (the candle chains, `LAGUNA_ATTN_GLUE_CLASSIC`). Env-derived for BOTH
+    /// runners — the Reference oracle executes the glue too, anchored by the env
+    /// pin — so reference dumps must record "classic". `None` for dumps predating
+    /// the field — the gate hard-fails on that per side (same reasoning as
+    /// `attn_dtype`).
+    attn_glue: Option<String>,
 }
 
 impl Provenance {
@@ -178,6 +186,12 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
             // that later, per side); present-but-not-a-string is malformed.
             attn_mm: match p.get("attn_mm") {
                 Some(d) => Some(d.as_str().context("provenance `attn_mm` is not a string")?.to_string()),
+                None => None,
+            },
+            // Absent in dumps predating the attn_glue field (the gate hard-fails
+            // on that later, per side); present-but-not-a-string is malformed.
+            attn_glue: match p.get("attn_glue") {
+                Some(d) => Some(d.as_str().context("provenance `attn_glue` is not a string")?.to_string()),
                 None => None,
             },
         })),
@@ -483,6 +497,29 @@ fn check_attn_mm(p: &Provenance, side: &str, want: &str) -> Result<()> {
     }
 }
 
+/// Enforce the attention-glue path recorded in one side's provenance. `want` is
+/// "classic" for the Reference-oracle side and strict-tier candidates (both are
+/// produced under `LAGUNA_ATTN_GLUE_CLASSIC=1` — unlike `combine`, the oracle
+/// EXECUTES the attention glue, so its anchor is the env pin, not a separate
+/// code path), and "fused" for the mm/decode/ppl candidates that grade the
+/// shipped vendored glue kernels. A provenance MISSING the field came from a
+/// `logits-dump` binary that predates it — hard fail, because such a dump is
+/// otherwise indistinguishable from a current one and the gate would pass
+/// vacuously.
+fn check_attn_glue(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    match p.attn_glue.as_deref() {
+        Some(g) if g == want => Ok(()),
+        Some(other) => bail!(
+            "{side} provenance.attn_glue is {other:?}, expected {want:?}; regenerate the dump \
+             under the environment its gate prescribes (see docs/parity.md §3)"
+        ),
+        None => bail!(
+            "{side} provenance has no attn_glue (stale `logits-dump` binary predating the \
+             field); rebuild logits-dump and regenerate the dump"
+        ),
+    }
+}
+
 fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
@@ -502,6 +539,9 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             check_combine(p, "reference dump", "reference")?;
             // f32 attention bypasses the f16 library's mm branch entirely.
             check_attn_mm(p, "reference dump", "f32-bypass")?;
+            // The oracle runs the attention glue too, pinned to the candle
+            // chains (LAGUNA_ATTN_GLUE_CLASSIC=1, parity-gate.ts referenceEnv()).
+            check_attn_glue(p, "reference dump", "classic")?;
         }
         Some(p) => bail!(
             "reference dump provenance.moe_impl is {:?}, expected \"reference\": the reference side \
@@ -627,6 +667,19 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     };
     if let Some(p) = &candidate.provenance {
         check_combine(p, "candidate dump", want_combine)?;
+    }
+
+    // EVERY tier also pins the CANDIDATE's attention-glue path (like combine):
+    // strict grades the candle glue chains (candidate produced under
+    // LAGUNA_ATTN_GLUE_CLASSIC=1 → "classic"), mm/decode grade the shipped
+    // fused glue kernels ("fused"). Candidate provenance is already proven Some
+    // by the attn_dtype check above.
+    let want_attn_glue = match tier {
+        Tier::Strict => "classic",
+        Tier::Mm | Tier::Decode => "fused",
+    };
+    if let Some(p) = &candidate.provenance {
+        check_attn_glue(p, "candidate dump", want_attn_glue)?;
     }
 
     // Non-finite candidate logits are a hard failure in EVERY tier: a NaN/Inf
@@ -879,6 +932,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_attn_dtype(p, "reference-greedy.json", "f32")?;
             check_combine(p, "reference-greedy.json", "reference")?;
             check_attn_mm(p, "reference-greedy.json", "f32-bypass")?;
+            check_attn_glue(p, "reference-greedy.json", "classic")?;
         }
         Some(p) => bail!(
             "reference-greedy.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate \
@@ -898,6 +952,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_attn_dtype(p, "candidate-greedy.json", "f16")?;
             check_combine(p, "candidate-greedy.json", "fused")?;
             check_attn_mm(p, "candidate-greedy.json", "classic")?;
+            check_attn_glue(p, "candidate-greedy.json", "fused")?;
         }
         Some(p) => bail!(
             "candidate-greedy.json (replay) provenance.moe_impl is {:?}, expected \"fused\"; the \
@@ -1118,6 +1173,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_attn_dtype(p, "reference-ppl.json", "f32")?;
             check_combine(p, "reference-ppl.json", "reference")?;
             check_attn_mm(p, "reference-ppl.json", "f32-bypass")?;
+            check_attn_glue(p, "reference-ppl.json", "classic")?;
         }
         Some(p) => bail!(
             "reference-ppl.json provenance.moe_impl is {:?}, expected \"reference\"; regenerate it \
@@ -1136,6 +1192,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_attn_dtype(p, "candidate-ppl.json", "f16")?;
             check_combine(p, "candidate-ppl.json", "fused")?;
             check_attn_mm(p, "candidate-ppl.json", "classic")?;
+            check_attn_glue(p, "candidate-ppl.json", "fused")?;
         }
         Some(p) => bail!(
             "candidate-ppl.json provenance.moe_impl is {:?}, expected \"fused\"; the candidate must \
@@ -1245,6 +1302,11 @@ fn prov(moe_impl: &str) -> Provenance {
         // candidates run the shipped classic prefill kernel. Strict-tier candidate
         // tests override this to "f32-bypass".
         attn_mm: Some(if moe_impl == "reference" { "f32-bypass" } else { "classic" }.to_string()),
+        // Reference runs under LAGUNA_ATTN_GLUE_CLASSIC (the oracle executes the
+        // attention glue too, anchored to the candle chains by the env pin);
+        // fused candidates run the shipped fused glue kernels. Strict-tier
+        // candidate tests override this to "classic".
+        attn_glue: Some(if moe_impl == "reference" { "classic" } else { "fused" }.to_string()),
     }
 }
 
@@ -1373,6 +1435,32 @@ fn greedy_gate_rejects_wrong_or_missing_attn_mm() {
     r.provenance.as_mut().unwrap().attn_mm = None;
     let err = greedy_compare(&r, &c).unwrap_err().to_string();
     assert!(err.contains("no attn_mm"), "unexpected error: {err}");
+}
+
+#[test]
+fn greedy_gate_rejects_wrong_or_missing_attn_glue() {
+    // The decode gate grades the shipped fused attention glue; a candidate replay
+    // produced under LAGUNA_ATTN_GLUE_CLASSIC=1 ran the candle chains instead.
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().attn_glue = Some("classic".to_string());
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("attn_glue"), "unexpected error: {err}");
+    // A candidate provenance missing the attn_glue field predates it — hard fail.
+    let (r, mut c) = valid_pair();
+    c.provenance.as_mut().unwrap().attn_glue = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_glue"), "unexpected error: {err}");
+    // The Reference oracle is pinned to the classic glue chains
+    // (LAGUNA_ATTN_GLUE_CLASSIC=1); a "fused" (or stale/missing) reference moved
+    // the anchor.
+    let (mut r, c) = valid_pair();
+    r.provenance.as_mut().unwrap().attn_glue = Some("fused".to_string());
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("attn_glue"), "unexpected error: {err}");
+    let (mut r, c) = valid_pair();
+    r.provenance.as_mut().unwrap().attn_glue = None;
+    let err = greedy_compare(&r, &c).unwrap_err().to_string();
+    assert!(err.contains("no attn_glue"), "unexpected error: {err}");
 }
 
 /// A one-step reference/candidate pair for the near-tie excuse tests: the
@@ -1655,6 +1743,58 @@ fn compare_pins_candidate_attn_mm_per_tier() {
     p.attn_mm = None;
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
     assert!(err.contains("no attn_mm"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_requires_reference_attn_glue() {
+    let candidate = tiny_dump(Some(prov("fused")));
+    // A reference regenerated WITHOUT LAGUNA_ATTN_GLUE_CLASSIC ran the fused glue
+    // kernels instead of the candle chains the oracle is anchored to → hard fail
+    // every tier.
+    let mut fused_ref = prov("reference");
+    fused_ref.attn_glue = Some("fused".to_string());
+    let err = compare(&candidate, &tiny_dump(Some(fused_ref)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("attn_glue"), "unexpected error: {err}");
+    // A reference from a binary predating the attn_glue field must also hard-fail.
+    let mut stale_ref = prov("reference");
+    stale_ref.attn_glue = None;
+    let err = compare(&candidate, &tiny_dump(Some(stale_ref)), Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("no attn_glue"), "unexpected error: {err}");
+}
+
+#[test]
+fn compare_pins_candidate_attn_glue_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // strict grades the candle glue chains: a candidate on the default fused glue
+    // (LAGUNA_ATTN_GLUE_CLASSIC forgotten) must be rejected. It must first clear
+    // the strict fused/no_mm_id + f32-attn + classic-combine checks to reach the
+    // attn_glue pin.
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    p.attn_mm = Some("f32-bypass".to_string());
+    p.no_mm_id = true;
+    p.combine = Some("classic".to_string());
+    // attn_glue defaults to "fused" — wrong for strict.
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict).unwrap_err().to_string();
+    assert!(err.contains("attn_glue"), "unexpected error: {err}");
+
+    // mm/decode grade the fused glue: a "classic" candidate ran the wrong path.
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq; // mm-active
+    p.attn_glue = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm).unwrap_err().to_string();
+    assert!(err.contains("attn_glue"), "unexpected error: {err}");
+    let mut p = prov("fused");
+    p.attn_glue = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("attn_glue"), "unexpected error: {err}");
+
+    // A candidate provenance missing only the attn_glue field is stale (predates it).
+    let mut p = prov("fused");
+    p.attn_glue = None;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode).unwrap_err().to_string();
+    assert!(err.contains("no attn_glue"), "unexpected error: {err}");
 }
 
 #[test]

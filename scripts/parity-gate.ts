@@ -120,7 +120,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_COMBINE_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
+    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
     if (k === "LAGUNA_PARITY_DIR" || k === "LAGUNA_PARITY_TIER") continue;
     e[k] = v;
   }
@@ -133,13 +133,15 @@ function baseEnv(): Record<string, string> {
  * of the shipped f16 default. All cached/committed reference artifacts are
  * f32-attention; regenerating with anything else would silently move the
  * strict tier's 0.999 anchor. The routed-expert combine is likewise pinned to
- * the classic candle chain (`LAGUNA_COMBINE_CLASSIC=1`) so the oracle stays on
- * the exact path its artifacts were blessed with (the fused kernel is
- * bit-identical, so this only anchors provenance). Candidate dumps use baseEnv()
- * and run whatever path their tier is gating.
+ * the classic candle chain (`LAGUNA_COMBINE_CLASSIC=1`), and the attention glue
+ * (softplus gate / permute-cast copies / partial-rotary rope) to the candle
+ * chains (`LAGUNA_ATTN_GLUE_CLASSIC=1`), so the oracle stays on the exact path
+ * its artifacts were blessed with (the fused kernels are bit-identical, so
+ * these only anchor provenance). Candidate dumps use baseEnv() and run whatever
+ * path their tier is gating.
  */
 function referenceEnv(): Record<string, string> {
-  return { ...baseEnv(), LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1" };
+  return { ...baseEnv(), LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1" };
 }
 
 /** Run a command with stdout+stderr streamed to `logPath` (never a pager). */
@@ -186,11 +188,12 @@ async function preflight(what: string): Promise<void> {
       const pid = Number.parseInt(l.split(/\s+/)[0], 10);
       if (pid === process.pid) return false;
       // `pgrep -f "laguna|llama"` also matches innocent shells/editors/watchers
-      // whose command line merely mentions the laguna repo path or a parity log.
-      // The hazard is another 75GB LOAD, so require a real model-process
-      // signature: our logits-dump, a llama.cpp binary (`llama-*`), or a process
-      // holding a `.gguf` open.
-      return /logits-dump|llama-|\.gguf/.test(l);
+      // whose command line merely mentions the laguna repo path, a parity log,
+      // or a source file (`git diff -- src/bin/logits-dump.rs` is not a model
+      // process). The hazard is another 75GB LOAD, so require a real
+      // model-process signature: one of our built binaries, a llama.cpp binary
+      // (`llama-*` as a path segment), or a process holding a `.gguf` open.
+      return /target\/release\/(logits-dump|laguna|deps\/parity)|(^|[/\s])llama-(cli|server|bench)|\.gguf/.test(l);
     });
   if (offenders.length) {
     console.error(`\nparity-gate: refusing to start ${what} — a model process is already running:`);
@@ -219,11 +222,14 @@ async function fixtureTokens(id: string): Promise<string> {
 
 /** True iff `path` is a JSON dump whose provenance is a genuine Reference-oracle
  *  run — the only kind the gate accepts as a reference: moe_impl=="reference",
- *  attn_dtype=="f32" (referenceEnv() pins LAGUNA_ATTN_F32=1), AND
- *  combine=="reference" (the Reference runner never dispatches ops::combine). A
- *  dump missing either field predates it and the Rust gate hard-fails on it, so
- *  regenerate here instead of failing mid-run. `kind` (when given) must also
- *  match. Any parse/shape problem returns false (regenerate). */
+ *  attn_dtype=="f32" (referenceEnv() pins LAGUNA_ATTN_F32=1),
+ *  combine=="reference" (the Reference runner never dispatches ops::combine),
+ *  AND attn_glue=="classic" (referenceEnv() pins LAGUNA_ATTN_GLUE_CLASSIC=1 —
+ *  the oracle executes the attention glue, anchored to the candle chains). A
+ *  dump missing any field predates it and the Rust gate hard-fails on it, so
+ *  regenerate here instead of failing after an expensive candidate run. `kind`
+ *  (when given) must also match. Any parse/shape problem returns false
+ *  (regenerate). */
 async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
   if (!existsSync(path)) return false;
   try {
@@ -232,7 +238,8 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     return (
       j?.provenance?.moe_impl === "reference" &&
       j?.provenance?.attn_dtype === "f32" &&
-      j?.provenance?.combine === "reference"
+      j?.provenance?.combine === "reference" &&
+      j?.provenance?.attn_glue === "classic"
     );
   } catch {
     return false;
@@ -390,12 +397,14 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // DEFAULT vendored mv path is gated by the decode + ppl tiers instead; its
   // full-logit cosine is a diagnostic only — see docs/parity.md §3b) — and
   // LAGUNA_ATTN_F32=1 reverts attention from the default f16 compute path to
-  // the legacy f32 one, and LAGUNA_COMBINE_CLASSIC=1 pins the routed-expert
-  // combine to the candle chain (bit-identical to the fused kernel, so this only
-  // matches the oracle's blessed path). mm runs the default mm_id prefill
+  // the legacy f32 one, LAGUNA_COMBINE_CLASSIC=1 pins the routed-expert
+  // combine to the candle chain, and LAGUNA_ATTN_GLUE_CLASSIC=1 pins the
+  // attention glue (softplus gate / permute-cast / rope) to the candle chains
+  // (both bit-identical to their fused kernels, so these only match the
+  // oracle's blessed path). mm runs the default mm_id prefill
   // (code-short's 58 tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
   const env = tier === "strict"
-    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1" }
+    ? { ...baseEnv(), LAGUNA_NO_MM_ID: "1", LAGUNA_MV_CLASSIC: "1", LAGUNA_ATTN_F32: "1", LAGUNA_COMBINE_CLASSIC: "1", LAGUNA_ATTN_GLUE_CLASSIC: "1" }
     : baseEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);

@@ -24,6 +24,7 @@ pub fn matmul_f16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::*;
     use crate::gguf::metal_device;
+    use crate::ops::dispatch::F16MmKernel;
     use crate::ops::dispatch::testutil::{max_abs, pseudo_random, rel_l2};
     use candle_core::{DType, Device, Tensor};
 
@@ -48,7 +49,7 @@ mod tests {
         let got = dispatch::run_matmul_f16_variant(
             &w.to_device(&device).unwrap(),
             &x.to_device(&device).unwrap(),
-            true,
+            F16MmKernel::Classic,
         )
         .unwrap();
         assert_eq!(got.dims(), &[t, n_out]);
@@ -122,7 +123,7 @@ mod tests {
             .to_device(&device)
             .unwrap();
         let x9 = Tensor::from_vec(pseudo_random(9 * k, 0x82, -1.0, 1.0), (9, k), &device).unwrap();
-        let mm = dispatch::run_matmul_f16_variant(&w, &x9, true).unwrap(); // t=9: classic gemm
+        let mm = dispatch::run_matmul_f16_variant(&w, &x9, F16MmKernel::Classic).unwrap(); // t=9: classic gemm
         let mv = matmul_f16(&w, &x9.narrow(0, 0, 8).unwrap()).unwrap(); // t=8: gemv
         let a = mm.narrow(0, 0, 8).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = mv.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -163,8 +164,8 @@ mod tests {
                 .unwrap();
             let x = Tensor::from_vec(pseudo_random(T * k, 0x400 + n_out as u64, -1.0, 1.0), (T, k), &device).unwrap();
 
-            let tensor = flat(&dispatch::run_matmul_f16_variant(&w, &x, false).unwrap());
-            let classic = flat(&dispatch::run_matmul_f16_variant(&w, &x, true).unwrap());
+            let tensor = flat(&dispatch::run_matmul_f16_variant(&w, &x, F16MmKernel::Tensor).unwrap());
+            let classic = flat(&dispatch::run_matmul_f16_variant(&w, &x, F16MmKernel::Classic).unwrap());
 
             // rel_l2 is the relative (scale-invariant) error, ~1.8e-4 on the worst
             // shape — the fork's own prefill precision class. max_abs is a raw
@@ -178,6 +179,55 @@ mod tests {
                 "tensor vs classic [{n_out}x{k}] t={T}: rel_l2 {rel} (max_abs {mabs})"
             );
         }
+    }
+
+    /// PROBE: does matmul2d accept MIXED operand element types — half weight
+    /// tile x FLOAT activation tile, f32 accumulate (`f16_t_mixed.metal`)? The
+    /// MPP header documents `float(left) x half(right) -> float` as supported;
+    /// this test is the empirical check. A compile rejection surfaces as a loud
+    /// failure carrying the compiler diagnostic (that outcome IS the probe's
+    /// answer). On success the kernel's inputs are bit-identical to the classic
+    /// simdgroup kernel's (both consume the stored f16 weights and the raw f32
+    /// activations — no staging rounding), so the residual is pure f32 tile
+    /// accumulation-order noise, the same ~1e-6 class as classic-vs-CPU above;
+    /// bound at the shared 1e-5 TOL. A ~2e-4 result here would mean the
+    /// implementation silently staged the float operand to half (the f16_t.metal
+    /// precision class) — that must FAIL: it would make the mixed kernel
+    /// pointless as a default candidate.
+    #[test]
+    fn f16_tensor_mixed_matches_classic() {
+        let device = metal_device().unwrap();
+        const T: usize = 512;
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut worst = 0f32;
+
+        for (n_out, k) in PREFILL_SHAPES {
+            let w = Tensor::from_vec(pseudo_random(n_out * k, 0x300 + n_out as u64, -0.5, 0.5), (n_out, k), &device)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
+            let x = Tensor::from_vec(pseudo_random(T * k, 0x400 + n_out as u64, -1.0, 1.0), (T, k), &device).unwrap();
+
+            let mixed = match dispatch::run_matmul_f16_variant(&w, &x, F16MmKernel::TensorMixed) {
+                Ok(t) => flat(&t),
+                Err(e) => panic!(
+                    "PROBE ANSWER: mixed-operand matmul2d (half weights x float activations) \
+                     did NOT compile/dispatch:\n{e:#}"
+                ),
+            };
+            let classic = flat(&dispatch::run_matmul_f16_variant(&w, &x, F16MmKernel::Classic).unwrap());
+
+            let rel = rel_l2(&mixed, &classic);
+            let mabs = max_abs(&mixed, &classic);
+            eprintln!("mixed vs classic [{n_out}x{k}] t={T}: rel_l2 {rel:.3e} (max_abs {mabs:.3e})");
+            worst = worst.max(rel);
+            assert!(
+                rel < TOL,
+                "mixed vs classic [{n_out}x{k}] t={T}: rel_l2 {rel} (max_abs {mabs}) — \
+                 ~2e-4 here means the float activation operand was silently rounded to half"
+            );
+        }
+        eprintln!("mixed vs classic worst rel_l2 {worst:.3e}");
     }
 
     #[test]
@@ -241,9 +291,72 @@ mod tests {
 
             eprintln!("--- [{n_out}x{k}] t={T} ---");
             let (w0, x0) = (w.clone(), x.clone());
-            bench("  classic", Box::new(move || read_scalar(&dispatch::run_matmul_f16_variant(&w0, &x0, true).unwrap())));
+            bench("  classic", Box::new(move || read_scalar(&dispatch::run_matmul_f16_variant(&w0, &x0, F16MmKernel::Classic).unwrap())));
             let (w1, x1) = (w.clone(), x.clone());
-            bench("  tensor ", Box::new(move || read_scalar(&dispatch::run_matmul_f16_variant(&w1, &x1, false).unwrap())));
+            bench("  tensor ", Box::new(move || read_scalar(&dispatch::run_matmul_f16_variant(&w1, &x1, F16MmKernel::Tensor).unwrap())));
+        }
+    }
+
+    /// 3-way isolation timing: classic simdgroup vs half-tile tensor vs the
+    /// mixed-operand tensor probe, on each production projection shape at a
+    /// 512-token chunk. Unlike `f16_tensor_vs_classic_timing`'s back-to-back
+    /// per-variant loops, the variants are INTERLEAVED inside one timed loop so
+    /// every variant samples the same DVFS/LPM clock trajectory. `#[ignore]`d —
+    /// run on a `pgrep`-verified free GPU with:
+    ///   cargo test --release -p laguna f16_tensor_mixed_vs_classic_timing -- --ignored --nocapture
+    /// `LAGUNA_BENCH_WARMUP` / `LAGUNA_BENCH_ITERS` override the loop counts.
+    #[test]
+    #[ignore = "perf bench"]
+    fn f16_tensor_mixed_vs_classic_timing() {
+        use std::time::Instant;
+
+        let device = metal_device().unwrap();
+        const T: usize = 512;
+        let read_scalar = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+        let get = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let (warm, iters) = (get("LAGUNA_BENCH_WARMUP", 10), get("LAGUNA_BENCH_ITERS", 100));
+
+        const VARIANTS: [(&str, F16MmKernel); 3] = [
+            ("classic", F16MmKernel::Classic),
+            ("tensor ", F16MmKernel::Tensor),
+            ("mixed  ", F16MmKernel::TensorMixed),
+        ];
+
+        for (n_out, k) in PREFILL_SHAPES {
+            let w = Tensor::from_vec(pseudo_random(n_out * k, 0x100 + n_out as u64, -0.5, 0.5), (n_out, k), &device)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
+            let x = Tensor::from_vec(pseudo_random(T * k, 0x200 + n_out as u64, -1.0, 1.0), (T, k), &device).unwrap();
+
+            let mut sink = 0f32;
+            let run = |kernel: F16MmKernel| {
+                read_scalar(&dispatch::run_matmul_f16_variant(&w, &x, kernel).unwrap())
+            };
+            for _ in 0..warm {
+                for (_, kernel) in VARIANTS {
+                    sink += run(kernel);
+                }
+            }
+
+            // One timed loop, variants interleaved per iteration; each dispatch
+            // ends in a small readback (the per-iter command-buffer flush).
+            let mut times: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(iters));
+            for _ in 0..iters {
+                for (i, (_, kernel)) in VARIANTS.iter().enumerate() {
+                    let t0 = Instant::now();
+                    sink += run(*kernel);
+                    times[i].push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+
+            eprintln!("--- [{n_out}x{k}] t={T} ---");
+            for (i, (name, _)) in VARIANTS.iter().enumerate() {
+                let mean = times[i].iter().sum::<f64>() / times[i].len() as f64;
+                let plateau: f64 =
+                    times[i][iters / 2..].iter().sum::<f64>() / (iters - iters / 2) as f64;
+                eprintln!("  {name}: mean {mean:.3} ms | plateau {plateau:.3} ms (sink {sink:.1})");
+            }
         }
     }
 }
