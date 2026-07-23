@@ -4,10 +4,10 @@ use anyhow::{Result, ensure};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::RmsNorm;
 
-use crate::attention::{AttnBlock, AttnWeights};
+use crate::attention::{AttnBlock, AttnWeights, PrefillMask};
 use crate::config::LagunaConfig;
 use crate::gguf::{GgufFile, QLinear, Weights};
-use crate::kv_cache::LayerCache;
+use crate::kv_cache::{LayerCache, MaskKind};
 use crate::moe::{DenseMlp, MoeBlock};
 use crate::ops::ExpertRunner;
 use crate::rope::Rope;
@@ -191,8 +191,37 @@ impl LagunaModel {
             };
         }
 
+        // Hoist the two distinct prefill masks (full-attn causal, SWA windowed)
+        // out of the per-layer loop: the mask is a pure function of (kind, pos,
+        // seq_len), so every full-attn layer shares one mask and every SWA layer
+        // another. Building the two materialized sdpa masks once here replaces 48
+        // per-layer builds — the dominant per-layer attention cost at seq=512.
+        // Only at prefill (seq>1); decode builds no mask, so the layers see None.
+        // Built lazily per kind so an all-full or all-SWA model never constructs
+        // a mask it won't use.
+        let (mut full_mask, mut swa_mask) = (None, None);
+        if seq > 1 {
+            for il in 0..self.layers.len() {
+                if full_mask.is_none() && self.cfg.is_full_attn(il) {
+                    full_mask = PrefillMask::build(MaskKind::Full, self.cfg.n_head(il), seq, pos, &self.device)?;
+                } else if swa_mask.is_none() && !self.cfg.is_full_attn(il) {
+                    swa_mask = PrefillMask::build(
+                        MaskKind::Swa { window: self.cfg.sliding_window },
+                        self.cfg.n_head(il),
+                        seq,
+                        pos,
+                        &self.device,
+                    )?;
+                }
+                if full_mask.is_some() && swa_mask.is_some() {
+                    break;
+                }
+            }
+        }
+
         for il in 0..self.layers.len() {
             let layer = &self.layers[il];
+            let mask = if self.cfg.is_full_attn(il) { full_mask.as_ref() } else { swa_mask.as_ref() };
             let cache = &mut self.caches[il];
 
             let normed = layer.attn_norm.forward(&x)?;
@@ -200,7 +229,7 @@ impl LagunaModel {
 
             // x += attn(attn_norm(x)); the AttnBlock output is the fork's
             // post-o_proj "attn_o_proj" node.
-            let attn = layer.attn.forward(&normed, cache, pos)?;
+            let attn = layer.attn.forward(&normed, cache, pos, mask)?;
             tap!("attn_o_proj", il, attn);
             let ffn_inp = (&x + &attn)?;
             tap!("ffn_inp", il, ffn_inp);

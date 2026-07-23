@@ -29,27 +29,31 @@
    modes (18.2/18.5 LPM, 38.6/39.2 full); fork's historical bench figures were
    LPM; prefill gap is mode-independent 0.42-0.49x (2×2 matrix + traps in
    docs/log.md power-calibration entry).
-2. **MoE combine fusion + shared map0** (prefill; ours is 0.42-0.49x the
-   fork's pp512 in BOTH power modes — 174 vs 354 LPM, 415 vs 990 full).
-   RESCOPED 2026-07-22 by the measured prefill budget (docs/log.md P2-phase-0
-   entry; `prefill_*` benches in moe.rs/attention.rs): the ~10-dispatch
-   routing glue is only ~0.6 ms/layer (~1% of prefill) — routing-glue fusion
-   DEMOTED (folded into the encoder-takeover ledger item); the COMBINE chain
-   (3 broadcast_muls + sum(1) over the [512,10,3072]/63MB expert output) is
-   ~14.8 ms/layer ≈ 23% of prefill, ~9x its bandwidth floor — candle's
-   broadcast ops take slow strided paths. Do now: (a) one fused combine
-   kernel, `sum_i(down_i × col_l2 × 1/32768 × w_i)` reading the expert output
-   once, f32 accumulation mirroring candle's reduce order, kill-switch + gated
-   like every owned kernel; (b) compute the mm_id map0 row-map ONCE per MoE
-   block instead of 3x (bit-identical by construction; the fork recomputes
-   too, so it's an absolute win over it — and the gate 3.0 vs up 7.9 ms
-   anomaly on identical shapes needs explaining first). Expected ~25% prefill.
-3. **Attention block cost, prefill edition** — the prefill budget puts
-   attention at 23.6 (full) / 30.1 (SWA) ms/layer ≈ 46% of the whole forward:
-   the single biggest prefill category, ahead of everything MoE. Subsumes the
-   old P1(b) decode glue fusion (~6 ms sustained: QK-norm, rope, softplus,
-   transpose/contiguous copies, sdpa casts + mask materialization) — attack
-   both seq regimes together.
+2. **MoE combine fusion + shared map0 — DONE 2026-07-23.** Prefill 174 → 211
+   tok/s @925 (+21%), 150-160 → 184 @4k; decode unchanged; all parity tiers
+   pass at the exact prior anchors with regenerated references because the
+   fused combine is BIT-IDENTICAL to candle's chain by construction (bitwise
+   acceptance test, `src/ops/combine.metal` mirrors candle's reduce geometry
+   at candle's rounding boundaries; `fp contract(off)` + `fp reassociate(off)`
+   pin it toolchain-wide). `LAGUNA_COMBINE_CLASSIC` kill-switch; `combine`
+   provenance enforced per tier. map0 computed once per MoE block via typed
+   `Map0Scratch`. Review round (3 models): five hardening items applied, no
+   live bugs; the gate-3.0/up-7.9 bench anomaly was DVFS burst fiction (bench
+   now interleaves). Full arc: docs/log.md 2026-07-23 entry. (Routing-glue
+   fusion stays demoted into the encoder-takeover item — measured ~1%.)
+3. **Attention block cost, prefill edition** — sub-budget measured 2026-07-23
+   (`prefill_attn_*` benches; per-forward: projections 585 ms, mask 415 → NOW
+   ~16, transposes 119, sdpa 90, gate 82, rope 75, qk-norm 21).
+   (a) **mask hoisting — DONE 2026-07-23** (48 builds/forward → 2 per chunk,
+   byte-identical, no kill-switch; prefill 211 → 228 @925, 184 → 237 @4k;
+   docs/log.md entry). (b) projections: cooperative-tensor f16 gemm port —
+   NEXT, prototype first (decision pending: f32-operand tensor tiles vs
+   fork-style f16-staged activations, which shift numerics — see the
+   mm_id `_t_hp`-was-slower precedent before committing). (c) the remaining
+   ~275 ms of glue (transposes, rope narrow/cat on full layers, gate, sdpa
+   casts) — likely lands with the encoder takeover / layout rework. Subsumes
+   the old P1(b) decode glue fusion (~6 ms sustained) — attack both seq
+   regimes together.
 4. **MoE-block encoder takeover** (ledger item below) — concurrency +
    range-tracked barriers; now also owns the demoted routing-glue fusion.
 5. **mmap + no-copy model load** (see ledger item below) — dev-velocity
@@ -283,6 +287,26 @@ implementation — never silently drop scope.
   prefill gemm (src/ops/f16.metal) uses the classic simdgroup path; the fork on M5
   would take the cooperative-tensor mul_mm for f16×f32. Potential prefill perf
   follow-up; correctness unaffected.
+  PROTOTYPED 2026-07-23 (src/ops/f16_t_proto.metal + the `proto_bench` module in
+  f16.rs, both #[ignore]d — NOT production-wired). Two Metal-4 `matmul2d` ports of
+  the gemm, mirroring the mm_id `_t`/`_t_hp` precedent: variant B (`_t`, half
+  operand tiles) and variant A (`_t_hp`, float operand tiles). Findings on the four
+  attention projection shapes at seq=512:
+  - **B (half tiles) is the clear win: ~1.8–2.0x over the shipped classic kernel**
+    (burst-min ms: SWA-q 9216 2.80 vs 5.17; FULL-q 6144 2.01 vs 3.64; k/v 1024 0.46
+    vs 0.81; o_proj 3072 2.69 vs 3.82). Cost: it rounds the f32 activation to f16,
+    so rel_l2 ~1.85e-4 / max_abs ≤1.4e-2 vs classic — the fork's own prefill
+    precision, i.e. the **mm** parity tier, NOT strict. This regresses attention
+    prefill off its current strict-clean status (float-tile classic is
+    MMA-bit-identical to the f32 reference); acceptable only because the prefill
+    full-logit gate is ALREADY the mm tier (mm_id drifts the same way).
+  - **A (float tiles) is not worth porting**: bit-IDENTICAL to classic (rel_l2 0.0)
+    but ~break-even on speed (no tensor-core throughput gain from float operands) —
+    exactly the mm_id `_t_hp` precedent ("compiles but slower than f16 tiles").
+  Recommended port: make B the default attention prefill gemm, keep the classic
+  float-tile kernel as the strict-tier / `LAGUNA_ATTN_F32` fallback (mirror the
+  mm_id `_t` default + `_hp`/classic fallback structure, incl. the lazy-compile
+  split so a future float-`matmul2d` rejection can't break the default library).
 - [x] **Combine-library reassociation hardening — RESOLVED via source pragma**
   (2026-07-22). The fused combine kernels' bit-identity to candle's chain rests
   on the rescale multiply chain (`r1 = d*l; r2 = r1*2^-15; r3 = r2*ww`) NOT

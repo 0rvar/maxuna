@@ -202,12 +202,15 @@ Warm steady-state, fused path, vs fork `llama-bench`, pmset-verified 2×2
 | | ours LPM | fork LPM | ours full | fork full |
 |---|---|---|---|---|
 | decode (256-tok sustained / tg128) | ~18.2 tok/s | 18.5 | ~38.6 | 39.2 |
-| prefill short (630-925 tok / pp512) | ~174 tok/s | 354 | ~415 | 990 |
-| prefill 4k (4007 tok / pp4096) | ~150-160 tok/s | 348 | ~345 | 793 |
+| prefill short (630-925 tok / pp512) | ~228 tok/s | 354 | (stale: ~415) | 990 |
+| prefill 4k (4007 tok / pp4096) | ~237 tok/s | 348 | (stale: ~345) | 793 |
 
-Decode is at parity with the fork in BOTH modes (0.98x). The prefill gap is
-mode-independent: 0.42-0.49x fork in both modes — it's dispatch/glue overhead,
-not clocks.
+Decode is at parity with the fork in BOTH modes (0.98x). Prefill "ours" LPM
+figures are 2026-07-23 post combine-fusion + mask-hoisting (174 → 228 @925,
+~155 → 237 @4k in one day); the full-power ours column predates both. The
+remaining prefill gap (0.64-0.68x fork) is led by the attention projections
+gemm (classic simdgroup f16 path — tensor-path port is the open TODO), the
+transpose/cast/rope glue, and serial scheduling vs ggml's concurrent encoder.
 
 Prefill: the vendored two-pass mm_id kernel (tensor `matmul2d` default) took
 prefill ~60 → ~188 tok/s (3.1x; ~174 re-measured 2026-07-22 in LPM). Decode:
@@ -225,10 +228,14 @@ One CPU↔GPU sync/token, routing on-GPU, transpose-contiguous copies are
 metadata reshapes at seq==1.
 
 Known remaining gaps (see TODO.md priority list for the plan):
-- **Prefill (0.42-0.49x fork, both modes)**: surrounding candle dispatches per
-  MoE+attn layer (route, silu*mul, combine, shared expert) that ggml fuses,
-  plus candle per-op overhead — NOT the matmul. P2: fuse route+glue+combine
-  into the owned kernels.
+- **Prefill (0.53-0.60x fork after combine fusion)**: the measured budget says
+  attention is ~46% of the forward (transpose/contiguous copies, mask
+  materialization, f16 casts, rope narrow/cat on full layers — the fork runs
+  flash-attention on permute VIEWS with none of that), plus serial scheduling
+  vs ggml's concurrent encoder. Routing glue measured ~1% — do NOT "fuse
+  routing" for perf. The MoE combine tail is DONE (src/ops/combine.metal,
+  bit-identical to candle's chain by construction, bitwise-tested;
+  LAGUNA_COMBINE_CLASSIC kill-switch; provenance-enforced per tier).
 - **Decode (parity with fork in both modes — 18.2 vs 18.5 LPM, 38.6 vs 39.2
   full)**: remaining levers to PASS the fork are the MoE mv_id gather (~14 ms
   sustained vs ~7 ms bandwidth floor), attention glue fusion (~6 ms

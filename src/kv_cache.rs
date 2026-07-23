@@ -21,6 +21,71 @@ pub enum LayerCache {
     Swa { k: Tensor, v: Tensor, len: usize, window: usize },
 }
 
+/// The per-layer state the attention-mask math reads — the attention kind, plus
+/// the window for SWA. Nothing else in a `LayerCache` affects the mask, so a
+/// mask built from a `MaskKind` is identical across every layer of that kind
+/// and can be hoisted out of the per-layer loop.
+#[derive(Clone, Copy)]
+pub enum MaskKind {
+    Full,
+    Swa { window: usize },
+}
+
+/// Attention mask for `seq_len` new queries at absolute position `pos`, or None
+/// when a single decode token needs no mask.
+///
+/// The mask is additive (0.0 to attend, -inf to block) with shape
+/// `[seq_len, k_seq]`, where column `c` corresponds to the same key `append`
+/// places at position `c` in the returned view. This is a pure function of
+/// (kind, seq_len, pos) — it reads no cache contents — so a caller can build it
+/// once per forward and share it across every layer of the same kind.
+pub fn attn_mask_for(
+    kind: MaskKind,
+    seq_len: usize,
+    pos: usize,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    if seq_len == 1 {
+        return Ok(None);
+    }
+    let mask = match kind {
+        MaskKind::Full => {
+            // Keys 0..pos+seq_len in position order; block strictly-future keys.
+            let k_seq = pos + seq_len;
+            let mut data = vec![0f32; seq_len * k_seq];
+            for qi in 0..seq_len {
+                let q_abs = pos + qi;
+                for kj in 0..k_seq {
+                    if kj > q_abs {
+                        data[qi * k_seq + kj] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            Tensor::from_vec(data, (seq_len, k_seq), device)?
+        }
+        MaskKind::Swa { window: w } => {
+            // Columns are the m surviving past keys (abs pos-m..pos-1) then the
+            // seq new keys (abs pos..pos+seq-1). Block future keys and any key
+            // older than the window (matches llama.cpp is_masked_swa STANDARD:
+            // q_abs - k_abs >= n_swa is masked).
+            let m = pos.min(w);
+            let k_seq = m + seq_len;
+            let mut data = vec![0f32; seq_len * k_seq];
+            for qi in 0..seq_len {
+                let q_abs = pos + qi;
+                for c in 0..k_seq {
+                    let k_abs = pos - m + c;
+                    if k_abs > q_abs || q_abs - k_abs >= w {
+                        data[qi * k_seq + c] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            Tensor::from_vec(data, (seq_len, k_seq), device)?
+        }
+    };
+    Ok(Some(mask))
+}
+
 impl LayerCache {
     pub fn new(cfg: &LagunaConfig, il: usize, max_ctx: usize, device: &Device) -> Result<Self> {
         let n_kv_head = cfg.n_kv_head;
@@ -70,56 +135,27 @@ impl LayerCache {
         }
     }
 
-    /// Attention mask for `seq_len` new queries at absolute position `pos`,
-    /// or None when a single decode token needs no mask.
-    ///
-    /// The mask is additive (0.0 to attend, -inf to block) with shape
-    /// `[seq_len, k_seq]`, where column `c` corresponds to the same key
-    /// `append` places at position `c` in the returned view.
+    /// Convenience wrapper over `attn_mask_for` for a single cache. Production
+    /// prefill hoists the build out of the per-layer loop and calls the free
+    /// function once per kind; single-cache callers (tests, benches) use this.
+    /// See `attn_mask_for` for the mask semantics.
     pub fn attn_mask(&self, seq_len: usize, pos: usize) -> Result<Option<Tensor>> {
-        if seq_len == 1 {
-            return Ok(None);
+        attn_mask_for(self.mask_kind(), seq_len, pos, &self.device())
+    }
+
+    /// The mask kind for this cache — the only per-layer state the mask reads.
+    pub fn mask_kind(&self) -> MaskKind {
+        match self {
+            LayerCache::Full { .. } => MaskKind::Full,
+            LayerCache::Swa { window, .. } => MaskKind::Swa { window: *window },
         }
-        let device = match self {
+    }
+
+    /// The device the cache tensors live on.
+    pub fn device(&self) -> Device {
+        match self {
             LayerCache::Full { k, .. } | LayerCache::Swa { k, .. } => k.device().clone(),
-        };
-        let mask = match self {
-            LayerCache::Full { .. } => {
-                // Keys 0..pos+seq_len in position order; block strictly-future keys.
-                let k_seq = pos + seq_len;
-                let mut data = vec![0f32; seq_len * k_seq];
-                for qi in 0..seq_len {
-                    let q_abs = pos + qi;
-                    for kj in 0..k_seq {
-                        if kj > q_abs {
-                            data[qi * k_seq + kj] = f32::NEG_INFINITY;
-                        }
-                    }
-                }
-                Tensor::from_vec(data, (seq_len, k_seq), &device)?
-            }
-            LayerCache::Swa { window, .. } => {
-                // Columns are the m surviving past keys (abs pos-m..pos-1) then
-                // the seq new keys (abs pos..pos+seq-1). Block future keys and any
-                // key older than the window (matches llama.cpp is_masked_swa
-                // STANDARD: q_abs - k_abs >= n_swa is masked).
-                let w = *window;
-                let m = pos.min(w);
-                let k_seq = m + seq_len;
-                let mut data = vec![0f32; seq_len * k_seq];
-                for qi in 0..seq_len {
-                    let q_abs = pos + qi;
-                    for c in 0..k_seq {
-                        let k_abs = pos - m + c;
-                        if k_abs > q_abs || q_abs - k_abs >= w {
-                            data[qi * k_seq + c] = f32::NEG_INFINITY;
-                        }
-                    }
-                }
-                Tensor::from_vec(data, (seq_len, k_seq), &device)?
-            }
-        };
-        Ok(Some(mask))
+        }
     }
 
     pub fn reset(&mut self) {

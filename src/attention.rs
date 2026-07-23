@@ -5,8 +5,47 @@ use candle_core::{DType, Device, Module, Tensor};
 
 use crate::config::LagunaConfig;
 use crate::gguf::{QLinear, Weights};
-use crate::kv_cache::LayerCache;
+use crate::kv_cache::{LayerCache, MaskKind};
 use crate::rope::Rope;
+
+/// Prefill attention masks for one query-head-count class (full-attn 48 heads
+/// or SWA 72), built once per forward and shared across every layer of that
+/// kind. The mask is a pure function of (kind, pos, seq_len) — identical across
+/// all layers of a kind — so building it here instead of per layer replaces 48
+/// materializations with 2. `raw` is the additive `[seq, k_seq]` f32 mask the
+/// manual/CPU fallback broadcast-adds; `sdpa` is that mask reshaped to
+/// `[1, n_head, seq, k_seq]`, cast f16 and made contiguous for the Metal sdpa
+/// kernel. Both are byte-identical to what the pre-hoist per-layer path built.
+pub struct PrefillMask {
+    raw: Tensor,
+    sdpa: Tensor,
+}
+
+impl PrefillMask {
+    /// Build the raw + sdpa-materialized masks for `n_head` query heads of
+    /// `kind`, for a `seq`-token chunk at absolute position `pos`. `None` for a
+    /// single decode token (seq==1), matching the pre-hoist path (which built no
+    /// mask there).
+    pub fn build(
+        kind: MaskKind,
+        n_head: usize,
+        seq: usize,
+        pos: usize,
+        device: &Device,
+    ) -> Result<Option<Self>> {
+        let raw = match crate::kv_cache::attn_mask_for(kind, seq, pos, device)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let (s, kk) = raw.dims2()?;
+        let sdpa = raw
+            .reshape((1, 1, s, kk))?
+            .broadcast_as((1, n_head, s, kk))?
+            .to_dtype(DType::F16)?
+            .contiguous()?;
+        Ok(Some(Self { raw, sdpa }))
+    }
+}
 
 /// How the attention projection weights are held, decided at load (model.rs,
 /// `LAGUNA_ATTN_F32`). Activations are f32 either way — the `F16` mode streams
@@ -104,9 +143,29 @@ impl AttnBlock {
         })
     }
 
+    /// Build this block's prefill mask for `cache` at (seq, pos), or None for a
+    /// single decode token. Production prefill hoists this out of the layer loop
+    /// — one build per kind, shared across every layer of that kind — while
+    /// single-block callers (tests, benches) build it per call.
+    pub fn prefill_mask(
+        &self,
+        cache: &LayerCache,
+        seq: usize,
+        pos: usize,
+    ) -> Result<Option<PrefillMask>> {
+        PrefillMask::build(cache.mask_kind(), self.n_head, seq, pos, &cache.device())
+    }
+
     /// x_normed: [seq, hidden] f32 (already attn_norm'ed by the caller).
-    /// Returns [seq, hidden] f32.
-    pub fn forward(&self, x_normed: &Tensor, cache: &mut LayerCache, pos: usize) -> Result<Tensor> {
+    /// `mask` is the pre-built, hoisted mask for this layer's kind (None for a
+    /// single decode token). Returns [seq, hidden] f32.
+    pub fn forward(
+        &self,
+        x_normed: &Tensor,
+        cache: &mut LayerCache,
+        pos: usize,
+        mask: Option<&PrefillMask>,
+    ) -> Result<Tensor> {
         let (seq, _hidden) = x_normed.dims2()?;
 
         // Gate logits from the *pre-attention* normed input (not the attn output).
@@ -142,17 +201,19 @@ impl AttnBlock {
 
         let (q, k) = self.rope.apply(&q, &k, pos)?;
 
-        // Cache in f16; sdpa runs in f16.
+        // Cache in f16; sdpa runs in f16. The additive mask is pre-built and
+        // hoisted by the caller (one per kind per forward; None at decode).
         let (k_all, v_all) = cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?)?;
-        let mask = cache.attn_mask(seq, pos)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
 
         // sdpa is a Metal-only kernel; fall back to an explicit f32 attention on
-        // other devices (used by the CPU tests and any non-Metal run).
+        // other devices (used by the CPU tests and any non-Metal run). The two
+        // paths consume different mask forms: sdpa the materialized f16 mask,
+        // the manual fallback the raw `[seq, k_seq]` additive one.
         let attn = if matches!(x_normed.device(), Device::Metal(_)) {
-            self.sdpa_attention(&q, &k_all, &v_all, mask.as_ref(), scale)?
+            self.sdpa_attention(&q, &k_all, &v_all, mask.map(|m| &m.sdpa), scale)?
         } else {
-            self.manual_attention(&q, &k_all, &v_all, mask.as_ref(), scale, seq)?
+            self.manual_attention(&q, &k_all, &v_all, mask.map(|m| &m.raw), scale, seq)?
         }; // [n_head, seq, head_dim] f32
 
         // Softplus output gate, per-head, broadcast over head_dim, in f32.
@@ -172,8 +233,9 @@ impl AttnBlock {
 
     /// Metal MLX fused attention. q [n_head, seq, hd] f32, k/v
     /// [n_kv_head, K, hd] f16. GQA (n_head multiple of n_kv_head) is handled by
-    /// the kernel; k/v are not pre-tiled. The kernel runs in f16 (q and the
-    /// mask are cast below). Returns [n_head, seq, hd] f32.
+    /// the kernel; k/v are not pre-tiled. The kernel runs in f16: q is cast
+    /// below, and `mask` arrives pre-materialized (f16, `[1, n_head, seq, k]`,
+    /// contiguous) from the hoisted `PrefillMask`. Returns [n_head, seq, hd] f32.
     fn sdpa_attention(
         &self,
         q: &Tensor,
@@ -190,21 +252,7 @@ impl AttnBlock {
         let k = k_all.unsqueeze(0)?; // [1, n_kv_head, K, hd], head-strided
         let v = v_all.unsqueeze(0)?;
 
-        // Full-kernel masks must match q dtype and carry the query-head dim.
-        let mask = match mask {
-            Some(m) => {
-                let (s, kk) = m.dims2()?;
-                Some(
-                    m.reshape((1, 1, s, kk))?
-                        .broadcast_as((1, self.n_head, s, kk))?
-                        .to_dtype(DType::F16)?
-                        .contiguous()?,
-                )
-            }
-            None => None,
-        };
-
-        let out = candle_nn::ops::sdpa(&q, &k, &v, mask.as_ref(), false, scale, 1.0)?;
+        let out = candle_nn::ops::sdpa(&q, &k, &v, mask, false, scale, 1.0)?;
         Ok(out.squeeze(0)?.to_dtype(DType::F32)?)
     }
 
@@ -470,10 +518,11 @@ pub(crate) mod tests {
         let x = dense(5, hidden, 42, &dev);
         let reference = naive_forward(&w, &rope, &x, n_head, n_kv, hd, None);
 
-        let prefill = block.forward(&x.narrow(0, 0, 4).unwrap(), &mut cache, 0).unwrap();
+        let mask = block.prefill_mask(&cache, 4, 0).unwrap();
+        let prefill = block.forward(&x.narrow(0, 0, 4).unwrap(), &mut cache, 0, mask.as_ref()).unwrap();
         assert!(max_abs_diff(&prefill, &reference.narrow(0, 0, 4).unwrap()) < 1e-3);
 
-        let decode = block.forward(&x.narrow(0, 4, 1).unwrap(), &mut cache, 4).unwrap();
+        let decode = block.forward(&x.narrow(0, 4, 1).unwrap(), &mut cache, 4, None).unwrap();
         assert!(max_abs_diff(&decode, &reference.narrow(0, 4, 1).unwrap()) < 1e-3);
     }
 
@@ -493,7 +542,7 @@ pub(crate) mod tests {
         let total = 20;
         let x = dense(total, hidden, 99, &dev);
         for t in 0..total {
-            let step = block.forward(&x.narrow(0, t, 1).unwrap(), &mut cache, t).unwrap();
+            let step = block.forward(&x.narrow(0, t, 1).unwrap(), &mut cache, t, None).unwrap();
             let reference = naive_forward(&w, &rope, &x.narrow(0, 0, t + 1).unwrap(), n_head, n_kv, hd, Some(window));
             let diff = max_abs_diff(&step, &reference.narrow(0, t, 1).unwrap());
             assert!(diff < 1e-3, "step {t} diff {diff}");
@@ -556,11 +605,12 @@ pub(crate) mod tests {
         let x = dense(7, hidden, 7, &dev);
         let reference = naive_forward(&w, &rope, &x, n_head, n_kv, hd, None);
 
-        let prefill = block.forward(&x.narrow(0, 0, 6).unwrap(), &mut cache, 0).unwrap();
+        let mask = block.prefill_mask(&cache, 6, 0).unwrap();
+        let prefill = block.forward(&x.narrow(0, 0, 6).unwrap(), &mut cache, 0, mask.as_ref()).unwrap();
         let ref_prefill = reference.narrow(0, 0, 6).unwrap();
         assert!(cosine(&prefill, &ref_prefill) > 0.999, "prefill cos {}", cosine(&prefill, &ref_prefill));
 
-        let decode = block.forward(&x.narrow(0, 6, 1).unwrap(), &mut cache, 6).unwrap();
+        let decode = block.forward(&x.narrow(0, 6, 1).unwrap(), &mut cache, 6, None).unwrap();
         let ref_decode = reference.narrow(0, 6, 1).unwrap();
         assert!(cosine(&decode, &ref_decode) > 0.999, "decode cos {}", cosine(&decode, &ref_decode));
 
@@ -572,7 +622,8 @@ pub(crate) mod tests {
         let mut cache_swa = LayerCache::new(&cfg_swa, 1, 128, &dev).unwrap();
         let xs = dense(6, hidden, 8, &dev);
         let ref_swa = naive_forward(&w, &rope_swa, &xs, n_head, n_kv, hd, Some(win));
-        let swa = block_swa.forward(&xs, &mut cache_swa, 0).unwrap();
+        let swa_mask = block_swa.prefill_mask(&cache_swa, xs.dim(0).unwrap(), 0).unwrap();
+        let swa = block_swa.forward(&xs, &mut cache_swa, 0, swa_mask.as_ref()).unwrap();
         assert!(cosine(&swa, &ref_swa) > 0.999, "swa cos {}", cosine(&swa, &ref_swa));
     }
 
@@ -614,10 +665,11 @@ pub(crate) mod tests {
             assert!(cos > 0.999998 && rel < 5e-5, "{what}: cos {cos} rel_l2 {rel}");
         };
 
-        let prefill = block.forward(&x.narrow(0, 0, 33).unwrap(), &mut cache, 0).unwrap();
+        let mask = block.prefill_mask(&cache, 33, 0).unwrap();
+        let prefill = block.forward(&x.narrow(0, 0, 33).unwrap(), &mut cache, 0, mask.as_ref()).unwrap();
         check(&prefill, &reference.narrow(0, 0, 33).unwrap(), "prefill");
 
-        let decode = block.forward(&x.narrow(0, 33, 1).unwrap(), &mut cache, 33).unwrap();
+        let decode = block.forward(&x.narrow(0, 33, 1).unwrap(), &mut cache, 33, None).unwrap();
         check(&decode, &reference.narrow(0, 33, 1).unwrap(), "decode");
 
         let win = 4;
@@ -627,7 +679,8 @@ pub(crate) mod tests {
         let mut cache_swa = LayerCache::new(&cfg_swa, 1, 128, &dev).unwrap();
         let xs = dense(12, hidden, 8, &dev).affine(0.125, 0.0).unwrap();
         let ref_swa = naive_forward(&w, &rope_swa, &xs, n_head, n_kv, hd, Some(win));
-        let swa = block_swa.forward(&xs, &mut cache_swa, 0).unwrap();
+        let swa_mask = block_swa.prefill_mask(&cache_swa, xs.dim(0).unwrap(), 0).unwrap();
+        let swa = block_swa.forward(&xs, &mut cache_swa, 0, swa_mask.as_ref()).unwrap();
         check(&swa, &ref_swa, "swa prefill");
     }
 
@@ -923,7 +976,7 @@ pub(crate) mod tests {
             let mut x = x0.clone();
             for (il, l) in layers.iter().enumerate() {
                 let normed = l.attn_norm.forward(&x).unwrap();
-                let attn = l.block.as_ref().unwrap().forward(&normed, &mut caches[il], POS).unwrap();
+                let attn = l.block.as_ref().unwrap().forward(&normed, &mut caches[il], POS, None).unwrap();
                 x = (&x + &attn).unwrap();
             }
             x
@@ -940,7 +993,7 @@ pub(crate) mod tests {
                 .block
                 .as_ref()
                 .expect("attn_step needs build_layers(dev, true)")
-                .forward(&normed, cache, POS)
+                .forward(&normed, cache, POS, None)
                 .unwrap();
             (x + &attn).unwrap()
         }
@@ -1409,31 +1462,108 @@ pub(crate) mod tests {
         /// two halves' numbers are directly comparable).
         const PREFILL_SEQ: usize = 512;
 
-        /// One SHIPPED f16 attention block at `il`'s geometry: f16 projection
-        /// weights (`Proj::DenseF16`, the production prefill default) consumed by
-        /// the vendored mixed-dtype kernels, with the same QK-norm/rope/head
-        /// counts the real layer uses. Built directly so the bench runs the
-        /// production f16 path rather than the dequant-f32 `QMatMul` one the
-        /// decode benches build.
-        fn build_f16_block(dev: &Device, il: usize, rope: Arc<Rope>) -> AttnBlock {
-            let h = n_head_of(il);
-            let s = il as u64 * 100;
-            let f16w = |rows: usize, cols: usize, seed: u64| {
-                dense(rows, cols, seed, dev).to_dtype(DType::F16).unwrap()
-            };
-            AttnBlock {
-                q_proj: Proj::DenseF16(f16w(h * HEAD_DIM, HIDDEN, s + 1)),
-                k_proj: Proj::DenseF16(f16w(N_KV * HEAD_DIM, HIDDEN, s + 2)),
-                v_proj: Proj::DenseF16(f16w(N_KV * HEAD_DIM, HIDDEN, s + 3)),
-                g_proj: Proj::DenseF16(f16w(h, HIDDEN, s + 4)),
-                o_proj: Proj::DenseF16(f16w(HIDDEN, h * HEAD_DIM, s + 5)),
-                q_norm: RmsNorm::new(norm_w(HEAD_DIM, s + 6, dev), 1e-6),
-                k_norm: RmsNorm::new(norm_w(HEAD_DIM, s + 7, dev), 1e-6),
-                rope,
-                n_head: h,
-                n_kv_head: N_KV,
-                head_dim: HEAD_DIM,
+        /// The raw ingredients of one SHIPPED f16 attention block at `il`'s
+        /// geometry: f16 projection weights (`Proj::DenseF16`, the production
+        /// prefill default, consumed by the vendored mixed-dtype kernels),
+        /// QK-norm weights, and the layer's rope table, with the head counts the
+        /// real layer uses. The raw handles let each per-stage sub-bench run one
+        /// slice of `AttnBlock::forward` in isolation on the exact tensors the
+        /// chain feeds it; `into_block` assembles the same values into a real
+        /// `AttnBlock` for the full-chain bench, so the parts and the whole are
+        /// priced over identical weights.
+        struct PrefillParts {
+            wq: Tensor,
+            wk: Tensor,
+            wv: Tensor,
+            wg: Tensor,
+            wo: Tensor,
+            q_norm: RmsNorm,
+            k_norm: RmsNorm,
+            rope: Arc<Rope>,
+            n_head: usize,
+        }
+
+        impl PrefillParts {
+            fn new(dev: &Device, il: usize, rope: Arc<Rope>) -> Self {
+                let h = n_head_of(il);
+                let s = il as u64 * 100;
+                let f16w = |rows: usize, cols: usize, seed: u64| {
+                    dense(rows, cols, seed, dev).to_dtype(DType::F16).unwrap()
+                };
+                PrefillParts {
+                    wq: f16w(h * HEAD_DIM, HIDDEN, s + 1),
+                    wk: f16w(N_KV * HEAD_DIM, HIDDEN, s + 2),
+                    wv: f16w(N_KV * HEAD_DIM, HIDDEN, s + 3),
+                    wg: f16w(h, HIDDEN, s + 4),
+                    wo: f16w(HIDDEN, h * HEAD_DIM, s + 5),
+                    q_norm: RmsNorm::new(norm_w(HEAD_DIM, s + 6, dev), 1e-6),
+                    k_norm: RmsNorm::new(norm_w(HEAD_DIM, s + 7, dev), 1e-6),
+                    rope,
+                    n_head: h,
+                }
             }
+
+            /// The same values assembled into the production `AttnBlock`, running
+            /// the f16 projection path rather than the dequant-f32 `QMatMul` one
+            /// the decode benches build.
+            fn into_block(&self) -> AttnBlock {
+                AttnBlock {
+                    q_proj: Proj::DenseF16(self.wq.clone()),
+                    k_proj: Proj::DenseF16(self.wk.clone()),
+                    v_proj: Proj::DenseF16(self.wv.clone()),
+                    g_proj: Proj::DenseF16(self.wg.clone()),
+                    o_proj: Proj::DenseF16(self.wo.clone()),
+                    q_norm: self.q_norm.clone(),
+                    k_norm: self.k_norm.clone(),
+                    rope: self.rope.clone(),
+                    n_head: self.n_head,
+                    n_kv_head: N_KV,
+                    head_dim: HEAD_DIM,
+                }
+            }
+        }
+
+        /// The FULL-attention (il 0: 48 heads, YaRN partial rope) and SWA
+        /// (il 1: 72 heads, plain rope) block ingredients plus the shared pos-0
+        /// input, as the model interleaves them. Every prefill bench builds this
+        /// pair so their stage numbers sum-check against `prefill_attn_chain_bench`.
+        fn prefill_variants(dev: &Device) -> (PrefillParts, PrefillParts, Tensor) {
+            let (rope_full, rope_swa) = build_ropes(dev);
+            (
+                PrefillParts::new(dev, 0, rope_full),
+                PrefillParts::new(dev, 1, rope_swa),
+                dense(PREFILL_SEQ, HIDDEN, 4242, dev),
+            )
+        }
+
+        /// The five f16 projection matmuls plus the `[seq, head, dim]` regroup,
+        /// exactly as `AttnBlock::forward` runs them. Returns (gate_logits
+        /// `[seq, n_head]`, q/k/v `[seq, head, dim]`), pre-QK-norm.
+        fn pp_project(p: &PrefillParts, x: &Tensor) -> (Tensor, Tensor, Tensor, Tensor) {
+            let mv = |w: &Tensor, x: &Tensor| crate::ops::matmul_f16(w, x).unwrap();
+            let g = mv(&p.wg, x);
+            let q = mv(&p.wq, x).reshape((PREFILL_SEQ, p.n_head, HEAD_DIM)).unwrap();
+            let k = mv(&p.wk, x).reshape((PREFILL_SEQ, N_KV, HEAD_DIM)).unwrap();
+            let v = mv(&p.wv, x).reshape((PREFILL_SEQ, N_KV, HEAD_DIM)).unwrap();
+            (g, q, k, v)
+        }
+
+        /// The three prefill `[seq, head, dim] -> [head, seq, dim]`
+        /// transpose+contiguous copies (the seq>1 permutation path).
+        fn pp_to_heads(q: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, Tensor, Tensor) {
+            let th = |t: &Tensor| t.transpose(0, 1).unwrap().contiguous().unwrap();
+            (th(q), th(k), th(v))
+        }
+
+        /// A synthetic post-sdpa attention tensor `[n_head, seq, head_dim]` f32,
+        /// for the stages downstream of sdpa (transposes' output regroup, gate).
+        fn synthetic_attn(p: &PrefillParts, seed: u64, dev: &Device) -> Tensor {
+            Tensor::from_vec(
+                seeded(p.n_head * PREFILL_SEQ * HEAD_DIM, seed),
+                (p.n_head, PREFILL_SEQ, HEAD_DIM),
+                dev,
+            )
+            .unwrap()
         }
 
         /// Prices the full attention chain (projections + QK-norm + rope + sdpa
@@ -1449,31 +1579,285 @@ pub(crate) mod tests {
         fn prefill_attn_chain_bench() {
             let dev = metal();
             let cfg = prod_cfg();
-            let (rope_full, rope_swa) = build_ropes(&dev);
             eprintln!(
                 "building 2 synthetic f16 attention blocks (full-attn + SWA) at seq={PREFILL_SEQ}..."
             );
             // il 0 is full-attention (il % 4 == 0), il 1 is SWA.
-            let full_block = build_f16_block(&dev, 0, rope_full);
-            let swa_block = build_f16_block(&dev, 1, rope_swa);
+            let (full, swa, x) = prefill_variants(&dev);
+            let full_block = full.into_block();
+            let swa_block = swa.into_block();
             let mut full_cache = LayerCache::new(&cfg, 0, MAX_CTX, &dev).unwrap();
             let mut swa_cache = LayerCache::new(&cfg, 1, MAX_CTX, &dev).unwrap();
-            let x = dense(PREFILL_SEQ, HIDDEN, 4242, &dev);
+
+            // Masks are built once, outside the timed loop, exactly as the model
+            // hoists them out of the per-layer loop — so this chain no longer
+            // pays the per-layer mask build (see `prefill_attn_mask_bench` for
+            // that isolated cost). The mask depends only on (kind, pos, seq), not
+            // cache contents, so the per-iter `reset()` leaves it valid.
+            let full_mask = full_block.prefill_mask(&full_cache, PREFILL_SEQ, 0).unwrap();
+            let swa_mask = swa_block.prefill_mask(&swa_cache, PREFILL_SEQ, 0).unwrap();
 
             bench(
                 &format!("prefill attn FULL block (48 heads, YaRN partial rope), seq={PREFILL_SEQ}"),
                 || {
                     full_cache.reset();
-                    read_scalar(&full_block.forward(&x, &mut full_cache, 0).unwrap())
+                    read_scalar(&full_block.forward(&x, &mut full_cache, 0, full_mask.as_ref()).unwrap())
                 },
             );
             bench(
                 &format!("prefill attn SWA block (72 heads, plain rope, window 512), seq={PREFILL_SEQ}"),
                 || {
                     swa_cache.reset();
-                    read_scalar(&swa_block.forward(&x, &mut swa_cache, 0).unwrap())
+                    read_scalar(&swa_block.forward(&x, &mut swa_cache, 0, swa_mask.as_ref()).unwrap())
                 },
             );
+        }
+
+        // --- prefill attention sub-category benches ------------------------
+        //
+        // These price the individual stages of `AttnBlock::forward` at the same
+        // 512-token prefill chunk, over the SAME synthetic blocks
+        // `prefill_attn_chain_bench` times, so where the block's per-layer cost
+        // goes can be budgeted. Each stage's live inputs are produced once
+        // (untimed) by running the earlier stages, then the stage under test is
+        // the only work inside the timed loop, ending in one small readback.
+        // FULL and SWA are timed separately wherever they differ (head count,
+        // rope kind, mask shape). The parts are timed in ISOLATION, so their sum
+        // only approximates the chain total: isolation removes cross-stage
+        // command-buffer pipelining and adds one flush per stage.
+
+        /// Stage 1: the four input projections (q/k/v/g) at [512,3072] plus the
+        /// output projection at [512, n_head*128], all `matmul_f16` dispatches.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_projections_bench() {
+            let dev = metal();
+            let (full, swa, x) = prefill_variants(&dev);
+            for (name, p) in [("FULL 48h", &full), ("SWA 72h", &swa)] {
+                // o_proj consumes the post-attention regroup [seq, n_head*128];
+                // synthesize an input of that shape so it is priced in isolation.
+                let o_in = dense(PREFILL_SEQ, p.n_head * HEAD_DIM, 55, &dev);
+                bench(
+                    &format!("prefill attn projections q/k/v/g + o_proj ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        let mv = |w: &Tensor, x: &Tensor| crate::ops::matmul_f16(w, x).unwrap();
+                        let _g = mv(&p.wg, &x);
+                        let _q = mv(&p.wq, &x);
+                        let _k = mv(&p.wk, &x);
+                        let _v = mv(&p.wv, &x);
+                        read_scalar(&mv(&p.wo, &o_in))
+                    },
+                );
+            }
+        }
+
+        /// Stage 2: the two QK-norm `rms_norm` calls over `[seq, head, 128]`.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_qk_norm_bench() {
+            let dev = metal();
+            let (full, swa, x) = prefill_variants(&dev);
+            for (name, p) in [("FULL 48h", &full), ("SWA 72h", &swa)] {
+                let (_g, q, k, _v) = pp_project(p, &x);
+                bench(
+                    &format!("prefill attn qk-norm 2x rms_norm ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        let _qn = p.q_norm.forward(&q).unwrap();
+                        read_scalar(&p.k_norm.forward(&k).unwrap())
+                    },
+                );
+            }
+        }
+
+        /// Stage 3: the three q/k/v `transpose(0,1).contiguous()` copies plus the
+        /// output-side `transpose+contiguous+reshape` regroup.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_transposes_bench() {
+            let dev = metal();
+            let (full, swa, x) = prefill_variants(&dev);
+            for (name, p) in [("FULL 48h", &full), ("SWA 72h", &swa)] {
+                let (_g, q, k, v) = pp_project(p, &x);
+                let q = p.q_norm.forward(&q).unwrap();
+                let k = p.k_norm.forward(&k).unwrap();
+                let attn = synthetic_attn(p, 66, &dev);
+                bench(
+                    &format!("prefill attn transposes 3x qkv + out-regroup ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        let _qh = q.transpose(0, 1).unwrap().contiguous().unwrap();
+                        let _kh = k.transpose(0, 1).unwrap().contiguous().unwrap();
+                        let _vh = v.transpose(0, 1).unwrap().contiguous().unwrap();
+                        let out = attn
+                            .transpose(0, 1)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((PREFILL_SEQ, p.n_head * HEAD_DIM))
+                            .unwrap();
+                        read_scalar(&out)
+                    },
+                );
+            }
+        }
+
+        /// Stage 4: `rope.apply` over q/k — FULL is the YaRN partial-rotary
+        /// narrow/contiguous/rope/cat/squeeze path (64 of 128 dims); SWA is the
+        /// plain full-width path.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_rope_bench() {
+            let dev = metal();
+            let (full, swa, x) = prefill_variants(&dev);
+            for (name, p) in [
+                ("FULL 48h, YaRN partial 64/128", &full),
+                ("SWA 72h, plain 128", &swa),
+            ] {
+                let (_g, q, k, v) = pp_project(p, &x);
+                let q = p.q_norm.forward(&q).unwrap();
+                let k = p.k_norm.forward(&k).unwrap();
+                let (qh, kh, _vh) = pp_to_heads(&q, &k, &v);
+                bench(
+                    &format!("prefill attn rope apply q+k ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        let (rq, _rk) = p.rope.apply(&qh, &kh, 0).unwrap();
+                        read_scalar(&rq)
+                    },
+                );
+            }
+        }
+
+        /// Stage 5a: the k/v f16 casts + cache append (slice_set) only. FULL
+        /// writes into the growing full cache; SWA into the 512-slot ring.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_cache_append_bench() {
+            let dev = metal();
+            let cfg = prod_cfg();
+            let (full, swa, x) = prefill_variants(&dev);
+            for (name, il, p) in [("FULL 48h", 0usize, &full), ("SWA 72h", 1usize, &swa)] {
+                let (_g, q, k, v) = pp_project(p, &x);
+                let q = p.q_norm.forward(&q).unwrap();
+                let k = p.k_norm.forward(&k).unwrap();
+                let (qh, kh, vh) = pp_to_heads(&q, &k, &v);
+                // append receives the post-rope k and the (un-roped) transposed v.
+                let (_rq, kh) = p.rope.apply(&qh, &kh, 0).unwrap();
+                let mut cache = LayerCache::new(&cfg, il, MAX_CTX, &dev).unwrap();
+                bench(
+                    &format!("prefill attn cache-append (k/v f16 cast + slice_set) ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        cache.reset();
+                        let kf = kh.to_dtype(DType::F16).unwrap();
+                        let vf = vh.to_dtype(DType::F16).unwrap();
+                        let (ka, _va) = cache.append(&kf, &vf).unwrap();
+                        read_scalar(&ka)
+                    },
+                );
+            }
+        }
+
+        /// Stage 5b: the mask only — host build + upload (`attn_mask`) plus the
+        /// sdpa-side reshape/broadcast/f16/contiguous materialization. FULL
+        /// builds a causal mask; SWA a windowed one. This measures the OLD
+        /// per-layer cost: production now hoists this build out of the layer loop
+        /// (`LagunaModel::run_stack` / `PrefillMask`), paying it twice per forward
+        /// instead of once per layer — this bench documents what that saves.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_mask_bench() {
+            let dev = metal();
+            let cfg = prod_cfg();
+            let (full, swa, _x) = prefill_variants(&dev);
+            for (name, il, p) in [("FULL 48h", 0usize, &full), ("SWA 72h", 1usize, &swa)] {
+                // The mask depends only on the cache geometry (seq, pos, window),
+                // not on any k/v content, so an empty cache at pos 0 suffices.
+                let cache = LayerCache::new(&cfg, il, MAX_CTX, &dev).unwrap();
+                bench(
+                    &format!("prefill attn mask build/upload + materialize ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        let mask = cache.attn_mask(PREFILL_SEQ, 0).unwrap().unwrap();
+                        let (s, kk) = mask.dims2().unwrap();
+                        let m = mask
+                            .reshape((1, 1, s, kk))
+                            .unwrap()
+                            .broadcast_as((1, p.n_head, s, kk))
+                            .unwrap()
+                            .to_dtype(DType::F16)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap();
+                        read_scalar(&m)
+                    },
+                );
+            }
+        }
+
+        /// Stage 6: the sdpa core — q f16 cast + `candle_nn::ops::sdpa` +
+        /// squeeze/f32 cast — with the cache views and materialized mask prebuilt.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_sdpa_bench() {
+            let dev = metal();
+            let cfg = prod_cfg();
+            let (full, swa, x) = prefill_variants(&dev);
+            let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+            for (name, il, p) in [("FULL 48h", 0usize, &full), ("SWA 72h", 1usize, &swa)] {
+                let (_g, q, k, v) = pp_project(p, &x);
+                let q = p.q_norm.forward(&q).unwrap();
+                let k = p.k_norm.forward(&k).unwrap();
+                let (qh, kh, vh) = pp_to_heads(&q, &k, &v);
+                let (qh, kh) = p.rope.apply(&qh, &kh, 0).unwrap();
+                let mut cache = LayerCache::new(&cfg, il, MAX_CTX, &dev).unwrap();
+                let (k_all, v_all) = cache
+                    .append(&kh.to_dtype(DType::F16).unwrap(), &vh.to_dtype(DType::F16).unwrap())
+                    .unwrap();
+                let mask = cache.attn_mask(PREFILL_SEQ, 0).unwrap().unwrap();
+                let (s, kk) = mask.dims2().unwrap();
+                let mask = mask
+                    .reshape((1, 1, s, kk))
+                    .unwrap()
+                    .broadcast_as((1, p.n_head, s, kk))
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+                let kv0 = (k_all.unsqueeze(0).unwrap(), v_all.unsqueeze(0).unwrap());
+                bench(
+                    &format!("prefill attn sdpa core (q-cast + sdpa + out-cast) ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        let qf = qh.to_dtype(DType::F16).unwrap().unsqueeze(0).unwrap().contiguous().unwrap();
+                        let out =
+                            candle_nn::ops::sdpa(&qf, &kv0.0, &kv0.1, Some(&mask), false, scale, 1.0)
+                                .unwrap();
+                        read_scalar(&out.squeeze(0).unwrap().to_dtype(DType::F32).unwrap())
+                    },
+                );
+            }
+        }
+
+        /// Stage 7: the softplus output gate — `softplus` + transpose/reshape +
+        /// `broadcast_mul` over the `[n_head, seq, head_dim]` attention output.
+        #[test]
+        #[ignore = "perf bench"]
+        fn prefill_attn_gate_bench() {
+            let dev = metal();
+            let (full, swa, x) = prefill_variants(&dev);
+            for (name, p) in [("FULL 48h", &full), ("SWA 72h", &swa)] {
+                let (gate_logits, _q, _k, _v) = pp_project(p, &x);
+                let attn = synthetic_attn(p, 88, &dev);
+                bench(
+                    &format!("prefill attn softplus gate + broadcast_mul ({name}), seq={PREFILL_SEQ}"),
+                    || {
+                        let gate = softplus(&gate_logits)
+                            .unwrap()
+                            .transpose(0, 1)
+                            .unwrap()
+                            .reshape((p.n_head, PREFILL_SEQ, 1))
+                            .unwrap();
+                        read_scalar(&attn.broadcast_mul(&gate).unwrap())
+                    },
+                );
+            }
         }
     }
 
@@ -1489,7 +1873,8 @@ pub(crate) mod tests {
             let block = build_block(&w, &cfg, 0, rope, &dev, AttnWeights::DequantF32);
             let mut cache = LayerCache::new(&cfg, 0, 32, &dev).unwrap();
             let x = dense(4, hidden, 11, &dev);
-            let out = block.forward(&x, &mut cache, 0).unwrap();
+            let mask = block.prefill_mask(&cache, 4, 0).unwrap();
+            let out = block.forward(&x, &mut cache, 0, mask.as_ref()).unwrap();
             assert_eq!(out.dims(), &[4, hidden]);
             assert!(out.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().all(|v| v.is_finite()));
         }

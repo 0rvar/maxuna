@@ -4,6 +4,78 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — attention mask hoisting SHIPPED: prefill 211 → 228 @925 / 184 → 237 @4k, byte-identical
+
+**Context.** The attention sub-budget (new `prefill_attn_*` benches; parts
+sum-check against the chain bench within ~3%) split the 23.6/30.1 ms attention
+block: projections 9.2/13.2 (42% of attention per forward), cache+mask
+5.9/9.5, transposes 2.3/2.5, rope 2.7 FULL vs 1.2 SWA (partial-rotary
+narrow/cat tax), sdpa core 1.4/2.0, gate 1.4/1.8, qk-norm 0.4. A follow-up
+split showed the cache+mask category is 94-97% MASK: per-layer host mask
+build + upload + the [1,n_head,seq,k_seq] f16 broadcast materialization
+(~415 ms/forward); the KV cache append is ~0.35 ms.
+
+**Change.** A read-only audit PROVED the mask is a pure function of (kind,
+pos, seq_len, window) — `LayerCache::attn_mask` never reads per-layer state
+(not even SWA ring fill), so one forward has exactly TWO distinct masks.
+Hoisted: `attn_mask_for`/`MaskKind` (kv_cache.rs), `PrefillMask { raw, sdpa }`
+built once per kind per chunk in run_stack, passed into AttnBlock::forward
+(attention.rs no longer materializes per layer). Decode (seq==1, no mask)
+untouched. 48 builds/forward → 2 (× chunks). Byte-identical by construction —
+same values, same tensors, same kernels — so no kill-switch, no provenance.
+
+**Result.** Gate: all six grades at the exact anchors (references reused).
+Prefill 211 → 228.0 @925, 184 → 236.7 @4k — the 4k case gains most because
+chunked prefill multiplied the per-layer waste (8 chunks × 48 masks → 8 × 2,
+with masks growing as pos advances). vs fork LPM: 0.64-0.68x. Day cumulative:
+174 → 228 @925 (+31%), ~155 → 237 @4k (+53%).
+
+## 2026-07-23 — P2 tranche 1 SHIPPED: fused combine kernel + shared map0 — prefill 174 → 211 tok/s (+21%), bit-identical, all tiers green
+
+**Change.** (a) `src/ops/combine.metal` (+ combine.rs host, own runtime-compiled
+library, no Metal-4 dep): the routed-expert combine tail (3 broadcast_muls +
+strided sum(1) over the [seq,10,3072]/63MB expert output — measured 14.8
+ms/layer, ~9x bandwidth floor) is now ONE kernel reading `down` once.
+(b) mm_id's map0 row-map is computed ONCE per MoE block (typed `Map0Scratch`
+carrying n_expert/t/top_k, validated per consumer) instead of 3x.
+(c) `prefill_mm_id_bench` methodology fix: gate/up/down interleaved in one
+warmed loop (gate's old 3.0 ms was DVFS burst fiction; all three are ~8-10 ms
+weight-streaming-bound sustained).
+
+**The design bet that paid off: bit-identity BY CONSTRUCTION, not by
+tolerance.** The fused kernel replicates candle's `fast_sum_f32_strided`
+launch geometry exactly (width-8 threadgroups, ascending per-lane loader
+partition, hardware `simd_sum`, lane-0 store) and computes each element
+in-register at candle's per-op rounding boundaries (r1=down·col_l2 rounded,
+·2^-15 exact, ·w rounded — never folded, no fma). Acceptance test is BITWISE
+equality (`f32::to_bits`) vs the live candle chain across seq {1,8,512} ×
+n_out {1024,3072} × both variants (rescale / plain) — no tolerance anywhere.
+Consequence: logits are bit-identical, every parity tier passes at the exact
+prior anchors (strict 0.999057 / mm 0.996987 / decode 62+2,64,59+5 / Δnll
+0.001937) with references regenerated, and the kernel is safe under the strict
+tier without gate relaxation. `LAGUNA_COMBINE_CLASSIC` kill-switch;
+provenance `combine: fused|classic|reference` enforced per tier (missing =
+hard fail, same as attn_dtype).
+
+**Review round (Claude + Codex + GLM; DeepSeek skipped, degraded twice
+2026-07-22).** No live bugs; five hardening items, two found by all three:
+simd_sum lane-drop at top_k ≥ 66 (host bail + test), i32 index overflow at
+seq ≈ 70k (host bail + test), typed map0 scratch validation, provenance
+labeling for reference dumps + per-tier enforcement, shared-map0 test RAW-
+ordering fix. Plus the one real design gap: `#pragma clang fp contract(off)`
+does NOT cover fast-math REASSOCIATION of the multiply chain, and the pinned
+candle rev cannot express MTLCompileOptions (no re-export, no factory — the
+objc2-metal trap again). Resolved source-level: `#pragma clang fp
+reassociate(off)` — clang rejects unknown `fp` pragma options, so the library
+compiling proves it's honored. Perf spot-check after: 210.1 tok/s, no cost.
+
+**Result.** Prefill 174 → 210.7 tok/s @925 (+21%), 150-160 → 184 @4k (+~19%),
+decode unchanged (18.1). vs fork LPM: 0.49x → 0.60x pp512. First bench trio
+after the change read 148.9/184/197.9 — the 925 number was thermal-ordering
+fiction (ran hottest, right after the gate's ppl prefill); rested rerun 210.7.
+Lesson reinforced: single-shot LPM bench numbers are only comparable at
+matched thermal history.
+
 ## 2026-07-22 — P2 phase-0: prefill budget kills routing-glue fusion (~1%), promotes combine fusion (~23%); fork's Metal edge is scheduling, not fusion
 
 **Context.** P2 was scoped as "fuse MoE route+glue+combine — the prefill gap
