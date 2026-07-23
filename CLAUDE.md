@@ -70,8 +70,23 @@ trap documented here.
 
 ## The candle situation
 
-- Pinned by git rev `27f20fea…` in Cargo.toml (same rev as ../offload). The pin
-  freezes: the baked `kernel_mul_mv_id_*` Metal kernels (now only the
+- Candle lives at `vendor/candle` (2026-07-23) — a git CLONE of
+  huggingface/candle on branch `metal-register-external-buffers`, created
+  at the same pinned rev `27f20fea…` as before, wired via the Cargo.toml
+  `[patch]` section (all FIVE crates that git source provides; patching a
+  subset would build two copies of the shared types), carrying ONE local
+  ~50-line patch: `MetalDevice::{register,unregister}_external_buffers`
+  (batch, one commit each; built on new
+  `ResidencySet::{insert_batch,remove_batch}`) so gguf.rs's mmap no-copy
+  weight views join candle's queue-attached residency set — without
+  membership the 70GB working set pays per-command-buffer residency
+  bookkeeping (measured ~10% of sustained 4k prefill; residency is
+  perf-only, correctness never depends on it). MmapSource batch-registers
+  after load and unregisters + quiesces in Drop, so load→drop cycles
+  (serve-then-unload) are leak-free.
+  Upstream PR planned; if it lands and the pin moves past it, drop the
+  vendor dir and revert to the plain git pin. The rev freezes: the baked
+  `kernel_mul_mv_id_*` Metal kernels (now only the
   `LAGUNA_MV_CLASSIC` decode fallback — present in
   candle's metallib with ZERO upstream Rust wiring; src/ops/ is our host
   dispatch; candle's own FusedMoeGGUF/indexed_moe_forward PANIC on non-CUDA),
@@ -79,16 +94,30 @@ trap documented here.
   host dispatch and our vendored prefill kernels rely on. (candle's baked
   `kernel_mul_mm_id_*` is NO LONGER used — prefill is our vendored two-pass
   kernel; see below.) Do not bump the rev casually; re-verify those kernels and
-  APIs if you do.
-- Zero-copy invariant (gguf.rs `expert_stack`): the stacked expert tensor is
-  uploaded ONCE via `QStorage::from_data`; the Buffer handle is cloned (objc
-  retain) BEFORE the storage moves into `QTensor::new`, so ExpertStack.buffer
-  and the QTensor share one MTLBuffer. Candle exposes no accessor for a
-  QTensor's Metal buffer — preserve this construction or you reintroduce a
-  ~70GB VRAM double-copy.
+  APIs if you do — and re-apply the vendor patch on any bump.
+- Known candle-at-this-rev trap: Metal `Tensor::copy()`/`try_clone` is a
+  SHALLOW Arc clone — it copies NO data (CUDA's does). Any "copy this
+  tensor to new storage" logic built on it is a silent no-op on Metal.
+- Weight load is mmap + no-copy BY DEFAULT (2026-07-23, gguf.rs
+  `MmapSource`): one read-only mmap of the GGUF; each expert stack and
+  attention-f16 plane gets its own page-floored `newBufferWithBytesNoCopy`
+  view with a `base_off` byte offset threaded into the dispatches
+  (ExpertStack.qtensor is None on this path). The Mmap must outlive every
+  view — ExpertStack and LagunaModel each hold an `Arc<MmapSource>`.
+  `LAGUNA_LOAD_CLASSIC` restores the copying loader, whose zero-copy
+  invariant still stands: the stacked expert tensor is uploaded ONCE via
+  `QStorage::from_data`; the Buffer handle is cloned (objc retain) BEFORE
+  the storage moves into `QTensor::new`, so ExpertStack.buffer and the
+  QTensor share one MTLBuffer (candle exposes no accessor for a QTensor's
+  Metal buffer — preserve this construction or you reintroduce a ~70GB
+  VRAM double-copy).
 - `candle_metal_kernels::metal::Buffer` is the nameable buffer type; MTLSize is
-  built via candle's `get_block_dims` factory. objc2-metal was deliberately NOT
-  added (candle pins 0.3.2; a mismatched dep is a trap).
+  built via candle's `get_block_dims` factory. objc2/objc2-metal/objc2-foundation
+  ARE direct deps since the mmap load (2026-07-23) but ONLY because they are
+  `=`-exact-pinned to the versions candle's rev resolves (cargo unifies to one
+  copy — the old "mismatched dep" trap is neutralized by the pins; never relax
+  them to ranges, and re-pin in lockstep if the candle rev ever moves). They
+  exist solely for `newBufferWithBytesNoCopy` in gguf.rs's MmapSource.
 - Prefill mm_id is now our VENDORED two-pass kernel (`src/ops/mm_id.metal`,
   runtime-compiled via `src/ops/pipelines.rs` with `new_library_with_source`),
   NOT candle's baked `kernel_mul_mm_id_*` (unusable at 256 experts — see Perf
@@ -172,7 +201,15 @@ trap documented here.
   (`> /tmp/x.txt 2>&1`), read the file.
 - Scripted llama-cli runs need `-st -no-cnv </dev/null` or they spin forever in
   the interactive loop.
-- Every model invocation reloads 75GB (~30s warm cache). Batch runs.
+- Model load is mmap + no-copy since 2026-07-23: ~4.2s warm (was ~20-30s;
+  `LAGUNA_LOAD_CLASSIC` restores the copying loader). The aliased views
+  join candle's queue-attached residency set (the vendor/candle patch) —
+  required for full sustained-prefill throughput. Batching runs still
+  helps (per-process Metal setup). Process anonymous RSS shows only a few
+  GB — the 70GB of aliased weights are file-backed page-cache pages held
+  GPU-resident by the residency set; the `weights X GB resident` print is
+  the mapped total, not anonymous RSS. Keep other memory hogs off during
+  benches regardless.
 - Homebrew on this machine is nix-managed (`.homebrew-is-managed-by-nix`) —
   never `brew install` or chown /opt/homebrew. cmake comes from
   `nix shell nixpkgs#cmake`; nix's cmake skips Apple SDK detection, so

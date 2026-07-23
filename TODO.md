@@ -93,8 +93,12 @@
    (304.0 tok/s both ways). Scheduling is not where the remaining prefill
    gap lives — the fork's edge is per-kernel efficiency. The demoted
    routing-glue fusion dies with it (~1%, measured twice).
-5. **mmap + no-copy model load** (see ledger item below) — dev-velocity
-   multiplier: every parity/bench cycle pays ~30 s/load today.
+5. **mmap + no-copy model load — DONE 2026-07-23** (ledger item below):
+   warm load 20s → 4.9s, fork parity end-to-end; no repack file; the
+   initial ~10% sustained-4k-prefill deficit was GPU residency and is
+   CLOSED (same-state A/B dead even) — cost: candle is now VENDORED at
+   vendor/candle with a ~30-line residency-set patch (upstream PR
+   planned). All six gates pass at the exact anchors.
 6. **DFlash speculative decoding** — multiplies whatever decode speed exists,
    so it lands last.
 
@@ -422,19 +426,74 @@
   only; AttnBlock/MoeBlock expose no sub-node intermediates (Qcur_rope,
   attn_gated, ffn_moe_out, …), limiting first-divergence bisection to layer
   granularity. Add hooks if a real divergence ever needs sub-layer localization.
-- [ ] **mmap + no-copy model load** — warm load is ~30s because gguf.rs reads
-  each tensor into a heap Vec and `QStorage::from_data` copies it again into a
-  fresh MTLBuffer (~2 full passes over 75GB), plus the expert_stack re-layout
-  pass. The fork loads near-instantly warm via mmap + `newBufferWithBytesNoCopy`
-  (unified memory: GPU reads the page-cache pages in place; one page-aligned
-  buffer over the whole file, per-tensor offsets). For us that needs (a) a
-  one-time repack cache file with experts ALREADY stacked in our layout (no-copy
-  can't reorder, and the stacks are most of the 75GB), mmapped on subsequent
-  loads, and (b) a check whether the pinned candle rev can wrap an existing
-  Metal buffer as QStorage/Tensor for the QMatMul + F16 attention paths (our
-  vendored kernels take raw buffers already). Expected: warm load → a few
-  seconds; first-touch page wiring moves into the first forward (already
-  excluded from steady-state numbers).
+- [x] **mmap + no-copy model load — DONE 2026-07-23.** Warm load 20.0s →
+  4.0s (same-page-cache A/B; the historical "~30s" included colder cache);
+  end-to-end at parity with the fork (5.05s vs 5.75s total for
+  load+10-token gen). The original design over-planned in two ways the
+  territory map killed: (a) NO repack file is needed — the GGUF already
+  stores expert stacks expert-major-contiguous (expert_stack never did a
+  re-layout pass), and per-tensor alignment doesn't matter because only
+  the BUFFER base must be page-aligned: each aliased tensor gets its own
+  `newBufferWithBytesNoCopy` view over the page-floored range of ONE
+  whole-file mmap, with `base_off` (< 16KB, 32-aligned) carried into the
+  dispatch (this per-tensor-view scheme also sidesteps the fork's
+  overlapping-giant-view maxBufferLength dance); (b) NO candle patch is
+  needed — the ~70GB of expert stacks feed our vendored kernels that take
+  raw (Buffer, byte-offset) (`ExpertStack.qtensor` is now `Option`, None
+  on the mmap path; `IdDispatch.w_off` threads base_off into all three
+  expert encode sites), and the attention f16 planes alias via the pub
+  MetalStorage::new + from_storage + narrow route (GGUF F16 bytes ARE the
+  dense plane; the old dequantize_f16 round-trip was exact, so aliasing
+  is bit-identical — dispatch already honored layout start_offset).
+  Copying path kept for everything needing a real QTensor/small tensors
+  (lm_head, embeddings, norms, shared experts, layer-0 FFN, Reference
+  oracle's expert_qtensors — structurally independent loader).
+  Implementation notes: `MmapSource` in gguf.rs (memmap2 read-only map +
+  WillNeed advise + standalone ResidencySet — candle's queue-attached set
+  is pub(crate)-unreachable; ours keeps pages wired between forwards but
+  can't attach to the queue; revisit if the candle pin ever moves);
+  objc2/objc2-metal/objc2-foundation added as direct deps EXACT-pinned to
+  the versions candle's rev resolves (the CLAUDE.md mismatch trap is
+  neutralized by `=` pins; cargo unifies to one copy — comment in
+  Cargo.toml). Kill-switch `LAGUNA_LOAD_CLASSIC` (presence-based,
+  load-time) restores the full copying load. Process RSS drops from
+  ~75GB to a few GB: aliased weights are clean file-backed page-cache
+  pages (charged to "Cached Files", evictable under memory pressure →
+  re-faults on next touch), not anonymous process memory. All six parity
+  gates PASS at the exact anchors (bit-identical bytes); smoke gen
+  byte-identical vs classic. Bitwise unit tests: f16 alias vs upload
+  (both gemv + tensor-mm branches), expert stack mmap vs classic through
+  mv_id AND mm_id at base_off != 0, candle-baked mv_id fallback at
+  base_off 96. Review (Claude + GLM): clean; hardening applied (16B
+  alignment ensure on the expert alias path, mirroring f16's).
+  PART 2 (same day): the initial ship lost ~10% at SUSTAINED 4k prefill
+  (invisible at 925/decode — burst window). Root cause: GPU residency —
+  candle registers every pool buffer in a residency set attached to its
+  command queue (permanently resident, no per-command-buffer
+  bookkeeping); foreign no-copy views couldn't join it (set + queue both
+  pub(crate); mlock ≠ GPU residency, measured no-op; the fork pays zero
+  mmap tax — llama-bench pp4096 345 mmap vs 341 copied — because it
+  queue-attaches its sets). Fix: candle VENDORED at vendor/candle (same
+  rev, `[patch]` for all five crates from that git source) with a
+  ~50-line patch — MetalDevice::{register,unregister}_external_buffers
+  (batch, one commit each, on new ResidencySet::{insert_batch,
+  remove_batch}); MmapSource collects views and batch-registers once
+  after load (per-view synchronous commits cost ~7s of load), and
+  unregisters + quiesces (wait_until_completed before munmap) in Drop —
+  the set RETAINS its allocations, so without the unregister a dumped
+  model would pin every view forever; load→drop cycles (a
+  serve-then-unload server) are leak-free, with drop order guaranteed by
+  every view holder owning an Arc<MmapSource>. Same-state A/B: 4k 293.1
+  vs classic 290.1 (dead even; 294.3 re-confirmed on the final API),
+  decode even, load 4.2s. vendor/candle is a git CLONE of
+  huggingface/candle, branch metal-residency-set-registration cut at the
+  pin, patch left uncommitted for Orvar to commit/push to his fork. Traps documented in the arc: Metal `Tensor::copy()` at this
+  rev is a SHALLOW Arc clone (no data copy — a "copy to Private" fix
+  built on it is a silent no-op; gguf.rs documents it), and blit-copying
+  70GB to Private thrashes the box (70 wired + 70 page cache > 128GB).
+  Upstream candle PR planned (Orvar; diff at vendor/candle vs the pin,
+  also scratchpad candle-patch.diff); drop the vendor dir if it lands
+  and the pin ever moves past it.
 
 Items deliberately out of v1 scope. Append as new deferrals come up during
 implementation — never silently drop scope.

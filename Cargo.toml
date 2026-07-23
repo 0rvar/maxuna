@@ -14,6 +14,17 @@ candle-nn = { git = "https://github.com/huggingface/candle.git", rev = "27f20fea
 candle-transformers = { git = "https://github.com/huggingface/candle.git", rev = "27f20fea993c81ea6d32ce44018f42b68466525e", features = ["metal"] }
 candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", rev = "27f20fea993c81ea6d32ce44018f42b68466525e" }
 
+# Raw Metal bindings for the mmap no-copy load path (gguf.rs MmapSource:
+# newBufferWithBytesNoCopy views over the GGUF mapping, MTLResidencySet).
+# These MUST stay `=`-pinned to the exact versions the pinned candle rev
+# resolves: cargo has to unify laguna's objc2 crates with candle-metal-kernels'
+# so the ProtocolObject/Retained types interoperate — a drifting version would
+# duplicate the crates and break that (the objc2 mismatch trap CLAUDE.md warns
+# about). objc2-metal features mirror candle-metal-kernels' Cargo.toml.
+objc2 = "=0.6.3"
+objc2-metal = { version = "=0.3.2", features = ["block2"] }
+objc2-foundation = "=0.3.2"
+
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 crossterm = "0.29"
 unicode-width = "0.2"
@@ -23,6 +34,21 @@ anyhow = "1"
 serde_json = "1"
 half = "2.5"
 rand = "0.9"
+
+# The pinned candle rev, vendored at vendor/candle with ONE local patch:
+# MetalDevice::register_resident_buffer (candle-core metal_backend/device.rs),
+# which lets gguf.rs's mmap no-copy weight views join candle's queue-attached
+# residency set (without it the 70GB working set pays per-command-buffer
+# residency bookkeeping — measured ~10% of sustained 4k prefill). Every crate
+# the git source provides must be patched together or cargo would build two
+# copies of the shared types. Candidate for an upstream candle PR; drop the
+# vendor dir if it lands and the pin moves past it.
+[patch."https://github.com/huggingface/candle.git"]
+candle-core = { path = "vendor/candle/candle-core" }
+candle-nn = { path = "vendor/candle/candle-nn" }
+candle-transformers = { path = "vendor/candle/candle-transformers" }
+candle-metal-kernels = { path = "vendor/candle/candle-metal-kernels" }
+candle-ug = { path = "vendor/candle/candle-ug" }
 
 [profile.release]
 debug = true

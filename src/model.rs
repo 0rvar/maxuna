@@ -67,6 +67,14 @@ pub struct LagunaModel {
     max_ctx: usize,
     tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
+    /// Keeps the GGUF mapping (and its Metal view buffers' residency set) alive
+    /// for the model's lifetime on the mmap alias load: the aliased attention
+    /// f16 planes are plain `Tensor`s that cannot carry the mapping themselves,
+    /// so dropping it while the model lives would leave their view buffers (and
+    /// the GPU) reading unmapped pages (`gguf::MmapSource`'s lifetime
+    /// invariant; expert stacks additionally hold their own clones). `None` on
+    /// the classic copying load.
+    _weights_mmap: Option<Arc<crate::gguf::MmapSource>>,
 }
 
 impl LagunaModel {
@@ -147,6 +155,12 @@ impl LagunaModel {
         let output_norm = w.rms_norm("output_norm", cfg.rms_eps)?;
         let (lm_head, lm_head_buffer, lm_head_dtype) = w.qlinear_with_buffer("output")?;
 
+        // Batch-register every mmap weight view in candle's queue-attached
+        // residency set (one commit); MmapSource::drop unregisters them, so
+        // load→drop cycles are leak-free.
+        if let Some(src) = gguf.mmap_source() {
+            src.register_views();
+        }
         warn_if_over_budget(&gguf, &cfg, max_ctx);
 
         Ok(Self {
@@ -164,6 +178,7 @@ impl LagunaModel {
             max_ctx,
             tap_enabled: false,
             taps: Vec::new(),
+            _weights_mmap: gguf.mmap_source().cloned(),
         })
     }
 

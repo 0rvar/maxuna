@@ -4,6 +4,115 @@ What was tried, what worked, what didn't, and why. Append new entries AT THE
 TOP (reverse-chronological). TODO.md is the forward ledger; this is the history.
 Dates marked `~` are reconstructed from git/TODO records, not contemporaneous.
 
+## 2026-07-23 — mmap + no-copy load, part 2: the ~10% sustained-prefill deficit was GPU residency; candle vendored + patched (queue-attached residency set), gap closed
+
+**The deficit.** The freshly-shipped mmap loader benched clean on decode and
+short prefill but lost ~10% at sustained 4k prefill (275-277 vs classic
+305.7, reproduced 4x; the 925 bench rides the LPM burst window and hid it).
+Diagnosis was a full elimination chain: (1) mlock the mapping — no change
+(host page wiring is not GPU residency); (2) "copy attention planes to
+Private storage" — no change, and the review round later exposed WHY: at
+this candle rev Metal's `Storage::try_clone` is a shallow Arc clone, so
+`Tensor::copy()` copies nothing — the experiment was a no-op (the shipped
+code now documents this trap instead of using it); (3) GPU-blit all 70GB
+into Private buffers — thrashed the box (70GB wired + 70GB page cache >
+128GB; killed, removed); (4) the decisive control: the FORK pays no mmap
+tax at all (llama-bench pp4096: 345.2 mmap vs 341.1 copied), so no-copy
+file-backed memory streams at full rate when set up right. The one
+structural difference left: candle attaches its residency set to its
+command queue (`Commands::new` → `addResidencySet`) and registers every
+pool buffer in it — permanently GPU-resident, no per-command-buffer
+residency bookkeeping — while foreign no-copy views can't join it (the
+set and the queue are both pub(crate), no objc side-door exists; encoders
+don't expose their command buffer).
+
+**The fix: candle is now VENDORED at vendor/candle** (same pinned rev
+27f20fea, wired via `[patch."https://github.com/huggingface/candle.git"]`
+for all five crates that git source provides — patching a subset would
+build two copies of the shared types) with a ~50-line patch, upstream-PR
+candidate (vendor/candle is a git clone of huggingface/candle, branch
+`metal-residency-set-registration` cut at the pin, patch uncommitted for
+Orvar's authorship): candle-core
+`MetalDevice::{register,unregister}_external_buffers` (batch, one
+residency-set commit each) on new candle-metal-kernels
+`ResidencySet::{insert_batch, remove_batch}`. The API went through two
+shapes: first a raw `residency_set()` accessor + staged adds — measured
+correct (4k recovered) but review-dinged (exposes remove() on pool
+buffers; staged adds get flushed incidentally by candle's own pool-alloc
+commits, so "one commit at the end" was the guarantee, not the
+mechanism) — then the semantic register/unregister pair (batching still
+essential: per-view synchronous commits measured ~7s of load, 4.0s →
+11.2s). MmapSource collects views, batch-registers once after load, and
+in Drop quiesces (wait_until_completed — an in-flight command buffer
+retains its bound MTLBuffers but that does NOT keep the mmap'd pages
+alive) then unregisters everything it registered: the set RETAINS its
+allocations, so without the unregister a dumped model would pin every
+view's GPU mapping forever. Load→drop cycles (a serve-then-unload
+server) are leak-free; drop ordering is structural (every view holder
+owns an Arc<MmapSource>, so its Drop runs last). Residency is perf-only
+(setBuffer-bound buffers are made resident per command buffer
+regardless) — the pre-patch builds were bit-correct, just slower.
+
+**Results (same-state A/B, LPM, the honest comparison after a day of
+thermal drift — classic itself read 290 this round):** 4k sustained: mmap
+293.1 vs classic 290.1 — DEAD EVEN (was -10%; 294.3 re-confirmed on the
+final register/unregister API); decode 18.3 vs 18.4 — even; load 4.2s
+(vs 11.2 with per-view commits, 4.0 with no residency, ~20 classic).
+All six parity gates pass at the exact anchors on the
+vendored build. Review round (Claude + GLM): the shallow-copy discovery
+above (fix: deleted the no-op copy + documented the trap), comment
+honesty on the commit mechanism (fixed), an upstream-PR doc note on the
+accessor (added), [patch] completeness verified against Cargo.lock, the
+supposed 5.5GB residency leak dissolved (the "transient" views ARE the
+permanent tensor storage — registering them is required, not a leak).
+
+## 2026-07-23 — mmap + no-copy load: warm load 20s → 4s, fork parity, no repack file, no candle patch
+
+**The territory map killed both halves of the planned design.** The ledger
+item assumed (a) a one-time repack cache file (because "no-copy can't
+reorder" the expert stacks) and (b) a candle patch to wrap foreign buffers
+as QTensors. Neither exists in the shipped version: the GGUF already stores
+every expert stack expert-major-contiguous — `expert_stack` never did a
+re-layout, it uploaded the bytes verbatim — and per-tensor file alignment
+is irrelevant because only the BUFFER base needs page alignment: mmap the
+whole file once (memmap2 was already a dep), then give each aliased tensor
+its own `newBufferWithBytesNoCopy` view over the page-floored range, with
+the sub-page remainder carried as a `base_off` byte offset into the
+dispatch (GGUF's 32B data alignment keeps it vector-aligned). Per-tensor
+views also sidestep the fork's overlapping-giant-view maxBufferLength
+scheme entirely. And no QTensor wrap is needed: the ~70GB of expert stacks
+feed our vendored kernels, which take raw (Buffer, byte-offset) —
+`ExpertStack.qtensor` became `Option`, None on the mmap path — and the
+attention f16 planes alias through the pub `MetalStorage::new` +
+`Tensor::from_storage` + narrow route (GGUF F16 bytes ARE the dense plane;
+the old dequantize_f16 f16→f32→f16 round-trip was exact, so aliasing is
+bit-identical; the f16 dispatch already honored layout start_offset).
+Everything needing a real QTensor (lm_head, layer-0, shared experts,
+Reference oracle) or too small to matter keeps the copying path (~1.5GB).
+
+**Deps decision.** `newBufferWithBytesNoCopy` needs objc2-metal, which
+CLAUDE.md had banned as a mismatch trap. Neutralized instead of obeyed:
+the three objc2 crates are `=`-exact-pinned to the versions candle's rev
+resolves, so cargo unifies them to one copy — the trap only existed for
+version ranges. Pin discipline documented in Cargo.toml and CLAUDE.md.
+
+**Results.** Warm load 20.0s → 4.0s (same-page-cache A/B on this binary;
+the historical "~30s" included colder cache); end-to-end vs the fork's
+llama-cli on identical tiny runs: 5.05s vs 5.75s — load parity reached.
+All six parity gates PASS at the exact anchors (same bytes ⇒ same logits;
+references reused). Smoke generation byte-identical vs
+`LAGUNA_LOAD_CLASSIC` (the kill-switch that restores the copying loader).
+Process RSS collapses from ~75GB to a few GB: aliased weights are clean
+file-backed page-cache pages (Activity Monitor charges them to "Cached
+Files"), which also means memory pressure can evict them → re-faults on a
+later forward. A standalone ResidencySet keeps the views
+residency-requested (candle's queue-attached set is pub(crate)-unreachable
+— revisit if the pin moves). Bitwise unit tests cover the f16 alias (gemv
++ tensor-mm branches), expert-stack mmap-vs-classic through mv_id and
+mm_id at nonzero base_off, and the LAGUNA_MV_CLASSIC candle-baked encode
+site. Review round (Claude + GLM, per new two-reviewer policy): clean;
+one hardening applied (16B-alignment ensure on the expert alias path).
+
 ## 2026-07-23 — glue phase 2 shipped (last standalone casts folded); encoder takeover REFUTED before build
 
 **Glue phase 2 (revised scope).** The territory map showed the ledger item

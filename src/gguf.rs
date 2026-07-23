@@ -2,21 +2,183 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use candle_core::quantized::gguf_file::Content;
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
-use candle_core::{Device, Module, Tensor};
+use candle_core::{DType, Device, MetalDevice, MetalStorage, Module, Storage, Tensor};
 use candle_metal_kernels::metal::Buffer;
 use candle_nn::RmsNorm;
 
-/// An opened GGUF: parsed header plus the file handle tensors are read from.
+/// `LAGUNA_LOAD_CLASSIC` reverts the model load from the default mmap aliasing
+/// (the big weights — expert stacks, f16 attention planes — alias the GGUF's
+/// page cache through no-copy Metal buffer views, so a warm load takes seconds)
+/// to the legacy full-copy load (read every tensor into a Vec, upload via
+/// `QStorage::from_data`). Consulted once at `open`: a classic-opened `GgufFile`
+/// carries no mapping, so every downstream loader copies.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling `ops::*` switches
+/// (`flash_classic`, `attn_glue_classic`): any value enables it — only leaving
+/// it unset keeps the mmap path.
+pub fn load_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_LOAD_CLASSIC").is_some())
+}
+
+unsafe extern "C" {
+    /// Mach's exported page-size global (libSystem, always linked): 16384 on
+    /// Apple silicon, but read at runtime rather than hardcoded.
+    /// `newBufferWithBytesNoCopy` requires page-aligned pointers and
+    /// page-multiple lengths, so `MmapSource::view` floors/ceils with this.
+    safe static vm_page_size: usize;
+}
+
+/// The GGUF file mapped read-only, plus the raw Metal device and residency set
+/// its no-copy buffer views hang off. Built once per `open` on Metal (unless
+/// `LAGUNA_LOAD_CLASSIC`) and shared by every aliased tensor.
+///
+/// LIFETIME INVARIANT: the mapping must outlive every Metal view buffer created
+/// over it. Views are created with `deallocator: None`, so dropping a `Buffer`
+/// never unmaps — but dropping this struct DOES (memmap2 unmaps on drop), which
+/// would leave a live view (and the GPU) reading unmapped pages. Everything
+/// holding an aliased view therefore keeps a clone of the owning
+/// `Arc<MmapSource>`: `ExpertStack.mmap` per stack, and `LagunaModel` holds one
+/// for the aliased attention tensors (whose `Tensor`s cannot carry it).
+pub struct MmapSource {
+    map: memmap2::Mmap,
+    /// The candle Metal device views are created on. View buffers are batch-
+    /// registered in ITS queue-attached residency set (the vendored candle
+    /// patch `register_external_buffers`), so aliased weights stay permanently
+    /// GPU-resident exactly like candle's own pool buffers — without this the
+    /// 70GB working set pays per-command-buffer residency bookkeeping,
+    /// measured at ~10% of sustained 4k prefill (docs/log.md mmap entry).
+    /// Residency is perf-only: setBuffer-bound buffers are made resident per
+    /// command buffer regardless, so unregistered views compute correctly.
+    mdev: MetalDevice,
+    /// Views created but not yet registered resident; drained into
+    /// `registered` by `register_views` (LagunaModel::load calls it once after
+    /// all weights are built — one batch, one residency-set commit).
+    pending: Mutex<Vec<Arc<Buffer>>>,
+    /// Views currently registered in the device's residency set. Drop
+    /// unregisters them — the set RETAINS its allocations, so without this a
+    /// dumped model would leave every view's MTLBuffer (and its GPU mapping)
+    /// alive forever. Load→drop cycles (e.g. a serve-then-unload server) are
+    /// leak-free: drop order guarantees this struct outlives all view holders,
+    /// so by the time Drop runs the set holds the only remaining retains.
+    registered: Mutex<Vec<Arc<Buffer>>>,
+}
+
+impl Drop for MmapSource {
+    fn drop(&mut self) {
+        // Quiesce before unmapping: an in-flight command buffer retains the
+        // view MTLBuffers it has bound, but a buffer being alive does NOT keep
+        // the underlying pages mapped (`deallocator: None`) — the munmap when
+        // `self.map` drops below would yank pages the GPU may still be
+        // reading. Errors are ignored: teardown must not panic.
+        let _ = self.mdev.wait_until_completed();
+        let registered = self.registered.get_mut().unwrap_or_else(|e| e.into_inner());
+        self.mdev.unregister_external_buffers(registered.iter().map(|b| b.as_ref()));
+    }
+}
+
+impl MmapSource {
+    /// Maps `path` read-only for aliasing on `device` (must be Metal).
+    pub fn open(path: &Path, device: &Device) -> Result<Arc<Self>> {
+        let Device::Metal(mdev) = device else {
+            bail!("mmap aliasing requires a Metal device");
+        };
+        let file = File::open(path).with_context(|| format!("opening {} for mmap", path.display()))?;
+        // SAFETY: the mapping is read-only, and the GGUF file being truncated or
+        // rewritten under a running process is out of contract (the same
+        // assumption llama.cpp's mmap loader makes).
+        let map = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("mmapping {}", path.display()))?;
+        // Cheap prefetch hint; harmless if the kernel ignores it.
+        let _ = map.advise(memmap2::Advice::WillNeed);
+        Ok(Arc::new(Self {
+            map,
+            mdev: mdev.clone(),
+            pending: Mutex::new(Vec::new()),
+            registered: Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// One no-copy Metal buffer aliasing bytes `[abs_off, abs_off + len)` of the
+    /// mapping: page-floored start, page-ceiled length (Metal requires both),
+    /// candle's `RESOURCE_OPTIONS` (Shared + hazard-untracked, same as every
+    /// candle allocation so the encoder fence discipline stays uniform).
+    /// Returns the buffer plus `base_off`, the tensor's byte offset inside the
+    /// view — always < page size, and 32-byte aligned because GGUF aligns
+    /// tensor data to 32. Overlapping views over one mapping are legal (the
+    /// fork's giant per-file views rely on the same property).
+    fn view(&self, abs_off: usize, len: usize) -> Result<(Arc<Buffer>, usize)> {
+        ensure!(
+            abs_off.checked_add(len).is_some_and(|end| end <= self.map.len()),
+            "mmap view [{abs_off}, +{len}) exceeds the {}-byte mapping",
+            self.map.len()
+        );
+        let page = vm_page_size;
+        let start = abs_off / page * page;
+        let base_off = abs_off - start;
+        // Page-ceiled: the kernel maps whole pages, so a tail past EOF inside
+        // the last page is mapped (zero-filled) and safe to cover.
+        let view_len = (base_off + len).div_ceil(page) * page;
+        let ptr = std::ptr::NonNull::new(unsafe { self.map.as_ptr().add(start) } as *mut std::ffi::c_void)
+            .context("mmap base pointer is null")?;
+        // SAFETY: `ptr` is page-aligned inside the mapping and `view_len` is a
+        // page multiple; the bytes stay valid as long as `self.map` lives (the
+        // Arc<MmapSource> lifetime invariant above). `deallocator: None` means
+        // Metal never frees the pages — unmapping stays the Mmap drop's job.
+        let raw = unsafe {
+            use objc2_metal::MTLDevice as _;
+            self.mdev.device().as_ref().newBufferWithBytesNoCopy_length_options_deallocator(
+                ptr,
+                view_len,
+                candle_metal_kernels::RESOURCE_OPTIONS,
+                None,
+            )
+        }
+        .with_context(|| format!("newBufferWithBytesNoCopy failed for {view_len} bytes at {start}"))?;
+        let buffer = Arc::new(Buffer::new(raw));
+        // Collected for batch residency registration — see `pending`/
+        // `register_views`. Per-view registration (a synchronous residency-set
+        // commit each) measured ~7s of load across the 381 views.
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(buffer.clone());
+        Ok((buffer, base_off))
+    }
+
+    /// Registers every not-yet-registered view in the device's queue-attached
+    /// residency set, one batch + one commit. LagunaModel::load calls this
+    /// once after all weights are built; Drop unregisters everything this
+    /// registered.
+    pub fn register_views(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut registered = self.registered.lock().unwrap_or_else(|e| e.into_inner());
+        self.mdev.register_external_buffers(pending.iter().map(|b| b.as_ref()));
+        registered.append(&mut pending);
+    }
+}
+
+/// An opened GGUF: parsed header plus the file handle tensors are read from,
+/// and (on Metal, unless `LAGUNA_LOAD_CLASSIC`) the whole file mapped for the
+/// no-copy alias load path.
 pub struct GgufFile {
     pub content: Content,
     pub device: Device,
     pub path: PathBuf,
     file: Mutex<File>,
+    mmap: Option<Arc<MmapSource>>,
+}
+
+impl GgufFile {
+    /// The alias-load mapping, present on Metal unless `LAGUNA_LOAD_CLASSIC`.
+    /// A holder of aliased weights whose tensors cannot carry the Arc
+    /// themselves (the attention planes) must clone this and keep it alive —
+    /// see `MmapSource`'s lifetime invariant.
+    pub fn mmap_source(&self) -> Option<&Arc<MmapSource>> {
+        self.mmap.as_ref()
+    }
 }
 
 pub fn metal_device() -> Result<Device> {
@@ -27,11 +189,17 @@ pub fn open(path: impl AsRef<Path>, device: &Device) -> Result<Arc<GgufFile>> {
     let path = path.as_ref();
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let content = Content::read(&mut file).with_context(|| format!("parsing GGUF {}", path.display()))?;
+    let mmap = if matches!(device, Device::Metal(_)) && !load_classic() {
+        Some(MmapSource::open(path, device)?)
+    } else {
+        None
+    };
     Ok(Arc::new(GgufFile {
         content,
         device: device.clone(),
         path: path.to_path_buf(),
         file: Mutex::new(file),
+        mmap,
     }))
 }
 
@@ -58,17 +226,34 @@ impl QLinear {
     }
 }
 
-/// Stacked per-expert weights kept in their quantized GGUF layout:
-/// one 3D QTensor `[n_expert, n_out, k]` whose device buffer the `ops::{mv_id,mm_id}`
+/// Stacked per-expert weights kept in their quantized GGUF layout,
+/// `[n_expert, n_out, k]`, whose device buffer the `ops::{mv_id,mm_id}`
 /// kernels index directly by expert id.
 pub struct ExpertStack {
-    pub qtensor: Arc<QTensor>,
+    /// The stack as a QTensor, on the classic copying load. `None` on the mmap
+    /// alias load — the fused Metal kernels read only `buffer` plus the
+    /// shape/dtype fields, and every consumer that needs real QTensors
+    /// (`ReferenceExperts`, `split_expert_stack`) loads its own via
+    /// `expert_qtensors`, which always copies.
+    pub qtensor: Option<Arc<QTensor>>,
     /// The stack's quantized bytes as a raw device buffer, for the fused
-    /// `ops::{mv_id,mm_id}` kernels. This is a retained handle to the SAME
-    /// `MTLBuffer` that backs `qtensor` (both were cloned from one `QStorage`),
-    /// so the fused path indexes the resident weights with no second upload.
-    /// `None` off Metal — the Reference runner uses `qtensor`/`expert_qtensors`.
+    /// `ops::{mv_id,mm_id}` kernels. Classic load: a retained handle to the
+    /// SAME `MTLBuffer` that backs `qtensor` (both were cloned from one
+    /// `QStorage`), so the fused path indexes the resident weights with no
+    /// second upload. Mmap load: a page-floored no-copy view over the GGUF
+    /// mapping (see `MmapSource::view`). `None` off Metal — the Reference
+    /// runner uses `expert_qtensors`.
     pub buffer: Option<Arc<Buffer>>,
+    /// Byte offset of the stack's first block inside `buffer`: 0 on the classic
+    /// path (dedicated allocation), the sub-page remainder of the tensor's file
+    /// offset on the mmap path (< page size, 32-byte aligned per GGUF data
+    /// alignment). Every kernel dispatch consuming `buffer` must add it
+    /// (dispatch.rs `IdDispatch.w_off`).
+    pub base_off: usize,
+    /// Keeps the file mapping (and its residency set) alive while `buffer`
+    /// aliases it — `MmapSource`'s lifetime invariant. `None` on the classic
+    /// path.
+    pub mmap: Option<Arc<MmapSource>>,
     pub dtype: GgmlDType,
     pub n_expert: usize,
     pub n_out: usize,
@@ -191,10 +376,33 @@ impl Weights {
     /// A rank-2 weight `[out_dim, in_dim]` as a dense f16 tensor, for layers
     /// whose matmuls run natively in f16 (the GGUF stores the attention weights
     /// as F16, so this keeps them at their stored precision — `QMatMul` would
-    /// dequantize them to f32 and double the streamed bytes). The f32
-    /// intermediate `dequantize_f16` goes through is dropped before this
-    /// returns; no f32 copy stays alive.
+    /// dequantize them to f32 and double the streamed bytes).
+    ///
+    /// On the mmap load an F16-stored weight ALIASES the file's page cache
+    /// (`f16_alias_tensor`) instead of being read + re-uploaded: the GGUF F16
+    /// bytes ARE the dense plane, and the classic `dequantize_f16` round-trip
+    /// (f16→f32→f16) is exact, so the two paths are bit-identical. Any other
+    /// stored dtype (or a classic open) takes the copying path, whose f32
+    /// intermediate is dropped before this returns; no f32 copy stays alive.
     pub fn dense_f16(&self, name: &str) -> Result<Tensor> {
+        if let Some(src) = self.src.mmap.as_ref() {
+            let full = self.name(name);
+            let info = self
+                .src
+                .content
+                .tensor_infos
+                .get(&full)
+                .with_context(|| format!("tensor {full} not found"))?;
+            if info.ggml_dtype == GgmlDType::F16 {
+                let dims = info.shape.dims().to_vec();
+                let [out_dim, in_dim] = dims[..] else {
+                    bail!("{full} is not a rank-2 weight: {dims:?}");
+                };
+                let tensor_start = (self.src.content.tensor_data_offset + info.offset) as usize;
+                return f16_alias_tensor(src, &self.src.device, tensor_start, out_dim, in_dim)
+                    .with_context(|| format!("mmap-aliasing {full}"));
+            }
+        }
         let qt = self.qtensor(name)?;
         let t = qt.dequantize_f16(&self.src.device)?;
         let dims = t.dims().to_vec();
@@ -204,13 +412,25 @@ impl Weights {
         Ok(t)
     }
 
-    /// Loads a stacked expert tensor `[n_expert, n_out, k]` such that the fused
-    /// MoE kernels and the wrapping `QTensor` share ONE device allocation. We read
-    /// the quantized bytes from the file ourselves, upload them once via
-    /// `QStorage::from_data`, retain a handle to that buffer, and only then wrap
-    /// the same storage in a `QTensor` — so no second copy of the (large) expert
-    /// weights ever lands in VRAM.
+    /// Loads a stacked expert tensor `[n_expert, n_out, k]` for the fused MoE
+    /// kernels. Default (mmap open): the quantized bytes stay in the file's
+    /// page cache and the kernels read them through a no-copy view. Classic
+    /// open: read + upload once, sharing the allocation with a wrapping
+    /// QTensor.
     pub fn expert_stack(&self, name: &str) -> Result<ExpertStack> {
+        match self.src.mmap.as_ref() {
+            Some(src) => self.expert_stack_mmap(name, src),
+            None => self.expert_stack_classic(name),
+        }
+    }
+
+    /// The classic copying load: the fused MoE kernels and the wrapping
+    /// `QTensor` share ONE device allocation. We read the quantized bytes from
+    /// the file ourselves, upload them once via `QStorage::from_data`, retain a
+    /// handle to that buffer, and only then wrap the same storage in a
+    /// `QTensor` — so no second copy of the (large) expert weights ever lands
+    /// in VRAM.
+    fn expert_stack_classic(&self, name: &str) -> Result<ExpertStack> {
         let full = self.name(name);
         let info = self
             .src
@@ -249,7 +469,58 @@ impl Weights {
             _ => None,
         };
         let qtensor = Arc::new(QTensor::new(storage, (n_expert, n_out, k))?);
-        Ok(ExpertStack { qtensor, buffer, dtype, n_expert, n_out, k })
+        Ok(ExpertStack { qtensor: Some(qtensor), buffer, base_off: 0, mmap: None, dtype, n_expert, n_out, k })
+    }
+
+    /// The mmap alias load: the stack's quantized bytes are never read into
+    /// host memory — the fused kernels index a page-floored no-copy view of the
+    /// GGUF mapping, with `base_off` marking the stack's first block inside the
+    /// view. The GGUF stores expert stacks expert-major-contiguous (the classic
+    /// path does no re-layout either), so the view IS the stack. No QTensor is
+    /// built: nothing on the fused Metal path reads one, and the consumers that
+    /// need real QTensors (`ReferenceExperts`, `split_expert_stack`) load
+    /// theirs via `expert_qtensors`.
+    fn expert_stack_mmap(&self, name: &str, src: &Arc<MmapSource>) -> Result<ExpertStack> {
+        let full = self.name(name);
+        let info = self
+            .src
+            .content
+            .tensor_infos
+            .get(&full)
+            .with_context(|| format!("expert stack tensor {full} not found"))?;
+        let dims = info.shape.dims().to_vec();
+        let [n_expert, n_out, k] = dims[..] else {
+            bail!("{full} is not a rank-3 expert stack: {dims:?}");
+        };
+        let dtype = info.ggml_dtype;
+        let block = dtype.block_size();
+        let elems = n_expert * n_out * k;
+        if !elems.is_multiple_of(block) {
+            bail!("{full}: {elems} elements not a multiple of {dtype:?} block size {block}");
+        }
+        let size_in_bytes = elems / block * dtype.type_size();
+        let tensor_start = (self.src.content.tensor_data_offset + info.offset) as usize;
+
+        let (buffer, base_off) = src
+            .view(tensor_start, size_in_bytes)
+            .with_context(|| format!("mmap-aliasing {full}"))?;
+        // Same contract the f16 alias path enforces: the expert kernels do
+        // vector loads from the bound offset, so it must stay 16-byte aligned
+        // (every real GGUF is 32-aligned; this guards hand-crafted files).
+        ensure!(
+            base_off.is_multiple_of(16),
+            "{full}: mmap base_off {base_off} is not 16-byte aligned"
+        );
+        Ok(ExpertStack {
+            qtensor: None,
+            buffer: Some(buffer),
+            base_off,
+            mmap: Some(src.clone()),
+            dtype,
+            n_expert,
+            n_out,
+            k,
+        })
     }
 
     /// Loads a tensor by its fully-qualified GGUF name (dtype suffix included),
@@ -332,6 +603,50 @@ pub fn split_expert_stack(
     Ok(out)
 }
 
+/// Wraps `[out_dim, in_dim]` f16 bytes at absolute file offset `abs_off` of
+/// `src`'s mapping as a dense f16 tensor WITHOUT copying: page-floored no-copy
+/// view → whole-view 1-D f16 `MetalStorage` → `narrow` off the sub-page
+/// `base_off` → `reshape`. The result is a contiguous VIEW whose layout
+/// start_offset is `base_off / 2` elements; the vendored `matmul_f16` dispatch
+/// honors `layout.start_offset()` and requires the byte offset 16-aligned,
+/// which the GGUF's 32-byte tensor-data alignment guarantees.
+fn f16_alias_tensor(
+    src: &MmapSource,
+    device: &Device,
+    abs_off: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<Tensor> {
+    let Device::Metal(mdev) = device else {
+        bail!("f16 mmap aliasing requires a Metal device");
+    };
+    let elems = out_dim * in_dim;
+    let (buffer, base_off) = src.view(abs_off, elems * DType::F16.size_in_bytes())?;
+    // base_off is 32-byte aligned (GGUF data alignment), so it is a whole
+    // number of f16 elements and satisfies matmul_f16's 16-byte view check.
+    ensure!(
+        base_off.is_multiple_of(16),
+        "f16 alias at file offset {abs_off} is not 16-byte aligned inside its page (base_off {base_off})"
+    );
+    let count = buffer.length() / DType::F16.size_in_bytes(); // page-multiple, exact
+    let storage = MetalStorage::new(buffer, mdev.clone(), count, DType::F16);
+    let whole = Tensor::from_storage(
+        Storage::Metal(storage),
+        count,
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    // The returned tensor's storage IS the no-copy view for the model's
+    // lifetime: with the view registered in the queue-attached residency set,
+    // Shared page-cache-backed planes stream at full rate (measured even with
+    // the classic loader's driver-allocated buffers; docs/log.md mmap entry).
+    // Do NOT "fix" this with Tensor::copy() — Metal's try_clone at the pinned
+    // rev is a shallow Arc clone, not a data copy.
+    Ok(whole
+        .narrow(0, base_off / DType::F16.size_in_bytes(), elems)?
+        .reshape((out_dim, in_dim))?)
+}
+
 /// Human-readable metadata + tensor listing for `laguna inspect`.
 pub fn describe(content: &Content) -> String {
     let mut out = String::new();
@@ -394,7 +709,10 @@ mod tests {
 
         let gguf = open(&path, &device).unwrap();
         let weights = Weights::from_gguf(gguf);
-        let stack = weights.expert_stack("ffn_gate_exps").unwrap();
+        // The CLASSIC path explicitly: this test pins the shared-allocation
+        // invariant of the copying load (the default mmap path is covered by
+        // `expert_stack_mmap_matches_classic`).
+        let stack = weights.expert_stack_classic("ffn_gate_exps").unwrap();
 
         // One buffer, sized to exactly one stack (a double upload would not change
         // this length, but the size check catches a wrong-tensor / wrong-dtype load
@@ -402,12 +720,14 @@ mod tests {
         let expected = n_expert * n_out * k / dt.block_size() * dt.type_size();
         let buf = stack.buffer.as_ref().expect("expert stack has a Metal buffer");
         assert_eq!(buf.length(), expected, "fused buffer must be one stack");
-        assert_eq!(stack.qtensor.storage_size_in_bytes(), expected);
+        let qtensor = stack.qtensor.as_ref().expect("classic load carries a QTensor");
+        assert_eq!(qtensor.storage_size_in_bytes(), expected);
         assert_eq!(stack.dtype, dt);
+        assert_eq!(stack.base_off, 0, "classic load starts at the buffer head");
 
         // The shared buffer carries the right weights: a fused gather-matvec through
         // stack.buffer matches a CPU reference over the dequantized QTensor.
-        let deq = stack.qtensor.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let deq = qtensor.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let (t, top_k) = (2usize, 2usize);
         let x_vec = fill(t * k, 0xC0FFEE);
         let x = Tensor::from_vec(x_vec.clone(), (t, 1, k), &device).unwrap();
@@ -435,6 +755,151 @@ mod tests {
         }
         let rel = (num / den.max(1e-30)).sqrt();
         assert!(rel < 1e-3, "fused-through-shared-buffer rel_l2 {rel} too high");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The alias-load mapping for `path`: reuse the GgufFile's own (default
+    /// open), or map explicitly when the test env forced `LAGUNA_LOAD_CLASSIC`.
+    fn mmap_source_for(gguf: &GgufFile, path: &Path, device: &Device) -> Arc<MmapSource> {
+        match gguf.mmap_source() {
+            Some(s) => s.clone(),
+            None => MmapSource::open(path, device).unwrap(),
+        }
+    }
+
+    /// An mmap-aliased f16 plane must be BITWISE identical to uploading the
+    /// same bytes, both at rest and through the vendored matmul_f16 kernels
+    /// (whose weight extraction must honor the view's nonzero start_offset).
+    /// The plane sits at a non-page-aligned (but 32-aligned, as in a GGUF)
+    /// offset, so the view is page-floored and base_off is nonzero.
+    #[test]
+    fn mmap_alias_f16_matches_upload() {
+        let device = metal_device().unwrap();
+        let (out_dim, in_dim) = (24usize, 64usize);
+        let elems = out_dim * in_dim;
+        let header = 96usize; // 32-aligned like GGUF tensor data, not page-aligned
+
+        let vals: Vec<half::f16> =
+            fill(elems, 0xF16).iter().map(|v| half::f16::from_f32(*v)).collect();
+        let path = std::env::temp_dir().join(format!("laguna_mmap_f16_{}.bin", std::process::id()));
+        {
+            let mut bytes = vec![0u8; header];
+            for v in &vals {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        }
+
+        let src = MmapSource::open(&path, &device).unwrap();
+        // View plumbing: page-floored start, sub-page base_off, page-multiple length.
+        let (buf, base_off) = src.view(header, elems * 2).unwrap();
+        assert_eq!(base_off, header, "view must page-floor to offset 0 here");
+        assert_eq!(buf.length() % vm_page_size, 0, "no-copy view length must be page-multiple");
+
+        let aliased = f16_alias_tensor(&src, &device, header, out_dim, in_dim).unwrap();
+        // Exercise the full residency lifecycle: batch-register the views (as
+        // LagunaModel::load does) so the end-of-test drop runs the unregister
+        // path against a set that actually holds them.
+        src.register_views();
+        assert!(aliased.is_contiguous());
+        assert_eq!(aliased.dims(), &[out_dim, in_dim]);
+        let uploaded = Tensor::from_vec(vals.clone(), (out_dim, in_dim), &device).unwrap();
+
+        let a: Vec<half::f16> = aliased.flatten_all().unwrap().to_vec1().unwrap();
+        let u: Vec<half::f16> = uploaded.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (x, y)) in a.iter().zip(&u).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "aliased f16 bytes differ at element {i}");
+        }
+
+        // Through the vendored kernels, both the decode gemv (t=1) and the
+        // prefill mm (t=16 > F16_MM_MIN_SEQ) branches: identical kernels over
+        // identical bytes, only the weight buffer offset differs — bitwise.
+        for t in [1usize, 16] {
+            let x = Tensor::from_vec(fill(t * in_dim, 0xAB + t as u64), (t, in_dim), &device).unwrap();
+            let got: Vec<f32> = crate::ops::matmul_f16(&aliased, &x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let want: Vec<f32> = crate::ops::matmul_f16(&uploaded, &x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "matmul_f16 t={t} differs at element {i}: aliased {g} vs uploaded {w}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The mmap-aliased expert stack must be BITWISE identical to the classic
+    /// upload through BOTH fused kernel families (mv_id decode gather, mm_id
+    /// two-pass prefill): same kernels, same bytes, only the weight buffer
+    /// binding offset (`base_off`) differs. The synthetic GGUF's small header
+    /// puts the tensor at a non-page-aligned offset, so base_off is exercised
+    /// nonzero.
+    #[test]
+    fn expert_stack_mmap_matches_classic() {
+        let device = metal_device().unwrap();
+        let (n_expert, n_out, k) = (4usize, 8usize, 256usize);
+        let dt = GgmlDType::Q4K;
+
+        let w = Tensor::from_vec(fill(n_expert * n_out * k, 0xA11A5), (n_expert, n_out, k), &Device::Cpu).unwrap();
+        let qt_cpu = QTensor::quantize(&w, dt).unwrap();
+        let path = std::env::temp_dir().join(format!("laguna_mmap_stack_{}.gguf", std::process::id()));
+        {
+            let mut f = File::create(&path).unwrap();
+            gguf_file::write(&mut f, &[], &[("ffn_up_exps.weight", &qt_cpu)]).unwrap();
+        }
+
+        let gguf = open(&path, &device).unwrap();
+        let weights = Weights::from_gguf(gguf.clone());
+        let classic = weights.expert_stack_classic("ffn_up_exps").unwrap();
+        let src = mmap_source_for(&gguf, &path, &device);
+        let aliased = weights.expert_stack_mmap("ffn_up_exps", &src).unwrap();
+
+        assert!(aliased.qtensor.is_none(), "mmap stack must not build a QTensor");
+        assert!(aliased.mmap.is_some(), "mmap stack must keep the mapping alive");
+        assert_ne!(
+            aliased.base_off, 0,
+            "the synthetic GGUF's tensor offset must exercise a nonzero base_off"
+        );
+        assert_eq!(aliased.base_off % 32, 0, "GGUF data alignment makes base_off 32-aligned");
+
+        let (t, top_k) = (4usize, 2usize);
+        let x = Tensor::from_vec(fill(t * k, 0xBEEF), (t, 1, k), &device).unwrap();
+        let ids = Tensor::from_vec(vec![0u32, 3, 1, 2, 2, 0, 3, 1], (t, top_k), &device).unwrap();
+
+        let read = |t: Tensor| -> Vec<f32> { t.flatten_all().unwrap().to_vec1().unwrap() };
+        let assert_bitwise = |got: &[f32], want: &[f32], path_name: &str| {
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{path_name} differs at element {i}: aliased {g} vs classic {w}"
+                );
+            }
+        };
+
+        // Decode gather (mv_id; vendored or classic per env — same for both stacks).
+        let got = read(crate::ops::mul_mv_id(&aliased, &x, &ids).unwrap());
+        let want = read(crate::ops::mul_mv_id(&classic, &x, &ids).unwrap());
+        assert_bitwise(&got, &want, "mv_id");
+
+        // Prefill two-pass matmul (mm_id, active variant — same for both stacks).
+        let got = read(crate::ops::mul_mm_id(&aliased, &x, &ids).unwrap());
+        let want = read(crate::ops::mul_mm_id(&classic, &x, &ids).unwrap());
+        assert_bitwise(&got, &want, "mm_id");
 
         let _ = std::fs::remove_file(&path);
     }

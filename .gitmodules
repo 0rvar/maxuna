@@ -1,0 +1,4 @@
+[submodule "vendor/candle"]
+	path = vendor/candle
+	url = git@github.com:0rvar/candle.git
+	branch = metal-register-external-buffers

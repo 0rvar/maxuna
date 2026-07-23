@@ -37,6 +37,11 @@ macro_rules! mtl_size {
 /// `x` `[t, x_per_row, k]`, ids `[t, top_k]`, output `[t, top_k, n_out]`.
 pub(crate) struct IdDispatch<'a> {
     pub weights: &'a Buffer,
+    /// Byte offset of the expert stack's first block inside `weights`
+    /// (`ExpertStack.base_off`): 0 for a dedicated classic allocation, the
+    /// sub-page file offset for an mmap-aliased page-floored view. EVERY
+    /// encode that binds `weights` must pass this as the buffer offset.
+    pub w_off: usize,
     pub x: &'a Buffer,
     pub x_off: usize,
     pub ids: &'a Buffer,
@@ -376,7 +381,7 @@ pub(crate) fn encode_mul_mv_id_vendored(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_bytes(0, &args);
-    encoder.set_input_buffer(1, Some(d.weights), 0);
+    encoder.set_input_buffer(1, Some(d.weights), d.w_off);
     encoder.set_input_buffer(2, Some(d.x), d.x_off);
     encoder.set_output_buffer(3, Some(d.dst), 0);
     encoder.set_input_buffer(4, Some(d.ids), d.ids_off);
@@ -432,7 +437,7 @@ pub(crate) fn encode_mul_mv_id(
     candle_metal_kernels::set_params!(
         encoder,
         (
-            d.weights,
+            (d.weights, d.w_off),
             (d.x, d.x_off),
             candle_metal_kernels::Output::new(d.dst),
             (d.ids, d.ids_off),
@@ -602,7 +607,7 @@ fn encode_mm(
     // buffers: 0=args, 1=weights, 2=x, 3=tpe, 4=ids-map, 5=dst.
     encoder.set_compute_pipeline_state(&mm);
     encoder.set_bytes(0, &mm_args);
-    encoder.set_input_buffer(1, Some(d.weights), 0);
+    encoder.set_input_buffer(1, Some(d.weights), d.w_off);
     encoder.set_input_buffer(2, Some(d.x), d.x_off);
     encoder.set_input_buffer(3, Some(scratch), tpe_off);
     encoder.set_input_buffer(4, Some(scratch), ids_map_off);
@@ -801,6 +806,7 @@ fn run_inner(
 
     let d = IdDispatch {
         weights: w_buf,
+        w_off: stack.base_off,
         x: x_buf,
         x_off,
         ids: ids_buf,
@@ -2002,8 +2008,10 @@ pub(crate) mod testutil {
         };
         let qtensor = Arc::new(QTensor::new(storage, (n_expert, n_out, k))?);
         let stack = ExpertStack {
-            qtensor,
+            qtensor: Some(qtensor),
             buffer,
+            base_off: 0,
+            mmap: None,
             dtype: dt,
             n_expert,
             n_out,

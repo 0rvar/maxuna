@@ -170,7 +170,6 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "byteorder",
  "candle-metal-kernels",
@@ -199,7 +198,6 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "block2",
  "half",
@@ -214,7 +212,6 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -231,7 +228,6 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -249,7 +245,6 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "ug",
  "ug-metal",
@@ -1047,6 +1042,9 @@ dependencies = [
  "crossterm",
  "half",
  "memmap2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
  "rand",
  "serde_json",
  "tokenizers",
@@ -1303,9 +1301,9 @@ dependencies = [
 
 [[package]]
 name = "objc2"
-version = "0.6.4"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+checksum = "b7c2599ce0ec54857b29ce62166b0ed9b4f6f1a70ccc9a71165b6154caca8c05"
 dependencies = [
  "objc2-encode",
 ]

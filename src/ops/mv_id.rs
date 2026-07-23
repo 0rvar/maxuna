@@ -196,6 +196,66 @@ mod tests {
         }
     }
 
+    /// Every weights-binding encode site must honor `ExpertStack.base_off`
+    /// (the mmap alias load binds a page-floored view, so the stack's first
+    /// block sits at a nonzero buffer offset). The vendored-kernel and mm_id
+    /// sites are covered bitwise by `gguf::tests::expert_stack_mmap_matches_classic`;
+    /// this covers the remaining site, the candle-baked classic kernel
+    /// (`Mode::Mv`, the `LAGUNA_MV_CLASSIC` fallback): the same stack bytes
+    /// uploaded at offset 0 and behind a 32-byte-aligned pad must produce
+    /// bitwise-identical results.
+    #[test]
+    fn base_off_offsets_candle_baked_kernel() {
+        use crate::gguf::ExpertStack;
+        use candle_core::Device;
+
+        let device = metal_device().unwrap();
+        let (n_expert, n_out, k, t, top_k) = (4usize, 8usize, 256usize, 3usize, 2usize);
+        let dt = GgmlDType::Q4K;
+        let (stack, _) = build_stack(&device, dt, n_expert, n_out, k, 0x0FF5E7).unwrap();
+
+        // The same quantized bytes again, 96 bytes (32-aligned, like a GGUF
+        // tensor offset inside its page) into a fresh buffer.
+        let base_off = 96usize;
+        let bytes = stack.qtensor.as_ref().unwrap().data().unwrap();
+        let mut padded = vec![0u8; base_off];
+        padded.extend_from_slice(&bytes);
+        let Device::Metal(mdev) = &device else { unreachable!() };
+        let buf = mdev.new_buffer_with_data(&padded).unwrap();
+        let offset_stack = ExpertStack {
+            qtensor: None,
+            buffer: Some(buf),
+            base_off,
+            mmap: None,
+            dtype: dt,
+            n_expert,
+            n_out,
+            k,
+        };
+
+        let x_vec = pseudo_random(t * k, 0x0FF5E7 ^ 0xABCD, -1.0, 1.0);
+        let x = Tensor::from_vec(x_vec, (t, 1, k), &device).unwrap();
+        let ids = Tensor::from_vec(random_ids(t, top_k, n_expert, 0x44), (t, top_k), &device).unwrap();
+
+        let run = |s: &ExpertStack| -> Vec<f32> {
+            dispatch::run(s, &x, &ids, Mode::Mv, crate::ops::MmVariant::ClassicHp)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let want = run(&stack);
+        let got = run(&offset_stack);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "baked mv_id with base_off {base_off} differs at element {i}: {g} vs {w}"
+            );
+        }
+    }
+
     #[test]
     fn vendored_id_matches_classic() {
         // The vendored kernel and candle's baked kernel are two geometries over

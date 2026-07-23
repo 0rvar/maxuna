@@ -741,7 +741,16 @@ mod tests {
                 _ => None,
             };
             let qtensor = Arc::new(QTensor::new(storage, (N_EXPERT, n_out, k)).unwrap());
-            ExpertStack { qtensor, buffer, dtype: GgmlDType::Q4K, n_expert: N_EXPERT, n_out, k }
+            ExpertStack {
+                qtensor: Some(qtensor),
+                buffer,
+                base_off: 0,
+                mmap: None,
+                dtype: GgmlDType::Q4K,
+                n_expert: N_EXPERT,
+                n_out,
+                k,
+            }
         }
 
         /// RMSNorm weights near 1.0, as in the attention decode benches.
