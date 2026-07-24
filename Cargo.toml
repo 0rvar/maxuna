@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Pinned to the same candle rev as ../offload's voxtral port. This rev's
-# candle-metal-kernels ships kernel_mul_mv_id_* / kernel_mul_mm_id_* (the
-# quantized indexed MoE matmuls) in quantized.metal with no Rust host wiring —
-# src/ops/ dispatches them directly, so the pin also freezes those kernel
-# signatures and the public QStorage/MetalDevice surface we rely on.
-candle-core = { git = "https://github.com/huggingface/candle.git", rev = "27f20fea993c81ea6d32ce44018f42b68466525e", features = ["metal"] }
-candle-nn = { git = "https://github.com/huggingface/candle.git", rev = "27f20fea993c81ea6d32ce44018f42b68466525e", features = ["metal"] }
-candle-transformers = { git = "https://github.com/huggingface/candle.git", rev = "27f20fea993c81ea6d32ce44018f42b68466525e", features = ["metal"] }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", rev = "27f20fea993c81ea6d32ce44018f42b68466525e" }
+# This rev's candle-metal-kernels ships kernel_mul_mv_id_* / kernel_mul_mm_id_*
+# (the quantized indexed MoE matmuls) in quantized.metal with no Rust host
+# wiring — src/ops/ dispatches the mv_id ones directly (LAGUNA_MV_CLASSIC
+# fallback), so the pin also freezes those kernel signatures and the public
+# QStorage/MetalDevice surface we rely on.
+candle-core = { git = "https://github.com/huggingface/candle.git", rev = "25188553ba2ff0251bfe8c6a5e64496f93a2c48a", features = ["metal"] }
+candle-nn = { git = "https://github.com/huggingface/candle.git", rev = "25188553ba2ff0251bfe8c6a5e64496f93a2c48a", features = ["metal"] }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", rev = "25188553ba2ff0251bfe8c6a5e64496f93a2c48a", features = ["metal"] }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", rev = "25188553ba2ff0251bfe8c6a5e64496f93a2c48a" }
 
 # Raw Metal bindings for the mmap no-copy load path (gguf.rs MmapSource:
 # newBufferWithBytesNoCopy views over the GGUF mapping, MTLResidencySet).
