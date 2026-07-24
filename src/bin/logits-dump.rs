@@ -182,11 +182,14 @@ fn tap_value(name: &str, t: &Tensor) -> Result<Value> {
     }))
 }
 
-/// (top-1, top-2) as (token id, logit) pairs. Argmax is `top2(..).0.0`.
-/// Caller guarantees `logits.len() >= 2` (checked once against `vocab` in `main`).
-fn top2(logits: &[f32]) -> ((u32, f32), (u32, f32)) {
-    let t = topk(logits, 2);
-    (t[0], t[1])
+/// A decode step's top-5 (token id, logit) pairs, descending — the greedy/replay
+/// dumps' per-step top-k, mirroring the full-logit dump's `top5`. The argmax is
+/// `t[0].0`, and the k-way near-tie excusal reads the whole list; `top1`/`top2`
+/// are recorded alongside from `t[0]`/`t[1]` so pre-top5 readers still parse.
+/// Fewer than 5 entries only when the vocab is smaller; `logits.len() >= 2` is
+/// guaranteed (checked once against `vocab` in `main`), so `t[0]`/`t[1]` exist.
+fn step_top5(logits: &[f32]) -> Vec<(u32, f32)> {
+    topk(logits, 5)
 }
 
 /// (L2 norm in f64, count of non-finite entries) over a full logit vector. The
@@ -272,6 +275,15 @@ fn provenance(model: &LagunaModel, moe_impl: &str, seq_len: usize) -> Value {
         // The gate enforces it per side/tier (like attn_dtype), so a dump
         // predating the field cannot pass as current.
         "attn_mm": model.attn_mm(),
+        // Attention decode-projection path: "q8" (a q8_0-attention checkpoint's
+        // vendored decode gemv), "f16" (the dense f16 gemv — the official
+        // checkpoint, or a q8_0 file under LAGUNA_ATTN_DEQUANT), or "f32-bypass"
+        // (LAGUNA_ATTN_F32). Env/model-derived. The gate pins it per side/tier
+        // (reference/strict: "f32-bypass"; mm/decode: "f16" or "q8", pinnable via
+        // LAGUNA_PARITY_EXPECT_ATTN_DECODE); parity_schema v5 grandfathers a
+        // pre-field dump to "f32-bypass" (the oracle's value), keeping cached
+        // references valid.
+        "attn_decode": model.attn_decode(),
         // Reference runner never dispatches ops::combine, so it is neither
         // "fused" nor "classic" — mirror how moe_impl distinguishes reference.
         "combine": if matches!(moe_impl, "reference" | "ref") {
@@ -318,8 +330,9 @@ fn main() -> Result<()> {
     let gguf = gguf::open(&cli.model, &device)?;
     let cfg = LagunaConfig::from_gguf(&gguf.content)?;
     let vocab = cfg.vocab;
-    // `top2` (used by the greedy/replay decode dumps) indexes the top-2 logits;
-    // a degenerate vocab would panic there. Fail with a clear error instead.
+    // The greedy/replay decode dumps record each step's top1/top2 from
+    // `step_top5`, which indexes `top5[0]`/`top5[1]`; a degenerate vocab would
+    // panic there. Fail with a clear error instead.
     anyhow::ensure!(vocab >= 2, "vocab {vocab} < 2: cannot form a top-2 for the parity dumps");
     let model = LagunaModel::load(gguf, runner, cli.max_ctx)?;
 
@@ -541,21 +554,24 @@ fn prefill(model: &mut LagunaModel, device: &Device, prompt: &[u32]) -> Result<(
 }
 
 /// `--greedy N`: free-run greedy decode, recording at each step the token
-/// produced (argmax) and the top-1/top-2 of the logits that produced it. Runs
-/// the full N steps regardless of EOG so the gate compares equal lengths.
+/// produced (argmax) and the top-5 of the logits that produced it (with top-1/
+/// top-2 alongside for pre-top5 readers). Runs the full N steps regardless of EOG
+/// so the gate compares equal lengths.
 fn run_greedy(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, n: usize) -> Result<()> {
     let tokens = parse_tokens(cli.tokens.as_deref().context("--tokens is required for --greedy")?)?;
     let (mut logits, mut pos) = prefill(&mut model, device, &tokens)?;
 
     let mut steps: Vec<Value> = Vec::with_capacity(n);
     for i in 0..n {
-        let (t1, t2) = top2(&logits);
-        let token = t1.0;
+        let top5 = step_top5(&logits);
+        let token = top5[0].0;
         let (l2, nonfinite) = logit_scale(&logits);
+        let top5_json: Vec<Value> = top5.iter().map(|&(id, v)| json!([id, v])).collect();
         steps.push(json!({
             "token": token,
-            "top1": [t1.0, t1.1],
-            "top2": [t2.0, t2.1],
+            "top1": [top5[0].0, top5[0].1],
+            "top2": [top5[1].0, top5[1].1],
+            "top5": top5_json,
             "l2": l2,
             "nonfinite": nonfinite,
         }));
@@ -622,11 +638,13 @@ fn run_replay(cli: &Cli, mut model: LagunaModel, device: &Device, vocab: usize, 
     for (i, step) in ref_steps.iter().enumerate() {
         let forced_raw = step["token"].as_u64().with_context(|| format!("step {i} missing `token`"))?;
         let forced = u32::try_from(forced_raw).with_context(|| format!("step {i} token {forced_raw} exceeds u32"))?;
-        let (t1, t2) = top2(&logits);
+        let top5 = step_top5(&logits);
         let (l2, nonfinite) = logit_scale(&logits);
+        let top5_json: Vec<Value> = top5.iter().map(|&(id, v)| json!([id, v])).collect();
         steps.push(json!({
-            "top1": [t1.0, t1.1],
-            "top2": [t2.0, t2.1],
+            "top1": [top5[0].0, top5[0].1],
+            "top2": [top5[1].0, top5[1].1],
+            "top5": top5_json,
             "forced_token": forced,
             "l2": l2,
             "nonfinite": nonfinite,

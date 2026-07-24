@@ -6,6 +6,7 @@ pub mod flash;
 pub mod mm_id;
 pub mod mv_id;
 mod pipelines;
+pub mod q8;
 pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
@@ -15,6 +16,7 @@ pub use f16::matmul_f16;
 pub use flash::flash_attn;
 pub use mm_id::mul_mm_id;
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
+pub use q8::matmul_q8;
 pub use silu_mul::silu_mul;
 
 pub use crate::gguf::ExpertStack;
@@ -177,6 +179,24 @@ pub fn sdpa_f32() -> bool {
 pub(crate) fn attn_mm_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_MM_CLASSIC").is_some())
+}
+
+/// `LAGUNA_ATTN_DEQUANT` disables the q8_0 attention DECODE gemv (`ops::matmul_q8`)
+/// for a q8_0-quantized checkpoint, sending the decode projections back through
+/// the dequantized f16 dense plane (`ops::matmul_f16`) — byte-identical to the
+/// pre-fast-path fallback the prefill/mm branch already uses. A kill-switch and
+/// provenance anchor for the UD checkpoint's attention decode; on an f16-attention
+/// checkpoint (the official file) it is a no-op (there is no q8_0 alias, so decode
+/// always ran the f16 gemv). Orthogonal to `LAGUNA_ATTN_F32`, which bypasses the
+/// f16/q8 libraries entirely for the legacy dequant-f32 QMatMul path and takes
+/// precedence (its `AttnWeights::DequantF32` never builds a q8_0 alias).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`attn_mm_classic`, `flash_classic`): any value enables it — only leaving it
+/// unset keeps the q8_0 decode gemv.
+pub(crate) fn attn_dequant() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LAGUNA_ATTN_DEQUANT").is_some())
 }
 
 /// The mm_id prefill kernel family. Runtime-selectable via env; the single

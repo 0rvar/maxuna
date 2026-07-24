@@ -49,8 +49,9 @@ pub struct LagunaModel {
     lm_head: QLinear,
     /// Retained handle to the lm_head weight's Metal buffer, shared with
     /// `lm_head`'s QTensor (zero-copy). Present only on Metal for the vendored
-    /// q4_K/q6_K plain mat-vec; `None` off Metal or for an unsupported dtype, in
-    /// which case the decode path stays on `lm_head.forward`.
+    /// plain mat-vec (`mv_vendored_supported` — the official lm_head is q6_K, the
+    /// UD lm_head q8_0); `None` off Metal or for an unsupported dtype, in which
+    /// case the decode path stays on `lm_head.forward`.
     lm_head_buffer: Option<Arc<candle_metal_kernels::metal::Buffer>>,
     lm_head_dtype: candle_core::quantized::GgmlDType,
     /// Attention weight dtype resolved once at load (F16 default, F32 under
@@ -64,6 +65,13 @@ pub struct LagunaModel {
     /// cooperative-tensor default) or "classic" (the simdgroup kernel, under the
     /// LAGUNA_ATTN_MM_CLASSIC kill-switch).
     attn_mm: &'static str,
+    /// Attention DECODE-projection path resolved once at load, for dump
+    /// provenance: "f32-bypass" under LAGUNA_ATTN_F32 (the whole block is the
+    /// legacy dequant-f32 QMatMul), "q8" when the checkpoint stores its attention
+    /// weights q8_0 and the vendored decode gemv is active (the unsloth UD file),
+    /// else "f16" (the dense f16 gemv — the official checkpoint, or a q8_0 file
+    /// under LAGUNA_ATTN_DEQUANT).
+    attn_decode: &'static str,
     max_ctx: usize,
     tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
@@ -161,6 +169,19 @@ impl LagunaModel {
             caches.push(LayerCache::new(&cfg, il, max_ctx, &device)?);
         }
 
+        // Attention decode-projection path, for dump provenance. LAGUNA_ATTN_F32
+        // routes the whole block through the dequant-f32 QMatMul ("f32-bypass",
+        // like attn_mm). Otherwise a q8_0-attention checkpoint runs the vendored
+        // decode gemv ("q8") unless LAGUNA_ATTN_DEQUANT forces the f16 plane, and
+        // an f16-attention checkpoint always decodes through the f16 gemv ("f16").
+        let attn_decode = if attn_dtype == DType::F32 {
+            "f32-bypass"
+        } else if !crate::ops::attn_dequant() && layers.iter().any(|l| l.attn.uses_q8_decode()) {
+            "q8"
+        } else {
+            "f16"
+        };
+
         let output_norm = w.rms_norm("output_norm", cfg.rms_eps)?;
         let (lm_head, lm_head_buffer, lm_head_dtype) = w.qlinear_with_buffer("output")?;
 
@@ -184,6 +205,7 @@ impl LagunaModel {
             lm_head_dtype,
             attn_dtype,
             attn_mm,
+            attn_decode,
             max_ctx,
             tap_enabled: false,
             taps: Vec::new(),
@@ -216,6 +238,14 @@ impl LagunaModel {
     /// branch, is bypassed entirely).
     pub fn attn_mm(&self) -> &'static str {
         self.attn_mm
+    }
+
+    /// The attention DECODE-projection path `load` resolved, for dump provenance:
+    /// "f32-bypass" (LAGUNA_ATTN_F32), "q8" (a q8_0-attention checkpoint's
+    /// vendored decode gemv), or "f16" (the dense f16 gemv — the official
+    /// checkpoint, or a q8_0 file under LAGUNA_ATTN_DEQUANT).
+    pub fn attn_decode(&self) -> &'static str {
+        self.attn_decode
     }
 
     /// Run the transformer stack (embedding → 48 layers → final norm) and return

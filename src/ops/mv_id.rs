@@ -25,9 +25,10 @@ pub fn mv_classic() -> bool {
 ///
 /// By default dispatches the vendored ggml-geometry kernel
 /// (`kernel_mul_mv_id_<dtype>_f32_v`, src/ops/mv.metal) for the supported
-/// q4_K/q6_K experts — each threadgroup covers `N_R0*N_SG` output rows across
-/// `N_SG` simdgroups, current ggml geometry. `LAGUNA_MV_CLASSIC` (or an
-/// unsupported dtype) falls back to candle's baked `kernel_mul_mv_id_<dtype>_f32`.
+/// dtypes — q4_K/q6_K (official experts), q5_K and q8_0 (unsloth UD experts) —
+/// in current ggml geometry (the K-quant per-simdgroup row fan-out, or q8_0's
+/// shmem K-split). `LAGUNA_MV_CLASSIC` (or an unsupported dtype) falls back to
+/// candle's baked `kernel_mul_mv_id_<dtype>_f32`.
 ///
 /// x: [t, x_per_row, k] f32 — x_per_row is 1 when every selected expert of a
 /// token consumes the same activation (gate/up), top_k for the down projection.
@@ -47,7 +48,8 @@ pub fn mul_mv_id(stack: &ExpertStack, x: &Tensor, ids: &Tensor) -> Result<Tensor
 /// lm_head bypass at seq==1. `weight` is the rank-2 `[n_out, k]` quantized
 /// tensor's raw device buffer (the caller retains it at load, same zero-copy
 /// trick as `ExpertStack.buffer`). `x` is `[t, k]` f32; returns `[t, n_out]` f32.
-/// Only q4_K/q6_K are supported (lm_head is q6_K); callers gate on
+/// Supports the vendored dtypes (`mv_vendored_supported` — q4_K/q5_K/q6_K/q8_0;
+/// the official lm_head is q6_K, the UD lm_head q8_0); callers gate on
 /// `mv_vendored_supported` and `mv_classic` and fall back to QMatMul otherwise.
 pub fn mul_mv(weight: &Buffer, dtype: GgmlDType, n_out: usize, k: usize, x: &Tensor) -> Result<Tensor> {
     dispatch::run_plain_mv(weight, dtype, n_out, k, x)
@@ -174,8 +176,12 @@ mod tests {
         (rel_l2(&got, &want), max_abs(&got, &want))
     }
 
-    /// The vendored id kernel exists only for q4_K / q6_K (the production experts).
-    const VENDORED_DTYPES: &[(GgmlDType, &str)] = &[(GgmlDType::Q4K, "Q4K"), (GgmlDType::Q6K, "Q6K")];
+    /// The vendored id kernel exists for every dtype the two checkpoints decode
+    /// through the gather: q4_K/q6_K (official experts + lm_head) and q5_K/q8_0
+    /// (unsloth UD experts + lm_head). q5_K and q8_0 exercise the two other ggml
+    /// geometries — q5_K's N_R0=1 K-quant fan-out and q8_0's shmem K-split.
+    const VENDORED_DTYPES: &[(GgmlDType, &str)] =
+        &[(GgmlDType::Q4K, "Q4K"), (GgmlDType::Q5K, "Q5K"), (GgmlDType::Q6K, "Q6K"), (GgmlDType::Q8_0, "Q8_0")];
 
     #[test]
     fn vendored_id_shared_and_per_slot() {
@@ -352,6 +358,33 @@ mod tests {
         assert!(rel < 1e-3, "vendored ragged mv rel_l2 {rel} too high (max_abs {max})");
     }
 
+    #[test]
+    fn plain_mv_q8_0_lmhead_and_ragged() {
+        // The UD checkpoint's lm_head is q8_0: vocab-sized rows at seq==1, the
+        // shmem K-split geometry (N_R0=2, N_SG=4). 100352 is the production vocab,
+        // 3072 the hidden dim.
+        let (rel, max, rel_qmm) = plain_mv_case(GgmlDType::Q8_0, 100352, 3072, 1, 0x820);
+        assert!(rel < 1e-3, "vendored q8_0 vocab mv rel_l2 {rel} too high (max_abs {max})");
+        assert!(rel_qmm < 1e-3, "QMatMul oracle sanity rel_l2 {rel_qmm}");
+
+        // Odd row count (not a multiple of N_R0=2) exercises the helper's
+        // `r0 + row < ne01` ragged store guard.
+        let (rel, max, _) = plain_mv_case(GgmlDType::Q8_0, 31, 256, 2, 0x821);
+        assert!(rel < 1e-3, "vendored q8_0 ragged mv rel_l2 {rel} too high (max_abs {max})");
+    }
+
+    #[test]
+    fn plain_mv_q5k_basic_and_ragged() {
+        // q5_K's N_R0=1 fan-out: a K-quant row count that is not a multiple of
+        // N_R0*N_SG=2, plus a k spanning multiple super-blocks (512 = 2*QK_K).
+        let (rel, max, rel_qmm) = plain_mv_case(GgmlDType::Q5K, 256, 512, 1, 0x830);
+        assert!(rel < 1e-3, "vendored q5_K mv rel_l2 {rel} too high (max_abs {max})");
+        assert!(rel_qmm < 1e-3, "QMatMul oracle sanity rel_l2 {rel_qmm}");
+
+        let (rel, max, _) = plain_mv_case(GgmlDType::Q5K, 33, 256, 2, 0x831);
+        assert!(rel < 1e-3, "vendored q5_K ragged mv rel_l2 {rel} too high (max_abs {max})");
+    }
+
     /// Isolated lm_head-scale timing: vendored plain mv vs candle QMatMul on a
     /// q6_K `[100352, 3072]` weight at seq==1. Ignored (perf, not correctness);
     /// run with `cargo test --release --lib plain_mv_lmhead_bench -- --ignored --nocapture`.
@@ -388,10 +421,11 @@ mod tests {
 
     #[test]
     fn plain_mv_unsupported_dtype_errors() {
-        // Only q4_K/q6_K are vendored; q5_K must error rather than fault.
+        // q4_K/q5_K/q6_K/q8_0 are vendored; an unsupported K-quant (q2_K) must
+        // error rather than fault.
         let device = metal_device().unwrap();
-        let (buffer, _, _) = build_plain_weight(&device, GgmlDType::Q5K, 8, 256, 0x900);
+        let (buffer, _, _) = build_plain_weight(&device, GgmlDType::Q2K, 8, 256, 0x900);
         let x = Tensor::from_vec(vec![0f32; 256], (1, 256), &device).unwrap();
-        assert!(mul_mv(&buffer, GgmlDType::Q5K, 8, 256, &x).is_err());
+        assert!(mul_mv(&buffer, GgmlDType::Q2K, 8, 256, &x).is_err());
     }
 }

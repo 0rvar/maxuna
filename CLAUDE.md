@@ -67,6 +67,15 @@ trap documented here.
   generation_config.json (temp 1.0, top_k 20) instead.
 - Official quants: Q4_K_M 75GB (fits), Q8_0 128GB (does NOT fit), F16 235GB
   (+ published imatrix — self-quantizing Q5/Q6 is a TODO item).
+- SECOND SUPPORTED FILE (2026-07-24): `models/laguna-s-2.1-UD-Q4_K_XL.gguf`
+  (unsloth Dynamic, 73.4GB, merged from the 3-shard original) — the byte-spend
+  INVERSE of the official file: ALL attention Q8_0 (never F16), shared
+  experts/embeddings/lm_head Q8_0, routed experts Q4_K/Q5_K (down Q5_K/Q6_K).
+  Its metadata is the 1M-context conversion (ctx 1048576, YaRN factor 128 vs
+  official 256k/32) — rope differs from official AT EVERY POSITION, and the
+  as-shipped 1M config measures ~1.5% worse short-ctx ppl than rope-pinned to
+  the official config. Decode +17.5% vs official (bandwidth: attention halves).
+  Both files load through the same dtype-dispatched paths — no flags.
 
 ## The candle situation
 
@@ -162,6 +171,18 @@ trap documented here.
   would round activations + outputs to f16 — measured 22x worse per block).
   `LAGUNA_ATTN_F32` reverts to dequant-f32 QMatMul (the legacy path the strict
   tier gates; reference dumps pin it via parity-gate's referenceEnv()).
+- Quant-attention checkpoints (the UD file) use DUAL-STORAGE attention
+  (gguf.rs `attn_proj`): the dequant-f16 dense plane serves the seq>8 prefill
+  gemm (identical numerics to the fallback), and a no-copy mmap alias of the
+  raw q8_0 blocks feeds the vendored q8 gemv (`src/ops/q8.metal`, ggml
+  `mul_mv_q8_0_f32` geometry, f32 accum) at seq<=8 — the decode bandwidth win.
+  `LAGUNA_ATTN_DEQUANT` (presence) disables the q8 gemv (dequant-f16
+  everywhere). Provenance `attn_decode` ("f16"|"q8"|"f32-bypass"), schema v5,
+  grandfather "f32-bypass" (= the oracle's value — the grandfather principle).
+  The decode mv (mv.metal) covers q4_K/q5_K/q6_K/q8_0 via per-dtype ggml
+  geometries (`MvVendoredGeom`; q8_0 is the f16-style shmem K-split, NOT the
+  K-quant row fan-out) — lm_head and expert gathers route vendored for all
+  four; `LAGUNA_MV_CLASSIC` still reverts everything to candle baked.
 
 ## Verification workflow
 
@@ -170,7 +191,14 @@ trap documented here.
   long-swa 609 — the last exercises SWA-ring wraparound).
 - One-command full cycle (dumps + all tiered gates, hazard-safe serial):
   `bun scripts/parity-gate.ts` (`--tiers`/`--fixtures`/`--regen-ref`; see
-  docs/parity.md §3).
+  docs/parity.md §3). Non-default checkpoints: `--model <gguf>` (or
+  `$LAGUNA_MODEL`) gives the run per-model parity dirs + a per-model
+  `reference-ppl-<basename>.json` fixture; gate the UD file with
+  `--expect-attn-decode q8`. Quant-attention candidates get calibrated-wider
+  decode bounds (l2 band 1.5, near-tie window 1.0 — derived in §3b from the
+  prefill f16-plane-vs-f32 perturbation, which the official file structurally
+  cannot have; the greedy near-tie excusal is k-way over the step top5).
+  Do NOT cargo-build while a gate runs — candidates would mix binary versions.
 - Pass criteria philosophy (learned in WP8): the Track B full-logit gate is the
   real gate, and it is now THREE-TIER by change kind (`LAGUNA_PARITY_TIER`, see
   docs/parity.md §3b): **strict** (the CLASSIC mv fallback path only —
@@ -255,6 +283,10 @@ Warm steady-state, fused path, vs fork `llama-bench`, pmset-verified 2×2
 
 LPM decode PASSES the fork (~1.02-1.04x; 18.8-19.2 across runs, ±5% LPM
 noise); the "ours full" column predates all of the 2026-07-23 work.
+UD-Q4_K_XL (2026-07-24, LPM same-batch, decode-630 fixture): ours 22.8 vs
+official 19.4 (+17.5%); fork tg128 on the same files 22.80 vs 19.65 — fork
+parity holds on both checkpoints. UD prefill -1.5% vs official; UD warm load
+7.3s (the ~3s over official's mmap-only load is the attention dequant pass).
 Prefill "ours" LPM figures are 2026-07-23 post flash attention + tensor
 projections + glue phase 2 (174 → 304 @925, ~155 → 312 @4k over two days;
 0.86x/0.90x fork — 4k now runs FASTER per-token than 925 because the

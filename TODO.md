@@ -667,19 +667,86 @@ implementation — never silently drop scope.
   the unsigned compare (fixed same round). One-line fixes; guard change
   cannot affect in-bounds math (bit-identity contracts unaffected), but
   land them as their own commit with the suite re-run.
-- [ ] **Attention-weight quantization probe (biggest remaining decode lever,
+- [x] **Attention-weight quantization probe (biggest remaining decode lever,
   real quality risk)** — the official GGUF ships attention F16: ~5.6 GB of
   the ~8.6 GB/token decode traffic (65%). Q8_0 attention would cut
   ~2.6 GB/token → theoretical decode ~19 → ~27 LPM. Measurement-first:
-  (1) preview with the FORK — quantize attention (llama-quantize from F16
-  + published imatrix, or an existing third-party quant, e.g. unsloth
-  dynamic if it covers this model) and bench fork decode + ppl delta
-  before building anything; (2) only if quality survives the ppl/greedy
-  gates, port: loader (mmap f16-plane assumptions), quantized-attn
-  matvec/gemm paths (vendored mv covers q4_K/q6_K; q8_0 needs a variant).
+  The probe file already EXISTS (researched 2026-07-23, tensor dtypes
+  parsed from the real shard headers, not docs):
+  `unsloth/Laguna-S-2.1-GGUF` UD-Q4_K_XL (73.4 GB — fits; needs
+  llama.cpp >= b10087) ships the EXACT opposite trade-off from the
+  official file: ALL attention weights Q8_0 (never F16), shared
+  experts/embeddings/lm_head also Q8_0, routed experts Q4_K/Q5_K with
+  down_proj a notch higher (Q5_K/Q6_K). Estimated decode traffic
+  ~6.3 GB/token vs our 8.6 → ~19 → ~26 LPM potential. No published
+  per-quant ppl for THIS model (unsloth's Dynamic-2.0 quality tables
+  cover DeepSeek/Gemma) — quality is unmeasured. Plan: (1) preview with
+  the FORK — bench decode + ppl delta (frozen wikitext corpus,
+  docs/parity.md) UD-Q4_K_XL vs official Q4_K_M; ~73 GB download, zero
+  engine work; (2) only if quality survives, port to laguna: loader
+  (mmap assumes f16 attention planes), q8_0 attention matvec/gemm, AND
+  q5_K expert-kernel instantiations (vendored mv_id/mm_id cover
+  q4_K/q6_K only — the unsloth expert mix won't run on our kernels
+  as-is).
   CAUTION: llama.cpp's Q4_K_M normally quantizes attention — the model
   authors keeping F16 suggests measured sensitivity; treat the ppl gate
   as the decider, not an afterthought.
+  STEP 1 DONE (2026-07-24, fork preview, LPM, same-batch llama-bench;
+  file at models/unsloth-ud-q4kxl/, raw outputs /tmp/unsloth-bench.txt +
+  /tmp/ppl-*.txt): decode tg128 19.65 -> 22.80 (+16% — less than the
+  naive 1.37x traffic ratio because the UD file spends bytes back on
+  Q8_0 lm_head/embeddings/shared + Q5_K/Q6_K down_proj); prefill pp512
+  392 -> 378 (-3.5%, Q8_0 matmul vs F16 on the compute-bound side). PPL
+  over the frozen 4386-token wikitext corpus (512-chunks, fork
+  llama-perplexity, protocol quirks cancel in the delta): official
+  8.953 +/- 0.589; UD as-shipped 8.991; UD rope-pinned to the official
+  256k config (--rope-scaling yarn --rope-freq-scale 0.03125
+  --yarn-orig-ctx 8192 — the UD conversion is the 1M/YaRN-128 variant,
+  which shifts logits at ALL positions, so the pinned run is the pure
+  quant comparison) 8.858 — the Q8_0-attention file is ~1% BETTER on
+  this corpus. Attention is NOT catastrophically quant-sensitive; the
+  official F16 spend looks like caution, not measured necessity.
+  Caveats: 4.4k-token prose corpus, no code eval, short-ctx only.
+  Also learned: fork b10006 loads the file fine (b10087 in the unsloth
+  card = mainline laguna support landing, PR #25165 — which our branch
+  IS; metadata key-diff vs official shows identical laguna.* keys).
+  The as-shipped 1M rope config costs ~1.5% ppl at short ctx vs pinned
+  — data point for the 1M-context-tuning item.
+  STEP 2 DONE (2026-07-24) — the UD file is fully supported at fork-parity
+  perf, official file bit-identical throughout: UD decode 22.8 vs official
+  19.4 tok/s LPM (+17.5%, same-batch 256-tok sustained; fork tg128 on the
+  same files: 22.80/19.65), prefill 277.9 vs 282.2 (-1.5%), UD warm load
+  7.3s (the ~3s over official is the attention dequant pass — see the
+  native-q8 prefill item). What shipped: vendored q5_K/q8_0 decode matvec
+  in mv.metal (ggml geometries — q5_K N_R0=1/N_SG=2; q8_0 N_R0=2/N_SG=4
+  f16-style shmem K-split; q4_K/q6_K codegen untouched), mv_vendored_
+  supported covers all four (expert gathers + UD q8_0 lm_head); dual-
+  storage q8_0 attention (dequant-f16 planes for seq>8 prefill + no-copy
+  mmap alias read by the vendored q8 gemv src/ops/q8.metal at seq<=8;
+  LAGUNA_ATTN_DEQUANT kill switch; provenance attn_decode, schema v5
+  grandfather "f32-bypass"); parity harness per-model (--model /
+  LAGUNA_MODEL, per-model parity dirs + reference-ppl-<basename>.json,
+  --expect-attn-decode q8). Gates: BOTH models ALL PASS (UD strict
+  0.999993 / mm 0.995609 / decode 3 fixtures / ppl Δnll 0.002854;
+  official regression identical anchors). Decode-tier calibration for
+  quant-attention checkpoints (docs/parity.md §3b): greedy dumps record
+  top5, k-way near-tie excusal (the documented semantics; pairwise was an
+  implementation over-narrowing), and for attn_decode=="q8" candidates a
+  widened l2 band (1.5) + near-tie window (1.0) — derived from measured
+  chaotic amplification of the prefill f16-plane-vs-f32 perturbation
+  (kernel exonerated at rel_l2 ~1e-6 by the q8_error_magnitude_probe;
+  step-47 winner flips between blessed configs under ulp-level prefill
+  changes). Reviews: Claude clean; GLM 3 findings fixed (comment
+  precision, attn_decode gate enforcement, classic-loader odd-row pad).
+- [ ] **Native-q8 prefill attention projections** — the UD dual-storage
+  design keeps dequant-f16 planes solely for the seq>8 prefill gemm,
+  costing ~11GB RAM and the ~3s dequant at load. A q8_0 cooperative-
+  tensor prefill gemm (in-kernel dequant to f16 tiles, ggml-style) would
+  drop the planes entirely. Only worth it if the RAM/load matters —
+  prefill perf is already ≈ f16 planes (-1.5%); measure before building.
+- [ ] **bench.ts --model parameterization** — scripts/bench.ts hardcodes
+  the official model path; the UD benches this arc ran manually (same
+  fixtures/protocol). Small change, mirror parity-gate.ts's --model.
 - [ ] **Long-context decode traffic (KV quantization)** — at 32k ctx the 12
   full-attention layers read ~1.6 GB/token of f16 KV on top of weights
   (SWA caps the other 36 at window 512); scales linearly toward the 256k

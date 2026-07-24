@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 4;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 5;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -43,6 +43,16 @@ pub struct ProvenanceField {
 /// Version 4: act (the routed-expert SwiGLU activation kernel; every earlier
 /// binary ran candle's `silu(gate) * up` chain — today's classic path — hence
 /// grandfather "classic").
+/// Version 5: attn_decode (the attention DECODE-projection path: "q8" for a
+/// q8_0-quantized checkpoint's vendored decode gemv, "f16" for the dense f16
+/// gemv, "f32-bypass" under LAGUNA_ATTN_F32). Grandfather "f32-bypass": like every
+/// post-baseline field, the grandfather is the value the Reference oracle carries
+/// (the gate enforces attn_decode on the reference side), and the oracle runs
+/// under LAGUNA_ATTN_F32 — the whole attention block is the dequant-f32 QMatMul —
+/// so every pre-v5 reference dump ran the f32-bypass decode path. Candidate dumps
+/// are always freshly generated at the current version and never rely on the
+/// grandfather; only the cached (committed) reference dumps do, and those are all
+/// f32-bypass, so grandfathering to it keeps them valid.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField { name: "moe_impl", introduced: 1, grandfather: None },
     ProvenanceField { name: "seq_len", introduced: 1, grandfather: None },
@@ -56,6 +66,7 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField { name: "sdpa", introduced: 2, grandfather: Some("f16") },
     ProvenanceField { name: "flash", introduced: 3, grandfather: Some("classic") },
     ProvenanceField { name: "act", introduced: 4, grandfather: Some("classic") },
+    ProvenanceField { name: "attn_decode", introduced: 5, grandfather: Some("f32-bypass") },
 ];
 
 /// Look up a field's introduction record by name.
@@ -117,6 +128,12 @@ mod tests {
         assert_eq!(resolve_missing("act", 1), Some("classic"));
         assert_eq!(resolve_missing("act", 3), Some("classic"));
         assert_eq!(resolve_missing("act", 4), None);
+        // attn_decode introduced at v5: v1..v4 dumps missing it resolve to
+        // "f32-bypass" (the Reference oracle's LAGUNA_ATTN_F32 decode path — the
+        // value every cached pre-v5 reference dump carries); missing at v5 fails.
+        assert_eq!(resolve_missing("attn_decode", 1), Some("f32-bypass"));
+        assert_eq!(resolve_missing("attn_decode", 4), Some("f32-bypass"));
+        assert_eq!(resolve_missing("attn_decode", 5), None);
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

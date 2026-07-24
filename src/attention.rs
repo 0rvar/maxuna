@@ -4,9 +4,18 @@ use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
 
 use crate::config::LagunaConfig;
-use crate::gguf::{QLinear, Weights};
+use crate::gguf::{AttnQ8, QLinear, Weights};
 use crate::kv_cache::{LayerCache, MaskKind};
 use crate::rope::Rope;
+
+/// Token count up to and including which a q8_0-stored attention projection runs
+/// the vendored q8_0 decode gemv (`ops::matmul_q8`); above it the dense f16
+/// plane's `matmul_f16` runs the tiled gemm. Set to the f16 path's own mv/mm
+/// break-even so the q8 gemv covers the ENTIRE gemv range (the f16 plane would
+/// otherwise run its own gemv over double the bytes for seq 1..=8) and the f16
+/// gemm takes over exactly where tiling wins — decode and short verify spans take
+/// the q8 gemv, prefill takes the f16 tensor gemm.
+const Q8_DECODE_MAX_SEQ: usize = 8;
 
 /// Prefill attention masks for one query-head-count class (full-attn 48 heads
 /// or SWA 72), built once per forward and shared across every layer of that
@@ -70,15 +79,32 @@ enum Proj {
     Quant(QLinear),
     /// `[out_dim, in_dim]` f16.
     DenseF16(Tensor),
+    /// A q8_0-stored attention weight (the unsloth UD checkpoint): the
+    /// dequantized f16 dense plane consumed by the prefill/mm path (byte-identical
+    /// to `DenseF16`) PLUS the raw q8_0 bytes consumed by the decode gemv
+    /// (`ops::matmul_q8`) at seq < 8. The stored q8_0 weights are the only
+    /// quantized values in the decode chain (no activation/output rounding), at
+    /// ~half the decode bandwidth of streaming the f16 plane.
+    DenseF16Q8 { f16: Tensor, q8: AttnQ8 },
 }
 
 impl Proj {
-    /// f32 in, f32 out on both variants; on `DenseF16` the stored f16 weights
-    /// are the only f16 the matmul ever sees.
+    /// f32 in, f32 out on every variant; the stored quantized/f16 weights are the
+    /// only non-f32 values the matmul ever sees.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Proj::Quant(q) => Ok(q.forward(x)?),
             Proj::DenseF16(w) => crate::ops::matmul_f16(w, x),
+            Proj::DenseF16Q8 { f16, q8 } => {
+                let seq = x.dim(0)?;
+                if seq <= Q8_DECODE_MAX_SEQ && !crate::ops::attn_dequant() {
+                    crate::ops::matmul_q8(&q8.buffer, q8.base_off, q8.out_dim, q8.in_dim, x)
+                } else {
+                    // Prefill (and LAGUNA_ATTN_DEQUANT): the dense f16 plane, the
+                    // path the f16-attention checkpoint always takes.
+                    crate::ops::matmul_f16(f16, x)
+                }
+            }
         }
     }
 }
@@ -121,7 +147,13 @@ impl AttnBlock {
     ) -> Result<Self> {
         let proj = |name: &str| -> Result<Proj> {
             Ok(match weights {
-                AttnWeights::F16 => Proj::DenseF16(w.dense_f16(name)?),
+                // q8_0-stored weights (the UD checkpoint) build the dual-storage
+                // Proj; f16-stored weights (the official file) return no q8 alias
+                // and stay on the plain f16 plane — byte-identical to today.
+                AttnWeights::F16 => match w.attn_proj(name)? {
+                    (f16, Some(q8)) => Proj::DenseF16Q8 { f16, q8 },
+                    (f16, None) => Proj::DenseF16(f16),
+                },
                 AttnWeights::DequantF32 => Proj::Quant(w.qlinear(name)?),
             })
         };
@@ -141,6 +173,14 @@ impl AttnBlock {
             n_kv_head: cfg.n_kv_head,
             head_dim: cfg.head_dim,
         })
+    }
+
+    /// Whether this block's projections hold the q8_0 decode alias (a
+    /// q8_0-quantized checkpoint under `AttnWeights::F16`). Uniform across the
+    /// block's projections, so `q_proj` is representative. Surfaced so the model
+    /// can record the attention decode path in dump provenance.
+    pub fn uses_q8_decode(&self) -> bool {
+        matches!(self.q_proj, Proj::DenseF16Q8 { .. })
     }
 
     /// Build this block's prefill mask for `cache` at (seq, pos), or None for a

@@ -164,6 +164,26 @@ the Reference oracle dumps — otherwise a dump carrying `provenance.moe_impl ==
 `tests/fixtures/reference-ppl.json` — review and stage it yourself),
 `--parity-dir DIR` (default `$LAGUNA_PARITY_DIR` or `/tmp/laguna-parity`).
 
+**Non-default checkpoints (`--model`, `--expect-attn-decode`).** `--model
+<path>` (or `$LAGUNA_MODEL`) gates a checkpoint other than the official
+Q4_K_M — e.g. the unsloth `models/laguna-s-2.1-UD-Q4_K_XL.gguf`. A non-default
+model gets its own parity dir and ppl fixture so its artifacts never collide with
+the official file's: the default parity dir becomes `/tmp/laguna-parity-<basename>`
+and the committed perplexity reference is `tests/fixtures/reference-ppl-<basename>.json`
+(`<basename>` = the model filename without `.gguf`). Because the parity dir
+differs, the reference dumps for each model are cached independently — regenerate
+a model's Reference/greedy/ppl dumps the first time you gate it. For a
+quant-attention checkpoint (its attention weights stored q8_0, so its decode
+projections run the vendored q8 gemv), pass `--expect-attn-decode q8` so the
+mm/decode/ppl gate pins `provenance.attn_decode == "q8"` — this keeps an
+official-model candidate (which decodes `"f16"`) from passing a UD gate by
+mistake. Unset (the default), the gate accepts either shipped decode gemv
+(`"f16"` or `"q8"`); the value must be `f16` or `q8`. Example:
+
+```bash
+bun scripts/parity-gate.ts --model models/laguna-s-2.1-UD-Q4_K_XL.gguf --expect-attn-decode q8
+```
+
 The script enforces the model-run hazards for you: it `pgrep`s for a running
 `laguna|llama` process before every model invocation, runs strictly serial (one
 75GB process at a time), streams all model output to log files under the parity
@@ -286,6 +306,34 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   gross scale/NaN bug, not a precision gate — cosine/top-1 handle precision. The
   perplexity gate is the other scale-sensitive layer for decode.
 
+  **Quant-attention band + near-tie widening (greedy tier).** `NORM_RATIO_MAX`
+  and `NEAR_TIE_MARGIN` were calibrated on runs where the candidate and the
+  pinned-f32 reference read IDENTICAL attention weight values — the official
+  checkpoint's stored f16 makes both sides read bit-for-bit the same numbers, so
+  per-step drift is pure MoE/kernel noise. A q8_0-attention checkpoint (the UD
+  file) instead reads f16-rounded attention planes at PREFILL while the reference
+  reads f32 weights; that perturbation the official file cannot have, and 48-layer
+  MoE routing amplifies it chaotically at mushy positions. So when the CANDIDATE's
+  `provenance.attn_decode == "q8"` the greedy gate widens two thresholds (both
+  selected off that one provenance field, at the same point in `greedy_compare`):
+  - the per-step l2-ratio band to `[1/NORM_RATIO_MAX_Q8, NORM_RATIO_MAX_Q8]` =
+    `[1/1.5, 1.5]` (else the official `1.18`). Derivation: the largest BENIGN
+    ratio on an argmax-AGREEING step (2026-07-24, UD text-mixed step 25) was
+    `1.3075` = `0.268` in log space; `1.5` (= `0.405` log) gives ~1.5× log-margin.
+  - the k-way near-tie WINDOW to `NEAR_TIE_MARGIN_Q8` = `1.0` (else the official
+    `0.5`). Derivation: at sensitive positions the top-few tokens scramble in a
+    ~1-logit window on ulp-level prefill differences, and two blessed candidate
+    configs straddle the reference there (2026-07-24, UD code-short step 47: the
+    reference ranks the candidate's 605 #3 at `0.848` below its top1; the
+    mm-classic prefill variant agrees with the reference's 8720, tensor/flash-classic
+    pick 605). `1.0` covers the measured `0.848` swing with margin while staying
+    inside the top-5 shape check. This is a widened *window*, NOT a mismatch budget
+    — top-5 membership and the `max(2, n/8)` excused-step cap still apply.
+
+  Both only widen for confirmed-q8 candidates — a pre-v5 dump grandfathers
+  `attn_decode` to `"f32-bypass"` (never `"q8"`), so the official file and every
+  non-q8 dump keep `1.18` / `0.5`.
+
   **Dump provenance + per-tier enforcement.** The tier is caller-selected
   (`LAGUNA_PARITY_TIER`) with no cross-check against how the dump was produced, so a
   decode/mv_id candidate graded under the looser mm tier would mask a regression the
@@ -351,16 +399,35 @@ kernels and they have different (both correct) numerical envelopes vs the f32
     against the composed f32-sdpa reference), which the model-level gate
     confirmed: flash-default mm cos and Δnll match the sdpa-f32-only matrix
     column digit-for-digit.
+  - `attn_decode` (the attention DECODE-projection path: `"f32-bypass"` under
+    `LAGUNA_ATTN_F32` — the whole block is the dequant-f32 QMatMul; `"f16"` = the
+    dense f16 gemv, which an f16-attention checkpoint always runs and a q8_0 file
+    runs under `LAGUNA_ATTN_DEQUANT`; `"q8"` = the vendored q8_0 decode gemv
+    `kernel_mul_mv_q8_0_f32_attn` in `src/ops/q8.metal`, which only a
+    q8_0-attention checkpoint like the UD file runs) is pinned per side: references
+    and strict candidates must be `"f32-bypass"` (redundant with `attn_mm`, but
+    pinned for symmetry / stale-dump defence — both derive from `LAGUNA_ATTN_F32`),
+    while mm/decode/ppl candidates grade the shipped decode gemv, whose value is
+    checkpoint-dependent (`"f16"` official, `"q8"` UD), so BOTH pass by default and
+    a gate run pins one via `LAGUNA_PARITY_EXPECT_ATTN_DECODE` (the
+    `--expect-attn-decode q8` gate flag, on a UD run). Introduced at provenance
+    schema version 5 with grandfather `"f32-bypass"` — the value every cached pre-v5
+    reference dump (all `LAGUNA_ATTN_F32` runs) carries, so old references stay
+    valid. Note the widened l2 band keyed off `attn_decode == "q8"` above.
   - **Experiment expectation overrides.** The mm/decode/ppl CANDIDATE
-    expectations for `sdpa`, `attn_mm`, and `flash` are overridable per gate
-    run via `LAGUNA_PARITY_EXPECT_SDPA` (e.g. `f32`),
-    `LAGUNA_PARITY_EXPECT_ATTN_MM` (e.g. `classic`), and
-    `LAGUNA_PARITY_EXPECT_FLASH` (e.g. `classic`), read by
+    expectations for `sdpa`, `attn_mm`, `flash`, and `attn_decode` are overridable
+    per gate run via `LAGUNA_PARITY_EXPECT_SDPA` (e.g. `f32`),
+    `LAGUNA_PARITY_EXPECT_ATTN_MM` (e.g. `classic`),
+    `LAGUNA_PARITY_EXPECT_FLASH` (e.g. `classic`), and
+    `LAGUNA_PARITY_EXPECT_ATTN_DECODE` (e.g. `q8`), read by
     `tests/parity.rs`. This is how a non-default path (f32 sdpa, classic
-    projections gemm, classic sdpa fallback) gets graded against the real
+    projections gemm, classic sdpa fallback) — or a specific decode-path
+    assertion for a quant-attention model — gets graded against the real
     oracle without editing the test; `parity-gate.ts --sdpa-f32` /
     `--attn-mm-classic` / `--flash-classic` set the candidate env and the
-    matching override together and print a prominent EXPERIMENT banner.
+    matching override together and print a prominent EXPERIMENT banner, while
+    `--expect-attn-decode` (a model-file assertion, not an experiment: it does
+    NOT alter the candidate run env) sets only the expectation.
     Reference-side and strict-tier pins are never overridable — they anchor
     the oracle.
   - Under `LAGUNA_PARITY_TIER=mm` the CANDIDATE must prove the mm_id path was
@@ -393,11 +460,15 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   REQUIRED with no grandfathering — the references regenerated at that era carry
   every one, so a v1 dump missing any of them is genuinely stale, not merely old.
   A field introduced at version N (e.g. `sdpa`: N=2, grandfather `"f16"`;
-  `flash`: N=3, grandfather `"classic"`) resolves to its grandfather value when
-  missing from a dump whose version predates N — adding a field therefore no
-  longer invalidates existing references — while missing at/after N remains the
-  stale-binary hard fail. A dump claiming a version NEWER than the gate binary
-  knows is rejected (rebuild the test binary).
+  `flash`: N=3, grandfather `"classic"`; `act`: N=4, grandfather `"classic"`;
+  `attn_decode`: N=5, grandfather `"f32-bypass"`) resolves to its grandfather
+  value when missing from a dump whose version predates N — adding a field
+  therefore no longer invalidates existing references — while missing at/after N
+  remains the stale-binary hard fail. Every post-baseline grandfather is the value
+  the Reference oracle carries (the gate enforces the field on the reference side),
+  since the cached reference dumps are the only ones that rely on grandfathering.
+  A dump claiming a version NEWER than the gate binary knows is rejected (rebuild
+  the test binary).
 
   **Why forced replay, not free-run.** Comparing two free-running greedy decodes
   cascades at the first near-tie: the moment the two engines pick different
@@ -407,17 +478,36 @@ kernels and they have different (both correct) numerical envelopes vs the f32
   every step comparable: the Reference runner free-runs greedy N tokens
   (`--greedy N`, the reference dump), then the candidate (Fused runner) is forced
   along that exact token sequence (`--replay`), recording its OWN argmax at each
-  step before being forced. A step passes when the candidate's argmax equals the
-  reference token; a mismatch is excused only when the *Reference's own*
-  top-1/top-2 margin at that step is `< 0.5` logit (same NEAR_TIE_MARGIN rule as
-  the mm tier — which token wins a sub-0.5 oracle tie is noise) AND the two picks
-  are mutual contenders: the candidate's pick is in the reference's top-2, or the
-  reference token is in the candidate's top-2 with the candidate's own top-1/top-2
-  margin also `< 0.5` (fork calibration showed the reference's stored top-2 can be
-  the wrong contender set at 3-way ties, but only when the candidate is also flat
-  there — a confident wrong pick is never fork-class). Total excused steps are
-  capped at `max(2, n/8)` (fork calibration measured `<= 4/64` tie-flips per
-  fixture; more than 1-in-8 is drift, not tie noise).
+  step before being forced. Each greedy/replay step records the full top-5
+  `(token, logit)` descending (the `"top5"` step field, same convention as the
+  full-logit dump's `top5`), which the near-tie rule reads.
+
+  **k-way near-tie excusal.** A step passes when the candidate's argmax equals the
+  reference token; a mismatch is excused only as a genuine *reference* near-tie —
+  the documented semantics: which token wins a sub-`NEAR_TIE_MARGIN` (0.5) oracle
+  tie is noise. With the per-step top5 (current dumps) this is the exact k-way
+  rule: the candidate's pick appears in the *reference's* top-5 AND its
+  reference-side logit is within the near-tie window (`NEAR_TIE_MARGIN` = `0.5`;
+  `NEAR_TIE_MARGIN_Q8` = `1.0` for a quant-attention candidate, selected off
+  `provenance.attn_decode == "q8"` exactly like the l2 band — see the
+  quant-attention note above) of the reference's own top-1 logit — i.e. the
+  reference itself ranked the candidate's token a near-winner. The q8 case is a
+  widened *window*, not a mismatch budget: top-5 membership and the `max(2, n/8)`
+  excused-step cap both still apply, so a token the reference ranks outside its
+  top-5 (or beyond the window below top-1) still hard-fails. A non-excused
+  mismatch prints where the candidate's token sits in the reference distribution
+  (its reference-side rank and logit, or "outside the reference top5"), so
+  diagnostics like "candidate 605 vs reference 8720 @ 18.020" show 605's actual
+  reference rank. Dumps predating the per-step top5 fall back to the narrower
+  *pairwise-contender* approximation of the same intent: the reference's own
+  top-1/top-2 margin `< 0.5` AND the two picks mutual contenders — the candidate's
+  pick in the reference's top-2, or the reference token in the candidate's top-2
+  with the candidate's own margin also `< 0.5` (fork calibration showed the
+  reference's stored top-2 can be the wrong contender set at 3-way ties, but only
+  when the candidate is also flat there — a confident wrong pick is never
+  fork-class; this restriction was the over-narrowing the k-way rule removes).
+  Total excused steps are capped at `max(2, n/8)` (fork calibration measured
+  `<= 4/64` tie-flips per fixture; more than 1-in-8 is drift, not tie noise).
 
 Calibration (code-short fixture, 2026-07-22, full-logit vs the f32 `Reference`):
 
@@ -470,11 +560,13 @@ grades only prefill). The gate now also enforces, per side, runner provenance
 (the reference dump must be `moe_impl == "reference"`, the candidate replay must
 be `moe_impl == "fused"` — a forgotten `--moe-impl fused` on the candidate would
 otherwise self-compare the oracle and pass vacuously) and, per step, finiteness
-(no non-finite logits) plus a candidate/reference L2-norm ratio bound (the same
-`NORM_RATIO_MAX` = 1.18 as the full-logit gate — greedy argmax is scale-invariant,
-so a uniform rescale would agree on every token yet be wrong). Both require the
-`l2`/`nonfinite` per-step fields the current `logits-dump` writes; an older dump
-missing them is a hard fail (regenerate).
+(no non-finite logits) plus a candidate/reference L2-norm ratio bound
+(`NORM_RATIO_MAX` = 1.18 as the full-logit gate — greedy argmax is scale-invariant,
+so a uniform rescale would agree on every token yet be wrong; a quant-attention
+candidate, `provenance.attn_decode == "q8"`, gets the widened `NORM_RATIO_MAX_Q8`
+= 1.5 instead — see §3b). Both require the `l2`/`nonfinite` per-step fields the
+current `logits-dump` writes; an older dump missing them is a hard fail
+(regenerate).
 
 ```bash
 DIR=/tmp/decode-code-short
@@ -527,11 +619,12 @@ dumps.)
 - Decode-kernel changes: the gate is **greedy agreement vs the Reference oracle
   under forced replay** (`greedy_parity`, §3c), across all three fixtures. Each
   step passes when the candidate's argmax equals the reference token; a mismatch
-  is excused only at a reference near-tie (the Reference's own top-1/top-2 margin
-  at that step `< 0.5` logit — the same NEAR_TIE_MARGIN rule as the mm tier) with
-  mutual-contender overlap (both-sides-flat for the reference-in-candidate-top-2
-  direction; see §3b), and total excuses are capped at `max(2, n/8)`. Any
-  non-excused mismatch fails. The full-logit cosine is reported (via
+  is excused only at a reference near-tie — the k-way rule (§3b): the candidate's
+  pick is in the *reference's* top-5 within the near-tie window (`0.5`, or `1.0`
+  for a quant-attention `attn_decode == "q8"` candidate) of the reference's own
+  top-1 logit (pre-top5 dumps fall back to the pairwise-contender form). Total
+  excuses are capped at `max(2, n/8)`. Any non-excused mismatch fails (and reports
+  the candidate token's reference-side rank + logit). The full-logit cosine is reported (via
   `LAGUNA_PARITY_TIER=decode logit_parity`) but NOT gated — the strict 0.999
   cosine passes with zero headroom and can't accept accumulation-reordering
   decode changes. A perplexity-delta bound complements this (see "Perplexity

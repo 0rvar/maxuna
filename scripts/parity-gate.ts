@@ -22,7 +22,8 @@
  *     [--tiers strict,mm,decode,ppl] \
  *     [--fixtures code-short,text-mixed,long-swa] \
  *     [--regen-ref] [--regen-ppl-ref] [--parity-dir DIR] \
- *     [--sdpa-f32] [--attn-mm-classic] [--flash-classic]
+ *     [--sdpa-f32] [--attn-mm-classic] [--flash-classic] \
+ *     [--expect-attn-decode f16|q8]
  *
  * --sdpa-f32 / --attn-mm-classic / --flash-classic are EXPERIMENT flags (not
  * shipping gates): mm/decode/ppl CANDIDATE dumps run with the opt-in path env
@@ -32,9 +33,23 @@
  * overrides; references and the strict tier stay pinned to the blessed
  * classic/f16 paths.
  *
+ * --expect-attn-decode PINS the attention decode-projection path the mm/decode/
+ * ppl gate expects (LAGUNA_PARITY_EXPECT_ATTN_DECODE). Unset (default), the gate
+ * accepts either shipped decode gemv — "f16" (an f16-attention checkpoint, the
+ * official file) or "q8" (a q8_0-attention checkpoint, the unsloth UD file). Pass
+ * "q8" when gating the UD model so an official-model candidate cannot slip
+ * through. It does NOT change the candidate's run env — the model file itself
+ * determines the path; this only pins the gate's expectation.
+ *
  * Defaults: all tiers; fixtures per tier (strict/mm force code-short; decode
  * uses all three; ppl has no fixture axis). Parity dir: $LAGUNA_PARITY_DIR or
  * /tmp/laguna-parity.
+ *
+ * Model: --model <gguf> / $LAGUNA_MODEL select the model under test (default:
+ * the official Q4_K_M). A non-default model gets per-model defaults for the
+ * parity dir (/tmp/laguna-parity-<basename>) and the frozen ppl fixture
+ * (tests/fixtures/reference-ppl-<basename>.json) — different weights are a
+ * different oracle, so dumps and fixtures never mix across models.
  *
  * Reuse: an existing Reference dump is reused iff it carries provenance with
  * moe_impl=="reference" and attn_dtype=="f32" (the pinned oracle environment);
@@ -48,9 +63,12 @@ import { openSync, closeSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 
 const ROOT = resolve(import.meta.dir, "..");
-const MODEL = join(ROOT, "models/laguna-s-2.1-Q4_K_M.gguf");
+// Model under test: --model / $LAGUNA_MODEL override the official default.
+// Reference dumps and the frozen ppl fixture are PER-MODEL (different weights
+// = different oracle), so a non-default model gets its own parity-dir default
+// and its own reference-ppl-<basename>.json fixture.
+const DEFAULT_MODEL = join(ROOT, "models/laguna-s-2.1-Q4_K_M.gguf");
 const CORPUS = join(ROOT, "tests/fixtures/ppl-corpus.txt");
-const PPL_FIXTURE = join(ROOT, "tests/fixtures/reference-ppl.json");
 const FIXTURES_JSON = join(ROOT, "tests/fixtures/parity-prompts.json");
 const LOGITS_DUMP = join(ROOT, "target/release/logits-dump");
 
@@ -74,6 +92,8 @@ const PPL_MAX_CTX = 5120; // corpus (~4386 tok) + BOS exceeds the 4096 default
 // -------------------------------------------------------------------- args
 
 interface Opts {
+  model: string;
+  pplFixture: string;
   tiers: Tier[];
   fixtures: string[];
   regenRef: boolean;
@@ -91,6 +111,11 @@ interface Opts {
    *  sdpa prefill instead of the shipped flash kernel), gates expect
    *  flash=classic. References and the strict tier already pin flash classic. */
   flashClassic: boolean;
+  /** Pins the mm/decode/ppl gate's attention decode-projection expectation
+   *  (LAGUNA_PARITY_EXPECT_ATTN_DECODE): "q8" for a q8_0-attention checkpoint
+   *  (the UD file), "f16" for an f16-attention one. `undefined` (default) accepts
+   *  either. Not an experiment flag — it does not alter the candidate run env. */
+  expectAttnDecode?: string;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -113,7 +138,18 @@ function parseArgs(argv: string[]): Opts {
     return items;
   };
 
+  const model = typeof flags.model === "string"
+    ? resolve(String(flags.model))
+    : (process.env.LAGUNA_MODEL ? resolve(process.env.LAGUNA_MODEL) : DEFAULT_MODEL);
+  // Non-default models get suffixed defaults so their reference dumps and
+  // frozen ppl fixture never collide with the official model's.
+  const modelTag = model === DEFAULT_MODEL
+    ? ""
+    : "-" + (model.split("/").pop() ?? "model").replace(/\.gguf$/, "");
+
   return {
+    model,
+    pplFixture: join(ROOT, `tests/fixtures/reference-ppl${modelTag}.json`),
     tiers: csv(flags.tiers, ALL_TIERS, "tier") as Tier[],
     fixtures: csv(flags.fixtures, ALL_FIXTURES, "fixture"),
     regenRef: Boolean(flags["regen-ref"]),
@@ -121,9 +157,18 @@ function parseArgs(argv: string[]): Opts {
     sdpaF32: Boolean(flags["sdpa-f32"]),
     attnMmClassic: Boolean(flags["attn-mm-classic"]),
     flashClassic: Boolean(flags["flash-classic"]),
+    expectAttnDecode: (() => {
+      const v = flags["expect-attn-decode"];
+      if (v === undefined) return undefined;
+      const s = String(v);
+      if (s !== "f16" && s !== "q8") {
+        die(`--expect-attn-decode must be "f16" or "q8" (the shipped decode gemv paths), got ${JSON.stringify(s)}`);
+      }
+      return s;
+    })(),
     parityDir: typeof flags["parity-dir"] === "string"
       ? String(flags["parity-dir"])
-      : (process.env.LAGUNA_PARITY_DIR || "/tmp/laguna-parity"),
+      : (process.env.LAGUNA_PARITY_DIR || `/tmp/laguna-parity${modelTag}`),
   };
 }
 
@@ -144,7 +189,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_CLASSIC" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_SDPA_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k === "LAGUNA_FLASH_CLASSIC" || k === "LAGUNA_ACT_CLASSIC" || k.startsWith("LAGUNA_MM_ID")) continue;
+    if (k === "LAGUNA_NO_MM_ID" || k === "LAGUNA_MV_CLASSIC" || k === "LAGUNA_ATTN_F32" || k === "LAGUNA_ATTN_MM_CLASSIC" || k === "LAGUNA_ATTN_MM_TENSOR" || k === "LAGUNA_SDPA_F32" || k === "LAGUNA_COMBINE_CLASSIC" || k === "LAGUNA_ATTN_GLUE_CLASSIC" || k === "LAGUNA_FLASH_CLASSIC" || k === "LAGUNA_ACT_CLASSIC" || k === "LAGUNA_ATTN_DEQUANT" || k.startsWith("LAGUNA_MM_ID")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("LAGUNA_PARITY_")) continue;
@@ -180,6 +225,11 @@ function referenceEnv(): Record<string, string> {
 /** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */
 let EXPERIMENT = { sdpaF32: false, attnMmClassic: false, flashClassic: false };
 
+/** --expect-attn-decode pin ("f16"/"q8"), set once in main; undefined = accept
+ *  either shipped decode gemv. NOT an experiment (leaves the candidate run env
+ *  untouched); only pins the mm/decode/ppl gate expectation. */
+let EXPECT_ATTN_DECODE: string | undefined = undefined;
+
 /**
  * Env for mm/decode/ppl CANDIDATE dump runs: baseEnv plus the opt-in path
  * switches the experiment flags request. References and the strict candidate
@@ -204,6 +254,9 @@ function experimentGateEnv(): Record<string, string> {
   if (EXPERIMENT.sdpaF32) e.LAGUNA_PARITY_EXPECT_SDPA = "f32";
   if (EXPERIMENT.attnMmClassic) e.LAGUNA_PARITY_EXPECT_ATTN_MM = "classic";
   if (EXPERIMENT.flashClassic) e.LAGUNA_PARITY_EXPECT_FLASH = "classic";
+  // Model-file assertion, not an experiment: pins the decode-projection path the
+  // gate expects (unset accepts either shipped gemv, "f16" or "q8").
+  if (EXPECT_ATTN_DECODE) e.LAGUNA_PARITY_EXPECT_ATTN_DECODE = EXPECT_ATTN_DECODE;
   return e;
 }
 
@@ -619,9 +672,14 @@ async function runPplTier(parityDir: string, regenPplRef: boolean): Promise<void
 // ------------------------------------------------------------------- main
 
 let PARITY_BIN = "";
+// Set from Opts in main() before any tier runs (same idiom as EXPERIMENT).
+let MODEL = DEFAULT_MODEL;
+let PPL_FIXTURE = "";
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  MODEL = opts.model;
+  PPL_FIXTURE = opts.pplFixture;
   if (!existsSync(MODEL)) die(`model not found: ${MODEL}`);
   if (!existsSync(LOGITS_DUMP)) {
     // Built below; but if the target dir is missing entirely, cargo will create it.
@@ -629,9 +687,11 @@ async function main() {
   mkdirSync(opts.parityDir, { recursive: true });
 
   EXPERIMENT = { sdpaF32: opts.sdpaF32, attnMmClassic: opts.attnMmClassic, flashClassic: opts.flashClassic };
+  EXPECT_ATTN_DECODE = opts.expectAttnDecode;
 
-  console.log(`parity-gate: tiers=[${opts.tiers.join(",")}] fixtures=[${opts.fixtures.join(",")}] dir=${opts.parityDir}`);
+  console.log(`parity-gate: tiers=[${opts.tiers.join(",")}] fixtures=[${opts.fixtures.join(",")}] dir=${opts.parityDir}${MODEL === DEFAULT_MODEL ? "" : ` model=${MODEL}`}`);
   if (opts.regenRef) console.log("  --regen-ref: reference dumps will be regenerated");
+  if (EXPECT_ATTN_DECODE) console.log(`  --expect-attn-decode ${EXPECT_ATTN_DECODE}: mm/decode/ppl gates require candidate attn_decode=${EXPECT_ATTN_DECODE}`);
   if (opts.sdpaF32 || opts.attnMmClassic || opts.flashClassic) {
     console.log("");
     console.log("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");

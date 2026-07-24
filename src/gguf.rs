@@ -275,6 +275,35 @@ pub struct ExpertStack {
     pub k: usize,
 }
 
+/// The vendored q8_0 attention decode gemv covers output rows in `N_R0`-row
+/// groups (`kernel_mul_mv_q8_0_f32_attn`, N_R0_Q8_0 = 2 in ggml-metal-impl.h;
+/// mirrored by `ops`'s `MV_Q8_NR0`). ggml guards only the STORE against a ragged
+/// final group — the COMPUTE reads the whole `N_R0`-row group — so the classic
+/// private weight copy is padded up to a whole multiple of this many rows.
+const Q8_DECODE_NR0: usize = 2;
+
+/// The raw q8_0 bytes of one attention projection weight `[out_dim, in_dim]`,
+/// as a device buffer for the vendored decode gemv (`ops::matmul_q8`). Loaded
+/// ONLY for a checkpoint that stores its attention weights q8_0 (the unsloth
+/// UD-Q4_K_XL file); the dense f16 plane that carries the prefill/mm path lives
+/// alongside it in `Proj`. Mmap load: a page-floored no-copy view over the GGUF
+/// mapping, with `base_off` the tensor's byte offset inside the view. Classic
+/// load: a dedicated private buffer (`base_off` 0).
+pub struct AttnQ8 {
+    /// The q8_0 bytes as a raw device buffer (aliased view or private copy).
+    pub buffer: Arc<Buffer>,
+    /// Byte offset of the weight's first block inside `buffer`: 0 on the classic
+    /// path, the sub-page remainder of the tensor's file offset on the mmap path
+    /// (< page size, 32-byte aligned per GGUF data alignment). The decode gemv
+    /// dispatch binds `buffer` at this offset.
+    pub base_off: usize,
+    /// Keeps the file mapping (and its residency set) alive while `buffer`
+    /// aliases it — `MmapSource`'s lifetime invariant. `None` on the classic path.
+    pub mmap: Option<Arc<MmapSource>>,
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
 /// VarBuilder-shaped accessor: `w.pp("blk.0").qlinear("attn_q")` reads `blk.0.attn_q.weight`.
 #[derive(Clone)]
 pub struct Weights {
@@ -425,6 +454,96 @@ impl Weights {
             bail!("{} is not a rank-2 weight: {dims:?}", self.name(name));
         };
         Ok(t)
+    }
+
+    /// One attention projection weight `[out_dim, in_dim]`: the dense f16 plane
+    /// (`dense_f16` — the prefill/mm path) plus, ONLY when the GGUF stores the
+    /// weight as Q8_0, the raw q8_0 bytes as an `AttnQ8` for the vendored decode
+    /// gemv (`ops::matmul_q8`). An F16-stored weight (the official checkpoint)
+    /// returns `None` for the q8 handle and stays on the f16 path everywhere —
+    /// byte-identical to today, no extra load work.
+    ///
+    /// The f16 plane and the q8_0 bytes are two views of the SAME weight: the plane
+    /// is `dequantize_f16` of the q8_0 tensor, the alias is the untouched q8_0
+    /// bytes. The two decode paths across the `Q8_DECODE_MAX_SEQ` seq boundary are
+    /// NOT bit-identical: the f16 plane rounds each dequantized value `d·q_i` to
+    /// f16 (one extra rounding per weight element) and the seq > boundary path
+    /// multiplies those f16 weights by the f32 activation, whereas the seq <=
+    /// boundary q8 gemv multiplies the raw int8 quants by `d` and accumulates in
+    /// f32 with no such rounding. Both inherit q8_0's quantization error, so they
+    /// agree to that plus the f16 plane's per-element rounding — the same
+    /// numerical class as the f16 path's OWN gemv/gemm split (already ulp-different
+    /// across its seq boundary). The discontinuity is accepted design: the decode
+    /// parity tier grades greedy/perplexity statistically, not bitwise.
+    pub fn attn_proj(&self, name: &str) -> Result<(Tensor, Option<AttnQ8>)> {
+        let f16 = self.dense_f16(name)?;
+        let full = self.name(name);
+        let info = self
+            .src
+            .content
+            .tensor_infos
+            .get(&full)
+            .with_context(|| format!("tensor {full} not found"))?;
+        if info.ggml_dtype != GgmlDType::Q8_0 {
+            return Ok((f16, None));
+        }
+        let dims = info.shape.dims().to_vec();
+        let [out_dim, in_dim] = dims[..] else {
+            bail!("{full} is not a rank-2 weight: {dims:?}");
+        };
+        let dtype = info.ggml_dtype;
+        let block = dtype.block_size();
+        let elems = out_dim * in_dim;
+        if !elems.is_multiple_of(block) {
+            bail!("{full}: {elems} elements not a multiple of {dtype:?} block size {block}");
+        }
+        let size_in_bytes = elems / block * dtype.type_size();
+        let tensor_start = (self.src.content.tensor_data_offset + info.offset) as usize;
+
+        let (buffer, base_off, mmap) = match self.src.mmap.as_ref() {
+            Some(src) => {
+                let (buffer, base_off) = src
+                    .view(tensor_start, size_in_bytes)
+                    .with_context(|| format!("mmap-aliasing {full}"))?;
+                // The gemv walks whole q8_0 blocks (half delta + int8 quants), so
+                // the bound offset needs 2-byte alignment; every real GGUF is
+                // 32-aligned (this guards hand-crafted files).
+                ensure!(
+                    base_off.is_multiple_of(2),
+                    "{full}: mmap base_off {base_off} is not 2-byte aligned"
+                );
+                (buffer, base_off, Some(src.clone()))
+            }
+            None => {
+                // Classic copy: read the raw q8_0 bytes into a fresh private buffer
+                // (base_off 0). The dense f16 plane above is an independent
+                // allocation on this path, so no allocation is shared.
+                //
+                // The decode gemv reads output rows in Q8_DECODE_NR0-row groups and
+                // (ggml convention) reads the whole group even when the final one is
+                // ragged — only the STORE is row-guarded. `new_buffer_with_data`
+                // allocates exactly the data length (the mmap view is page-padded,
+                // this is not), so an odd out_dim would put the last group's second
+                // row past the buffer. Pad up to a whole Q8_DECODE_NR0-row multiple
+                // with zeros; the padding rows are read and discarded by the guard.
+                let bytes_per_row = in_dim / block * dtype.type_size();
+                let padded_rows = out_dim.div_ceil(Q8_DECODE_NR0) * Q8_DECODE_NR0;
+                let mut raw = vec![0u8; padded_rows * bytes_per_row];
+                {
+                    let mut file = self.src.file.lock().unwrap();
+                    file.seek(SeekFrom::Start(tensor_start as u64))
+                        .with_context(|| format!("seeking to {full}"))?;
+                    file.read_exact(&mut raw[..size_in_bytes])
+                        .with_context(|| format!("reading {full} ({size_in_bytes} bytes)"))?;
+                }
+                let Device::Metal(mdev) = &self.src.device else {
+                    bail!("q8_0 attention weights require a Metal device");
+                };
+                let buffer = mdev.new_buffer_with_data(&raw)?;
+                (buffer, 0usize, None)
+            }
+        };
+        Ok((f16, Some(AttnQ8 { buffer, base_off, mmap, out_dim, in_dim })))
     }
 
     /// Loads a stacked expert tensor `[n_expert, n_out, k]` for the fused MoE

@@ -33,6 +33,11 @@ const MV_SOURCE: &str = include_str!("mv.metal");
 /// `mv.metal` (attention-critical vs MoE-decode-critical: neither library can
 /// break the other).
 const F16_SOURCE: &str = include_str!("f16.metal");
+/// Vendored q8_0-weight x f32-activation mat-vec kernel (the attention DECODE
+/// gemv of a q8_0-quantized checkpoint). Separate from `mv.metal` (which carries
+/// the byte-identical MoE-decode q8_0 gather kernel) exactly as `f16.metal` is:
+/// attention-critical vs MoE-decode-critical, so neither can break the other.
+const Q8_SOURCE: &str = include_str!("q8.metal");
 /// Vendored Metal-4 cooperative-tensor attention prefill gemm (the tensor
 /// analogue of `f16.metal`'s classic `kernel_mul_mm_f16_f32_v`). Separate from
 /// `f16.metal` so that file stays Metal-4-free: this library is compiled lazily,
@@ -176,6 +181,11 @@ pub(crate) fn mv_pipeline(device: &Device, name: &str) -> Result<ComputePipeline
 /// Pipeline for an `f16.metal` kernel (vendored f16-weight attention matmul).
 pub(crate) fn f16_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, F16_SOURCE, "f16", name)
+}
+
+/// Pipeline for a `q8.metal` kernel (vendored q8_0-weight attention decode gemv).
+pub(crate) fn q8_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, Q8_SOURCE, "q8", name)
 }
 
 /// Pipeline for an `f16_t.metal` kernel (Metal-4 cooperative-tensor attention

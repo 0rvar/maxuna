@@ -1,20 +1,28 @@
 // Vendored quantized mat-vec (MoE decode + lm_head) kernels, ported from the
 // llama.cpp laguna fork (ggml/src/ggml-metal/ggml-metal.metal). candle's baked
-// kernel_mul_mv_{id_,}q4_K/q6_K kernels are an OLDER geometry (one row per
-// simdgroup, no sgitg row fan-out) that runs ~15x under memory bandwidth on this
-// device; ggml's current impls assign `(r0*NSG + sgitg)*nr0` rows per simdgroup
-// and accumulate `nr0` register rows at once. We vendor the current bodies for
-// the only two dtypes the decode path touches: the q4_K/q6_K routed experts and
-// the q6_K lm_head.
+// kernel_mul_mv_{id_,}q4_K/q5_K/q6_K/q8_0 kernels are an OLDER geometry (one row
+// per simdgroup, no sgitg row fan-out) that runs ~15x under memory bandwidth on
+// this device; ggml's current impls assign more rows per threadgroup and
+// accumulate several register rows at once. We vendor the current bodies for the
+// dtypes the decode path touches across the official Q4_K_M and the unsloth
+// UD-Q4_K_XL checkpoints: q4_K/q5_K/q6_K routed experts, the q6_K (official) or
+// q8_0 (UD) lm_head, and the q8_0 UD experts/shared paths that decode through
+// the gather.
+//
+// Two distinct ggml geometries live here, both current:
+//   * K-quants (q4_K/q5_K/q6_K): each simdgroup owns its own `N_R0` output rows
+//     (`first_row = (r0*N_SG + sgitg)*N_R0`) and finishes with a bare simd_sum
+//     per row — no threadgroup memory. The host grid covers
+//     `ceil(ne01/(N_R0*N_SG))` row-blocks (dispatch.rs `MvVendoredGeom`).
+//   * q8_0 (like the f16 attention gemv): the `N_SG` simdgroups split the K
+//     reduction over the SAME `N_R0` rows and combine through threadgroup
+//     memory (`helper_mv_reduce_and_write`). The host grid covers
+//     `ceil(ne01/N_R0)` row-blocks and reserves `N_R0*N_SIMDWIDTH` floats of
+//     shmem.
 //
 // Deliberately a SEPARATE library from mm_id.metal so this decode-critical file
 // carries no Metal-4 `<metal_tensor>` dependency (mm_id.metal requires it) and no
-// experimental tile variant can break it. Only q4_K and q6_K are instantiated.
-//
-// ggml's function-constant layer (FC_mul_mv_nsg / _ne12 / _r2 / _r3) is dropped:
-// nr0 and NSG are hardcoded constexpr per the fork's ggml-metal-impl.h constants
-// (both dtypes: N_R0=2, N_SG=2), and the broadcast dims are 1 (ne12/r2/r3 == 1)
-// for our single-matrix / one-expert-per-slot usage.
+// experimental tile variant can break it.
 //
 // Compiled at runtime by src/ops/pipelines.rs via candle's
 // new_library_with_source.
@@ -30,12 +38,14 @@ using namespace metal;
 #pragma METAL fp math_mode(fast)
 
 #define QK_K 256
+#define QK8_0 32
+#define N_SIMDWIDTH 32
 
-// N_R0_Q4_K / N_R0_Q6_K = 2, N_SG_Q4_K / N_SG_Q6_K = 2 (ggml-metal-impl.h). The
-// fork carries these as function constants; we hardcode them (M5-only, single
-// dtype set) so the kernels need no specialization.
-#define NR0 2
-#define NSG 2
+// Per-dtype N_R0 / N_SG (ggml-metal-impl.h): q4_K/q6_K carry (2, 2), q5_K (1, 2),
+// q8_0 (2, 4). The fork carries these as function constants; each impl hardcodes
+// its pair as constexpr (M5-only, fixed dtype set) so the kernels need no
+// specialization. dispatch.rs `MvVendoredGeom` mirrors the same table for the
+// host grid + shmem.
 
 // ---- Quantized block layouts (from ggml-common.h; unions there don't change
 // the byte layout) -----------------------------------------------------------
@@ -50,11 +60,24 @@ typedef struct {
 } block_q4_K;
 
 typedef struct {
+    half    d;                    // super-block scale for quantized scales
+    half    dmin;                 // super-block scale for quantized mins
+    uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
+    uint8_t qh[QK_K/8];           // quants, high bit
+    uint8_t qs[QK_K/2];           // quants, low 4 bits
+} block_q5_K;
+
+typedef struct {
     uint8_t ql[QK_K/2];      // quants, lower 4 bits
     uint8_t qh[QK_K/4];      // quants, upper 2 bits
     int8_t  scales[QK_K/16]; // scales, quantized with 8 bits
     half    d;               // super-block scale
 } block_q6_K;
+
+typedef struct {
+    half   d;          // delta
+    int8_t qs[QK8_0];  // quants
+} block_q8_0;
 
 // ---- Argument structs -------------------------------------------------------
 // Byte-for-byte the fork's ggml_metal_kargs_mul_mv / _mul_mv_id (ggml-metal-impl.h);
@@ -105,6 +128,53 @@ typedef struct {
     int32_t  nr0;
 } mv_id_args;
 
+// ---- Cross-simdgroup reduce helper (q8_0 / f16-style) -----------------------
+// Verbatim from ggml-metal.metal helper_mv_reduce_and_write<NR0>: per-row
+// simd_sum, cross-simdgroup combine via shmem (NW floats per row), single
+// writer, ragged-tail row guard on the store. Only the q8_0 impl needs it (the
+// K-quant impls reduce with a bare simd_sum — each simdgroup owns disjoint rows).
+template<short NR0>
+static inline void helper_mv_reduce_and_write(
+        device float * dst_f32,
+        float sumf[NR0],
+        const int r0,
+        const int ne01,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem) {
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup float * shmem_f32[NR0];
+
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *) shmem + NW*row;
+
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+
+        if (tiisg == 0 && sgitg == 0) {
+            dst_f32[r0 + row] = tot;
+        }
+    }
+}
+
 // ---- q4_K impl (verbatim from ggml-metal.metal kernel_mul_mv_q4_K_f32_impl,
 // with the function-constant broadcast dims resolved to 1) --------------------
 
@@ -117,6 +187,9 @@ static inline void mul_mv_q4_K_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    constexpr short NR0 = 2;  // N_R0_Q4_K
+    constexpr short NSG = 2;  // N_SG_Q4_K
+
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
@@ -216,6 +289,125 @@ static inline void mul_mv_q4_K_impl(
     }
 }
 
+// ---- q5_K impl (verbatim from ggml-metal.metal kernel_mul_mv_q5_K_f32_impl) --
+
+template<typename args_t>
+static inline void mul_mv_q5_K_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NR0 = 1;  // N_R0_Q5_K
+    constexpr short NSG = 2;  // N_SG_Q5_K
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    // ne12 == 1, r2 == 1, r3 == 1: i12 == i13 == 0, so nb02/nb03/nb12/nb13 drop.
+    const uint64_t offset0 = first_row*args.nb01;
+    const uint64_t offset1 =        r1*args.nb11;
+
+    device const block_q5_K * x = (device const block_q5_K *) (src0 + offset0);
+    device const float     * yy = (device const float      *) (src1 + offset1);
+
+    float sumf[NR0]={0.f};
+
+    float yl[16], yh[16];
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short tid = tiisg/4;
+    const short ix  = tiisg%4;
+    const short iq  = tid/4;
+    const short ir  = tid%4;
+
+    const short l0 = 8*ir;
+    const short q_offset = 32*iq + l0;
+    const short y_offset = 64*iq + l0;
+
+    const uint8_t hm1 = 1u << (2*iq);
+    const uint8_t hm2 = hm1 << 1;
+    const uint8_t hm3 = hm1 << 4;
+    const uint8_t hm4 = hm2 << 4;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    device const float * y1 = yy + ix*QK_K + y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const uint8_t * q1 = x[i].qs + q_offset;
+        device const uint8_t * qh = x[i].qh + l0;
+        device const half * dh = &x[i].d;
+        device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
+
+        device const float * y2 = y1 + 128;
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short l = 0; l < 8; ++l) {
+            yl[l+0] = y1[l+ 0]; sumy[0] += yl[l+0];
+            yl[l+8] = y1[l+32]; sumy[1] += yl[l+8];
+            yh[l+0] = y2[l+ 0]; sumy[2] += yh[l+0];
+            yh[l+8] = y2[l+32]; sumy[3] += yh[l+8];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            device const uint8_t * q2 = q1 + 64;
+
+            sc16[0] = a[0] & kmask1;
+            sc16[1] = a[2] & kmask1;
+            sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+            sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+            float4 acc1 = {0.f};
+            float4 acc2 = {0.f};
+            for (short l = 0; l < 8; ++l) {
+                uint8_t h = qh[l];
+                acc1[0] += yl[l+0] * (q1[l] & 0x0F);
+                acc1[1] += yl[l+8] * (q1[l] & 0xF0);
+                acc1[2] += yh[l+0] * (q2[l] & 0x0F);
+                acc1[3] += yh[l+8] * (q2[l] & 0xF0);
+                acc2[0] += h & hm1 ? yl[l+0] : 0.f;
+                acc2[1] += h & hm2 ? yl[l+8] : 0.f;
+                acc2[2] += h & hm3 ? yh[l+0] : 0.f;
+                acc2[3] += h & hm4 ? yh[l+8] : 0.f;
+            }
+
+            sumf[row] += dh[0] * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
+                                  sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
+                                  sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
+                                  sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += args.nb01;
+            qh += args.nb01;
+            dh += args.nb01/2;
+            a  += args.nb01/2;
+        }
+
+        y1 += 4 * QK_K;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    // Same ragged-tail store-only guard as the q4_K impl above (see comment there).
+    for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = tot;
+        }
+    }
+}
+
 // ---- q6_K impl (verbatim from ggml-metal.metal kernel_mul_mv_q6_K_f32_impl) --
 
 template<typename args_t>
@@ -227,6 +419,9 @@ static inline void mul_mv_q6_K_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    constexpr short NR0 = 2;  // N_R0_Q6_K
+    constexpr short NSG = 2;  // N_SG_Q6_K
+
     constexpr uint8_t kmask1 = 0x03;
     constexpr uint8_t kmask2 = 0x0C;
     constexpr uint8_t kmask3 = 0x30;
@@ -308,6 +503,82 @@ static inline void mul_mv_q6_K_impl(
     }
 }
 
+// ---- q8_0 impl (verbatim from ggml-metal.metal kernel_mul_mv_q8_0_f32_impl) --
+// Unlike the K-quant impls, the N_SG simdgroups split the K reduction over the
+// SAME N_R0 rows and combine through threadgroup memory (helper above), so this
+// impl takes a shmem pointer and the host reserves N_R0*N_SIMDWIDTH floats.
+
+template<typename args_t>
+static inline void mul_mv_q8_0_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NR0 = 2;  // N_R0_Q8_0
+    constexpr short NSG = 4;  // N_SG_Q8_0
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    // ne12 == 1, r2 == 1, r3 == 1: i12 == i13 == 0, so nb02/nb03/nb12/nb13 drop.
+    const uint64_t offset1 = r1*args.nb11;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    // pointers to src0 rows
+    device const block_q8_0 * ax[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01;
+
+        ax[row] = (device const block_q8_0 *) ((device const char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    // each thread in a SIMD group deals with NQ quants at a time
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            float sumq = 0.f;
+            for (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 // ---- Plain entry points (lm_head, seq==1) -----------------------------------
 
 kernel void kernel_mul_mv_q4_K_f32_v(
@@ -321,6 +592,17 @@ kernel void kernel_mul_mv_q4_K_f32_v(
     mul_mv_q4_K_impl(args, src0, src1, dst, tgpig, tiisg, sgitg);
 }
 
+kernel void kernel_mul_mv_q5_K_f32_v(
+        constant mv_args   & args [[buffer(0)]],
+        device const char * src0  [[buffer(1)]],
+        device const char * src1  [[buffer(2)]],
+        device       char * dst   [[buffer(3)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_mv_q5_K_impl(args, src0, src1, dst, tgpig, tiisg, sgitg);
+}
+
 kernel void kernel_mul_mv_q6_K_f32_v(
         constant mv_args   & args [[buffer(0)]],
         device const char * src0  [[buffer(1)]],
@@ -332,15 +614,28 @@ kernel void kernel_mul_mv_q6_K_f32_v(
     mul_mv_q6_K_impl(args, src0, src1, dst, tgpig, tiisg, sgitg);
 }
 
+kernel void kernel_mul_mv_q8_0_f32_v(
+        constant mv_args   & args  [[buffer(0)]],
+        device const char * src0   [[buffer(1)]],
+        device const char * src1   [[buffer(2)]],
+        device       char * dst    [[buffer(3)]],
+        threadgroup  char * shmem  [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_mv_q8_0_impl(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // ---- Indexed entry points (routed expert gather) ----------------------------
 // Ports ggml's kernel_mul_mv_id wrapper (ggml-metal.metal:10820): tgpig.z
 // enumerates (token, slot); decode it to the expert id via the ids buffer,
 // offset src0/src1/dst, then call the same per-quant impl with a synthetic
 // single-matrix arg (ne02/ne11/ne12 == 1). The wrapper is a macro rather than a
 // function-pointer template (Metal's fragile support for those) — it expands the
-// id-decode + synthetic-arg setup, then calls the named impl inline.
+// id-decode + synthetic-arg setup, then calls the named impl inline. The
+// `_SHMEM` variant threads a threadgroup pointer through for the q8_0 impl.
 
-#define MUL_MV_ID_BODY(IMPL_FN)                                                    \
+#define MUL_MV_ID_DECODE                                                        \
     const int iid1 = tgpig.z/args.nei0;                                            \
     const int idx  = tgpig.z%args.nei0;                                            \
     tgpig.z = 0;                                                                    \
@@ -372,8 +667,15 @@ kernel void kernel_mul_mv_q6_K_f32_v(
         /*.nr0  =*/ args.nr0,                                                       \
         /*.r2   =*/ 1,                                                              \
         /*.r3   =*/ 1,                                                              \
-    };                                                                             \
+    };
+
+#define MUL_MV_ID_BODY(IMPL_FN)                                                    \
+    MUL_MV_ID_DECODE                                                                \
     IMPL_FN(args0, src0_cur, src1_cur, dst_cur, tgpig, tiisg, sgitg);
+
+#define MUL_MV_ID_BODY_SHMEM(IMPL_FN)                                              \
+    MUL_MV_ID_DECODE                                                                \
+    IMPL_FN(args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
 
 kernel void kernel_mul_mv_id_q4_K_f32_v(
         constant mv_id_args & args  [[buffer(0)]],
@@ -388,6 +690,19 @@ kernel void kernel_mul_mv_id_q4_K_f32_v(
     MUL_MV_ID_BODY(mul_mv_q4_K_impl)
 }
 
+kernel void kernel_mul_mv_id_q5_K_f32_v(
+        constant mv_id_args & args  [[buffer(0)]],
+        device const char *  src0s  [[buffer(1)]],
+        device const char *  src1   [[buffer(2)]],
+        device       char *  dst    [[buffer(3)]],
+        device const char *  ids    [[buffer(4)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    MUL_MV_ID_BODY(mul_mv_q5_K_impl)
+}
+
 kernel void kernel_mul_mv_id_q6_K_f32_v(
         constant mv_id_args & args  [[buffer(0)]],
         device const char *  src0s  [[buffer(1)]],
@@ -399,4 +714,18 @@ kernel void kernel_mul_mv_id_q6_K_f32_v(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     MUL_MV_ID_BODY(mul_mv_q6_K_impl)
+}
+
+kernel void kernel_mul_mv_id_q8_0_f32_v(
+        constant mv_id_args & args  [[buffer(0)]],
+        device const char *  src0s  [[buffer(1)]],
+        device const char *  src1   [[buffer(2)]],
+        device       char *  dst    [[buffer(3)]],
+        device const char *  ids    [[buffer(4)]],
+        threadgroup  char *  shmem  [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    MUL_MV_ID_BODY_SHMEM(mul_mv_q8_0_impl)
 }

@@ -318,24 +318,73 @@ const F16_MM_MIN_SEQ: usize = 8;
 const MV_F16_NR0: usize = 2;
 const MV_F16_NSG: usize = 4;
 
-/// ggml's N_R0 * N_SG for the vendored q4_K/q6_K mat-vec kernels (both dtypes
-/// carry N_R0 = 2, N_SG = 2 in ggml-metal-impl.h). Rows are grouped into blocks
-/// of this many along the output dimension (grid.x), and each threadgroup runs
-/// N_SG simdgroups of 32 threads.
-const MV_NR0: usize = 2;
-const MV_NSG: usize = 2;
+/// ggml's N_R0 / N_SG for the vendored q8_0 attention decode gemv
+/// (kernel_mul_mv_q8_0_f32_attn, q8.metal): N_R0_Q8_0 = 2 rows per threadgroup,
+/// N_SG_Q8_0 = 4 simdgroups splitting the K reduction (ggml-metal-impl.h). Same
+/// f16-style geometry as the attention f16 gemv above.
+const MV_Q8_NR0: usize = 2;
+const MV_Q8_NSG: usize = 4;
 
-/// True iff the vendored ggml-geometry mat-vec kernels exist for `dt` (only the
-/// q4_K experts and q6_K experts/lm_head are ported). Other dtypes stay on the
-/// candle baked path.
+/// ggml's per-dtype (N_R0, N_SG) for the vendored mat-vec kernels
+/// (ggml-metal-impl.h) plus the grid geometry the fork's host dispatch selects
+/// (ggml-metal-ops.cpp). Two shapes coexist:
+///   * K-quants (q4_K/q5_K/q6_K, `row_split=false`): each simdgroup owns its own
+///     `nr0` output rows, so grid.x covers `ceil(ne01/(nr0*nsg))` blocks and the
+///     kernel needs no threadgroup memory (bare simd_sum per row).
+///   * q8_0 (`row_split=true`, like the f16 gemv): the `nsg` simdgroups split the
+///     K reduction over the SAME `nr0` rows and combine through shmem, so grid.x
+///     covers `ceil(ne01/nr0)` blocks and the kernel reserves `nr0*32` floats.
+struct MvVendoredGeom {
+    nr0: usize,
+    nsg: usize,
+    row_split: bool,
+}
+
+impl MvVendoredGeom {
+    /// Threadgroup memory the kernel reads (`helper_mv_reduce_and_write`): `nr0`
+    /// rows of one 32-lane simdgroup partial each. Zero for the K-quant kernels.
+    fn smem_bytes(&self) -> usize {
+        if self.row_split {
+            self.nr0 * 32 * std::mem::size_of::<f32>()
+        } else {
+            0
+        }
+    }
+
+    /// grid.x row-block count for `n_out` output rows.
+    fn row_blocks(&self, n_out: usize) -> usize {
+        if self.row_split {
+            n_out.div_ceil(self.nr0)
+        } else {
+            n_out.div_ceil(self.nr0 * self.nsg)
+        }
+    }
+}
+
+fn mv_vendored_geom(dt: GgmlDType) -> Result<MvVendoredGeom> {
+    let g = match dt {
+        GgmlDType::Q4K | GgmlDType::Q6K => MvVendoredGeom { nr0: 2, nsg: 2, row_split: false },
+        GgmlDType::Q5K => MvVendoredGeom { nr0: 1, nsg: 2, row_split: false },
+        GgmlDType::Q8_0 => MvVendoredGeom { nr0: 2, nsg: 4, row_split: true },
+        other => bail!("no vendored ggml-geometry mat-vec for dtype {other:?}"),
+    };
+    Ok(g)
+}
+
+/// True iff the vendored ggml-geometry mat-vec kernels exist for `dt`. The
+/// official Q4_K_M touches q4_K/q6_K (routed experts + q6_K lm_head); the unsloth
+/// UD-Q4_K_XL additionally decodes q5_K routed experts and q8_0 experts / lm_head
+/// through the gather. Other dtypes stay on the candle baked path.
 pub fn mv_vendored_supported(dt: GgmlDType) -> bool {
-    matches!(dt, GgmlDType::Q4K | GgmlDType::Q6K)
+    matches!(dt, GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K | GgmlDType::Q8_0)
 }
 
 fn mv_vendored_id_kernel_name(dt: GgmlDType) -> Result<&'static str> {
     match dt {
         GgmlDType::Q4K => Ok("kernel_mul_mv_id_q4_K_f32_v"),
+        GgmlDType::Q5K => Ok("kernel_mul_mv_id_q5_K_f32_v"),
         GgmlDType::Q6K => Ok("kernel_mul_mv_id_q6_K_f32_v"),
+        GgmlDType::Q8_0 => Ok("kernel_mul_mv_id_q8_0_f32_v"),
         other => bail!("no vendored kernel_mul_mv_id kernel for dtype {other:?}"),
     }
 }
@@ -343,14 +392,18 @@ fn mv_vendored_id_kernel_name(dt: GgmlDType) -> Result<&'static str> {
 fn mv_vendored_plain_kernel_name(dt: GgmlDType) -> Result<&'static str> {
     match dt {
         GgmlDType::Q4K => Ok("kernel_mul_mv_q4_K_f32_v"),
+        GgmlDType::Q5K => Ok("kernel_mul_mv_q5_K_f32_v"),
         GgmlDType::Q6K => Ok("kernel_mul_mv_q6_K_f32_v"),
+        GgmlDType::Q8_0 => Ok("kernel_mul_mv_q8_0_f32_v"),
         other => bail!("no vendored kernel_mul_mv kernel for dtype {other:?}"),
     }
 }
 
 /// Encode the vendored `kernel_mul_mv_id_<dtype>_f32_v` (decode path). Same seam
-/// contract as `encode_mul_mv_id`, but dispatches our ggml-geometry kernel: each
-/// threadgroup covers `MV_NR0*MV_NSG` output rows across `MV_NSG` simdgroups, and
+/// contract as `encode_mul_mv_id`, but dispatches our ggml-geometry kernel with
+/// the per-dtype `MvVendoredGeom`: the K-quant kernels give each simdgroup its
+/// own `nr0` rows (`ceil(n_out/(nr0*nsg))` row-blocks), the q8_0 kernel splits
+/// the K reduction over `nsg` simdgroups (`ceil(n_out/nr0)` row-blocks + shmem).
 /// grid.z enumerates every (token, slot) pair (the id wrapper decodes z). The
 /// argument struct goes to buffer(0) (ggml layout), matching the kernel signature.
 pub(crate) fn encode_mul_mv_id_vendored(
@@ -360,6 +413,7 @@ pub(crate) fn encode_mul_mv_id_vendored(
     d: &IdDispatch,
 ) -> Result<()> {
     let name = mv_vendored_id_kernel_name(dt)?;
+    let geom = mv_vendored_geom(dt)?;
     let pipeline = pipelines::mv_pipeline(device.device(), name)?;
 
     let args = MvIdArgs {
@@ -382,7 +436,7 @@ pub(crate) fn encode_mul_mv_id_vendored(
         ne0: d.n_out as i32,
         ne1: d.top_k as i32,
         nb1: (d.n_out * DType::F32.size_in_bytes()) as u64,
-        nr0: MV_NR0 as i32,
+        nr0: geom.nr0 as i32,
     };
 
     let encoder = ep.encoder();
@@ -393,11 +447,16 @@ pub(crate) fn encode_mul_mv_id_vendored(
     encoder.set_input_buffer(2, Some(d.x), d.x_off);
     encoder.set_output_buffer(3, Some(d.dst), 0);
     encoder.set_input_buffer(4, Some(d.ids), d.ids_off);
+    // The q8_0 kernel's cross-simdgroup reduce reads threadgroup memory; the
+    // K-quant kernels declare none (smem_bytes == 0).
+    let smem = geom.smem_bytes();
+    if smem > 0 {
+        encoder.set_threadgroup_memory_length(0, smem);
+    }
 
-    // K-quant grid.x groups n_out rows into MV_NR0*MV_NSG-wide blocks; grid.z
-    // walks every (token, slot) pair; threads are MV_NSG simdgroups of 32.
-    let grid = mtl_size!(d.n_out.div_ceil(MV_NR0 * MV_NSG), 1, d.top_k * d.t);
-    let threads = mtl_size!(32, MV_NSG, 1);
+    // grid.z walks every (token, slot) pair; threads are `nsg` simdgroups of 32.
+    let grid = mtl_size!(geom.row_blocks(d.n_out), 1, d.top_k * d.t);
+    let threads = mtl_size!(32, geom.nsg, 1);
     encoder.dispatch_thread_groups(grid, threads);
     Ok(())
 }
@@ -899,9 +958,9 @@ pub(crate) fn prepare_mm_id_map0(n_expert: usize, ids: &Tensor) -> Result<Map0Sc
 /// Plain (non-indexed) quantized mat-vec against the vendored ggml-geometry
 /// kernel — the lm_head bypass at seq==1. `weight` is a rank-2 `[n_out, k]`
 /// quantized tensor's raw device buffer; `x` is `[t, k]` f32 (t small, typically
-/// 1). Returns `[t, n_out]` f32. Only q4_K/q6_K are supported (the lm_head is
-/// q6_K); callers gate on `mv_vendored_supported` and fall back to QMatMul
-/// otherwise.
+/// 1). Returns `[t, n_out]` f32. Supports the vendored dtypes (`mv_vendored_supported`
+/// — q4_K/q5_K/q6_K/q8_0): the official lm_head is q6_K, the UD lm_head q8_0.
+/// Callers gate on `mv_vendored_supported` and fall back to QMatMul otherwise.
 pub(crate) fn run_plain_mv(
     weight: &Buffer,
     dt: GgmlDType,
@@ -926,6 +985,7 @@ pub(crate) fn run_plain_mv(
     if !mv_vendored_supported(dt) {
         bail!("no vendored plain mv kernel for dtype {dt:?}");
     }
+    let geom = mv_vendored_geom(dt)?;
 
     let block_size = dt.block_size();
     if !k.is_multiple_of(block_size) {
@@ -960,7 +1020,7 @@ pub(crate) fn run_plain_mv(
         nb13: (t * k * DType::F32.size_in_bytes()) as u64,
         ne0: n_out as i32,
         ne1: t as i32,
-        nr0: MV_NR0 as i32,
+        nr0: geom.nr0 as i32,
         r2: 1,
         r3: 1,
     };
@@ -977,11 +1037,18 @@ pub(crate) fn run_plain_mv(
         encoder.set_input_buffer(1, Some(weight), 0);
         encoder.set_input_buffer(2, Some(x_buf), x_off);
         encoder.set_output_buffer(3, Some(&dst), 0);
+        // The q8_0 kernel's cross-simdgroup reduce reads threadgroup memory; the
+        // K-quant kernels declare none (smem_bytes == 0).
+        let smem = geom.smem_bytes();
+        if smem > 0 {
+            encoder.set_threadgroup_memory_length(0, smem);
+        }
 
-        // K-quant grid.x = ceil(n_out / (MV_NR0*MV_NSG)); grid.y = one column per
-        // token row (nr1 == 1 for the quant mv path); threads MV_NSG simdgroups.
-        let grid = mtl_size!(n_out.div_ceil(MV_NR0 * MV_NSG), t, 1);
-        let threads = mtl_size!(32, MV_NSG, 1);
+        // grid.x per MvVendoredGeom (K-quant: ceil(n_out/(nr0*nsg)); q8_0:
+        // ceil(n_out/nr0)); grid.y = one column per token row (nr1 == 1 for the
+        // quant mv path); threads `nsg` simdgroups.
+        let grid = mtl_size!(geom.row_blocks(n_out), t, 1);
+        let threads = mtl_size!(32, geom.nsg, 1);
         encoder.dispatch_thread_groups(grid, threads);
     }
     drop(x_guard);
@@ -1187,6 +1254,101 @@ pub(crate) fn run_matmul_f16_variant(weight: &Tensor, x: &Tensor, kernel: F16MmK
         }
     }
     drop(w_guard);
+    drop(x_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (t, n_out)))
+}
+
+/// q8_0-weight x f32-activation mat-vec against the vendored q8.metal kernel —
+/// the attention DECODE gemv (seq < 8) of a q8_0-quantized checkpoint. `weight`
+/// is the rank-2 `[n_out, k]` q8_0 tensor's raw device buffer, bound at `w_off`
+/// (the mmap alias's `base_off`, 0 for the classic private copy); `x` is `[t, k]`
+/// f32 (t small — decode/short-verify spans). Returns `[t, n_out]` f32 with no
+/// activation cast and no output rounding (the stored q8_0 weights are the only
+/// quantized values in the chain). Mirrors `run_matmul_f16`'s gemv branch: the
+/// q8_0 kernel's `N_SG` simdgroups split the K reduction over `N_R0` rows and
+/// combine through `N_R0*32` floats of shmem.
+pub(crate) fn run_matmul_q8(
+    weight: &Buffer,
+    w_off: usize,
+    n_out: usize,
+    k: usize,
+    x: &Tensor,
+) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("matmul_q8 requires x on a Metal device");
+    };
+    let (t, kx) = x.dims2().map_err(|e| anyhow::anyhow!("x must be rank-2 [t, k]: {e}"))?;
+    if x.dtype() != DType::F32 {
+        bail!("x must be f32, got {:?}", x.dtype());
+    }
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    if kx != k {
+        bail!("x k ({kx}) does not match weight k ({k})");
+    }
+    // The kernel walks whole q8_0 (32-element) blocks with no K tail; every
+    // attention K (the hidden dim) is a multiple of 32.
+    let block = GgmlDType::Q8_0.block_size();
+    if !k.is_multiple_of(block) {
+        bail!("matmul_q8 requires k % {block} == 0, got {k}");
+    }
+
+    let bytes_per_row = k / block * GgmlDType::Q8_0.type_size();
+
+    let out_count = t * n_out;
+    let dst = mdev.new_buffer(out_count, DType::F32, "matmul_q8")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let x_buf = x_storage.buffer();
+    let x_off = x_layout.start_offset() * DType::F32.size_in_bytes();
+
+    let nb11 = (k * DType::F32.size_in_bytes()) as u64;
+    let args = MvArgs {
+        ne00: k as i32,
+        ne01: n_out as i32,
+        ne02: 1,
+        nb00: 0,
+        nb01: bytes_per_row as u64,
+        nb02: (n_out * bytes_per_row) as u64,
+        nb03: (n_out * bytes_per_row) as u64,
+        ne10: k as i32,
+        ne11: t as i32,
+        ne12: 1,
+        nb10: DType::F32.size_in_bytes() as u64,
+        nb11,
+        nb12: t as u64 * nb11,
+        nb13: t as u64 * nb11,
+        ne0: n_out as i32,
+        ne1: t as i32,
+        nr0: MV_Q8_NR0 as i32,
+        r2: 1,
+        r3: 1,
+    };
+
+    let pipeline = pipelines::q8_pipeline(mdev.device(), "kernel_mul_mv_q8_0_f32_attn")?;
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(weight), w_off);
+        encoder.set_input_buffer(2, Some(x_buf), x_off);
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        encoder.set_threadgroup_memory_length(0, MV_Q8_NR0 * 32 * DType::F32.size_in_bytes());
+
+        // grid.x = ceil(n_out / N_R0); grid.y = one column per token; threads are
+        // N_SG simdgroups of 32 splitting the K reduction.
+        let grid = mtl_size!(n_out.div_ceil(MV_Q8_NR0), t, 1);
+        encoder.dispatch_thread_groups(grid, mtl_size!(32, MV_Q8_NSG, 1));
+    }
     drop(x_guard);
 
     Ok(output_tensor(dst, mdev, out_count, (t, n_out)))
