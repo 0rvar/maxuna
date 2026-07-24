@@ -778,6 +778,16 @@ implementation — never silently drop scope.
   `<think>` blocks as parsed events instead of raw text (needed for the server).
   Also inbound: `chat::Message` has no assistant tool-call variant and no tools-list
   header rendering, so the template's tool branches are currently unreachable.
+- [ ] **Control-token injection from user text** — `LagunaTokenizer::encode` maps
+  any literal added-token string to its single id (needed so chat.rs's own
+  structural markers encode correctly), so a user typing `<think>`, `</assistant>`,
+  `<tool_call>`, … injects REAL control tokens inside the `<user>` turn (observed
+  2026-07-23: a user message containing `<think></think>` made the model emit a
+  stray literal `</think>` into its visible reply). Fix = encode user/assistant
+  CONTENT with the added-vocab matcher disabled (or escape/split the marker
+  strings) while keeping template-emitted markers on the current path. llama.cpp
+  has the same class of issue with `--special`-style parsing, so parity-check the
+  fork's behavior before choosing the mechanism.
 - [ ] **Tokenizer from GGUF metadata** — `LagunaTokenizer::from_gguf` intentionally
   errors ("pass tokenizer.json via --tokenizer"); reconstructing byte-level BPE +
   the 70-entry added vocab from `tokenizer.ggml.*` arrays wasn't worth it while

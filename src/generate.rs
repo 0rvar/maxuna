@@ -26,6 +26,13 @@ pub struct Generator {
     /// The speculative drafter, or `None` for the plain single-token loop.
     drafter: Option<DflashDrafter>,
     spec_params: SpecParams,
+    /// Forced-reasoning floor: while fewer than this many tokens have been
+    /// decoded in a call, `</think>` and the EOG ids are banned from sampling,
+    /// holding the model inside the `<think>` block the chat template opened.
+    /// 0 (the default) leaves the model free to close the block immediately —
+    /// which the hybrid reasoner does on conversational prompts. Only
+    /// meaningful when the prompt ends with `<assistant><think>`.
+    min_think: usize,
 }
 
 /// Speculative-decode knobs (mirrors the fork's `common_params_speculative`).
@@ -446,7 +453,34 @@ impl PauseController {
 
 impl Generator {
     pub fn new(model: LagunaModel, tokenizer: LagunaTokenizer, sampler: Sampler) -> Self {
-        Self { model, tokenizer, sampler, drafter: None, spec_params: SpecParams::default() }
+        Self {
+            model,
+            tokenizer,
+            sampler,
+            drafter: None,
+            spec_params: SpecParams::default(),
+            min_think: 0,
+        }
+    }
+
+    /// Set the forced-reasoning floor (see the `min_think` field). Applies to
+    /// every subsequent `generate` call, on both the plain and speculative
+    /// decode paths.
+    pub fn set_min_think(&mut self, n: usize) {
+        self.min_think = n;
+    }
+
+    /// The ids banned from sampling while the forced-reasoning floor is in
+    /// effect: `</think>` plus the EOG ids (banning EOG too keeps the forcing
+    /// window from ending the reply outright). Empty when the floor is 0, so
+    /// the default path stays on the unmasked sampler.
+    fn think_exit_ban(&self) -> Vec<u32> {
+        if self.min_think == 0 {
+            return Vec::new();
+        }
+        let mut ban = vec![LagunaTokenizer::THINK_CLOSE];
+        ban.extend_from_slice(self.sampler.eog_ids());
+        ban
     }
 
     /// Attach a DFlash drafter so subsequent `generate` calls run speculative
@@ -501,6 +535,16 @@ impl Generator {
              raise --max-ctx or lower -n",
             tokens.len()
         );
+        // A floor at or past the token budget would ban `</think>`/EOG for the
+        // whole generation: the reply is all reasoning, and the chat REPL
+        // (which splits on the `</think>` literal) would show nothing and file
+        // the raw reasoning into history as content. Reject it up front.
+        ensure!(
+            self.min_think == 0 || self.min_think < max_tokens,
+            "min_think ({}) must be below max_tokens ({max_tokens}) or the think block \
+             can never close",
+            self.min_think
+        );
 
         // Benchmark mode (LAGUNA_BENCH): run a full prefill once to page the
         // touched weights into the GPU residency set and compile every pipeline,
@@ -550,6 +594,7 @@ impl Generator {
 
         // ---- Decode: sample, stream, feed back, one token at a time.
         let decode_start = Instant::now();
+        let think_exit_ban = self.think_exit_ban();
         let mut stream = self.tokenizer.decode_stream();
         let mut decoded = 0usize;
         while decoded < max_tokens {
@@ -557,7 +602,11 @@ impl Generator {
                 cancelled = true;
                 break;
             }
-            let token = self.sampler.sample(&logits)?;
+            let token = if decoded < self.min_think {
+                self.sampler.sample_masked(&logits, &think_exit_ban)?
+            } else {
+                self.sampler.sample(&logits)?
+            };
             if self.sampler.is_eog(token) {
                 break;
             }
@@ -601,9 +650,11 @@ impl Generator {
         on_text: &mut dyn FnMut(&str),
         should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<GenStats> {
+        let think_exit_ban = self.think_exit_ban();
+        let min_think = self.min_think;
         // Destructure into per-field borrows so the drafter can stay borrowed
         // across target-model / sampler / tokenizer calls (distinct fields).
-        let Self { model, tokenizer, sampler, drafter, spec_params } = self;
+        let Self { model, tokenizer, sampler, drafter, spec_params, .. } = self;
         let drafter = drafter.as_mut().expect("generate_spec requires a drafter");
         model.reset_cache()?;
         let device = model.device().clone();
@@ -619,6 +670,12 @@ impl Generator {
             "prompt ({} tokens) + max_tokens ({max_tokens}) exceeds max_ctx ({max_ctx}); \
              raise --max-ctx or lower -n",
             tokens.len()
+        );
+        // Same floor-vs-budget guard as the plain path (see generate()).
+        ensure!(
+            min_think == 0 || min_think < max_tokens,
+            "min_think ({min_think}) must be below max_tokens ({max_tokens}) or the think \
+             block can never close",
         );
 
         // Draft-block width is bounded by the trained block size (id_last plus
@@ -707,8 +764,13 @@ impl Generator {
 
         // First token: sampled from the last prefill logits, exactly as plain
         // decode does. It is emitted here; every later token is emitted as a
-        // committed token of a verify round.
-        let mut id_last = sampler.sample(&logits)?;
+        // committed token of a verify round. Emitted index 0, so the forced-
+        // reasoning ban applies whenever the floor is nonzero.
+        let mut id_last = if min_think > 0 {
+            sampler.sample_masked(&logits, &think_exit_ban)?
+        } else {
+            sampler.sample(&logits)?
+        };
         let first_eog = sampler.is_eog(id_last);
         if !first_eog {
             if let Some(text) = stream.step(id_last)? {
@@ -783,7 +845,11 @@ impl Generator {
                     let taps = model.take_spec_taps(); // each [1, n_embd]
                     let fused = drafter.encode(&taps)?;
                     drafter.inject(&fused, n_past)?;
-                    let s = sampler.sample(&step_logits)?;
+                    let s = if decoded < min_think {
+                        sampler.sample_masked(&step_logits, &think_exit_ban)?
+                    } else {
+                        sampler.sample(&step_logits)?
+                    };
                     n_past += 1;
                     stats.rounds += 1;
                     committed = vec![s];
@@ -804,9 +870,16 @@ impl Generator {
                     // once per committed token, matching plain decode), accepting
                     // matching drafts until the first mismatch, the bonus token, an
                     // EOG, or the max_tokens budget — never drawing past any of them.
+                    // Row i commits emitted index `decoded + i`, so the forced-
+                    // reasoning ban applies per row; a draft proposing a banned id
+                    // simply mismatches the masked sample and is rejected.
                     let (m, accepted) = accept_drafts(&drafts, max_tokens - decoded, |i| {
                         let row = logits_cpu.narrow(0, i, 1)?;
-                        let s = sampler.sample(&row)?;
+                        let s = if decoded + i < min_think {
+                            sampler.sample_masked(&row, &think_exit_ban)?
+                        } else {
+                            sampler.sample(&row)?
+                        };
                         Ok((s, sampler.is_eog(s)))
                     })?;
 

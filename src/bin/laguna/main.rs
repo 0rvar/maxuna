@@ -116,6 +116,12 @@ enum Cmd {
         raw: bool,
         #[arg(long)]
         stats: bool,
+        /// Force at least this many decode tokens of <think> reasoning before
+        /// `</think>` (or an EOG) may be sampled; 0 lets the model decide.
+        /// Meaningful only without --raw (the chat template ends the prompt
+        /// inside an open <think> block).
+        #[arg(long, default_value_t = 0)]
+        min_think: usize,
         #[command(flatten)]
         sampling: SamplingArgs,
         #[command(flatten)]
@@ -136,6 +142,11 @@ enum Cmd {
         /// Show the model's <think> reasoning (dimmed) instead of hiding it.
         #[arg(long)]
         show_thinking: bool,
+        /// Force at least this many decode tokens of <think> reasoning per
+        /// turn before `</think>` (or an EOG) may be sampled; 0 lets the
+        /// model decide (it skips reasoning on conversational prompts).
+        #[arg(long, default_value_t = 0)]
+        min_think: usize,
         #[command(flatten)]
         sampling: SamplingArgs,
     },
@@ -206,11 +217,13 @@ fn main() -> Result<()> {
             max_ctx,
             raw,
             stats,
+            min_think,
             sampling,
             draft,
         } => {
             let mut generator =
                 build_generator(&model, &tokenizer, &moe_impl, max_ctx, sampling.options(), Some(&draft))?;
+            generator.set_min_think(min_think);
 
             // BOS ownership: the chat template writes it as literal text; raw
             // mode prepends it here so generate() itself never injects a BOS.
@@ -271,9 +284,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Chat { model, tokenizer, max_tokens, moe_impl, max_ctx, show_thinking, sampling } => {
+        Cmd::Chat { model, tokenizer, max_tokens, moe_impl, max_ctx, show_thinking, min_think, sampling } => {
             let mut generator =
                 build_generator(&model, &tokenizer, &moe_impl, max_ctx, sampling.options(), None)?;
+            generator.set_min_think(min_think);
             repl::run(&mut generator, max_tokens, show_thinking)
         }
     }

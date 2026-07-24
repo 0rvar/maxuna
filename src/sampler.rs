@@ -37,12 +37,34 @@ impl Sampler {
 
     /// logits: [vocab] f32 on any device; reads back and samples on CPU.
     pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
+        self.sample_masked(logits, &[])
+    }
+
+    /// Like `sample`, but the `banned` token ids are excluded from the draw
+    /// (their logits are forced to -inf before filtering). Used to hold the
+    /// model inside a `<think>` block by banning `</think>` and the EOG ids.
+    pub fn sample_masked(&mut self, logits: &Tensor, banned: &[u32]) -> Result<u32> {
         let logits = logits.flatten_all()?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-        Ok(self.processor.sample(&logits)?)
+        if banned.is_empty() {
+            return Ok(self.processor.sample(&logits)?);
+        }
+        let mut values = logits.to_vec1::<f32>()?;
+        for &id in banned {
+            if let Some(v) = values.get_mut(id as usize) {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+        let masked = Tensor::new(values, &Device::Cpu)?;
+        Ok(self.processor.sample(&masked)?)
     }
 
     pub fn is_eog(&self, token: u32) -> bool {
         self.eog.contains(&token)
+    }
+
+    /// The configured end-of-generation token ids.
+    pub fn eog_ids(&self) -> &[u32] {
+        &self.eog
     }
 }
 
@@ -102,6 +124,18 @@ mod tests {
             let id = s.sample(&l).unwrap();
             assert!(id == 0 || id == 2, "drew id {id}, outside the top-2 set {{0, 2}}");
         }
+    }
+
+    // A banned id is never drawn, even when it holds by far the highest logit;
+    // the draw falls to the best unbanned candidate under greedy settings.
+    #[test]
+    fn masked_sampling_excludes_banned_ids() {
+        let l = logits(&[0.1, 9.0, 3.0, 0.2]);
+        let mut s =
+            Sampler::new(SamplerOptions { temperature: 0.0, top_k: 20, top_p: 1.0, seed: 7 }, vec![]);
+        assert_eq!(s.sample_masked(&l, &[1]).unwrap(), 2);
+        // Out-of-range ids are ignored rather than erroring.
+        assert_eq!(s.sample_masked(&l, &[1, 999]).unwrap(), 2);
     }
 
     #[test]

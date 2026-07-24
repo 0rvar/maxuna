@@ -25,6 +25,10 @@ impl LagunaTokenizer {
     pub const PAD: u32 = 9;
     /// End-of-generation tokens: `〈|EOS|〉` (2) and `</assistant>` (24).
     pub const EOG: [u32; 2] = [2, 24];
+    /// `</think>` — closes the reasoning block the chat template opens with
+    /// `<assistant><think>`. A single added token, so generation code can gate
+    /// on it by id (e.g. to force a minimum reasoning length).
+    pub const THINK_CLOSE: u32 = 19;
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(path.as_ref())
