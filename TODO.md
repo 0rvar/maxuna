@@ -773,6 +773,43 @@ implementation — never silently drop scope.
   "largest quant that fits" (needs raised `iogpu.wired_limit_mb` and capped context).
 - [ ] **min-p sampling** — generation_config defaults min_p=0 so v1 omits it;
   candle's LogitsProcessor lacks it (would be a custom sampler stage).
+- [ ] **`--max-think` reasoning ceiling (graduated, NOT a hard cutoff)** —
+  companion to the shipped `--min-think` floor (Generator::min_think masks
+  `</think>` id 19 + EOG ids for the first N decode tokens; forced-thinking
+  runs then reason for thousands of tokens and once rode the -n cap without
+  closing the block, though they usually do close naturally after a few k).
+  Researched 2026-07-24; a bare "inject `</think>` at token N" was started and
+  deliberately reverted — it is the known-bad baseline: llama.cpp's
+  `--reasoning-budget` does exactly that (state machine in
+  common/reasoning-budget.cpp; forces an injected token sequence by masking
+  all other logits to -inf, with a WAITING_UTF8 state so it never cuts
+  mid-codepoint) and its issue #20632 criticizes it for cutting mid-sentence
+  with ZERO tokens left to conclude. Best-practice design (evidence:
+  "Budget Guidance" arXiv 2506.13752 — soft beats hard truncation on
+  MATH/AIME; NVIDIA NIM BudgetControlLogitsProcessor; Qwen3 tech report;
+  s1 "budget forcing" arXiv 2501.19393):
+  1. SOFT RAMP from ~80% of the budget: add a positive, growing bias to the
+     `</think>` logit (e.g. `k · (t − 0.8·N)/(0.2·N)`, scaled vs the current
+     max logit) so the model exits at its own next good boundary — this is
+     the primary lever, not the hard stop.
+  2. GRACE WINDOW at 100%: don't force yet; wait up to ~10% of N for the
+     next `\n` (sentence boundary) — NIM's mechanism.
+  3. FORCED INJECTION at N+grace: emit Qwen3's official transition string
+     `"Considering the limited time by the user, I have to give the solution
+     based on the thinking directly now.\n"` then `</think>`, via
+     all-but-target -inf masking so the injected tokens land in the KV cache
+     as real context. Reserve the conclusion margin — never fire with 0
+     tokens of -n budget left (llama.cpp's core mistake).
+  Implementation: all in the CPU sampler readback (Sampler::sample_masked
+  already owns the logits Vec — a bias variant is trivial); wire the same
+  three sample sites as min_think (plain loop; spec path first-token,
+  plain-fallback round, accept_drafts verify closure — emitted index is
+  `decoded + i` there). Injection during spec rounds: simplest to force a
+  plain round while an injection sequence is active. Guard interaction:
+  effective ceiling ≥ floor; keep the existing `min_think < max_tokens`
+  ensure. Caution from s1: over-suppressing `</think>` to EXTEND thinking
+  causes repetitive loops around ~6× natural length — keep `--min-think`
+  values modest (hundreds, not thousands).
 - [ ] **Batching** — v1 is deliberately batch=1 (single-user local inference).
 - [ ] **Tool-call / reasoning stream parsing** — emitting structured `<tool_call>` /
   `<think>` blocks as parsed events instead of raw text (needed for the server).
