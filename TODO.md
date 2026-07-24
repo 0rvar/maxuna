@@ -738,6 +738,29 @@ implementation — never silently drop scope.
   step-47 winner flips between blessed configs under ulp-level prefill
   changes). Reviews: Claude clean; GLM 3 findings fixed (comment
   precision, attn_decode gate enforcement, classic-loader odd-row pad).
+- [ ] **UD code-quality verification (code-corpus ppl, rope discrimination)** —
+  the 2026-07-24 quality A/B (10 seeds/model, DFlash spec, temp 1.0, rust
+  url-sanitizer prompt; outputs /tmp/laguna-quality-ab/, blinded two-judge
+  eval) found moderate code-specific erosion on UD-Q4_K_XL vs official:
+  official preferred ~6-7/10 pairs, UD compile-failure 7/10 vs official
+  ~2.5/10 (dominant failure mode — hallucinated url-crate Serializer methods
+  — present on BOTH sides), UD skews terse (~1130 vs ~1340 mean tokens).
+  NOT an engine bug: all parity gates pass on both files, q8 gemv exonerated
+  at rel_l2 ~1e-6. Two open hypotheses: (a) the as-shipped 1M/YaRN-128 rope
+  config (we load it verbatim; wikitext ppl showed pinning to the official
+  256k config is worth ~1.5% and makes UD ~1% BETTER than official on
+  prose), (b) code-specific expert quant damage invisible to prose ppl.
+  Discriminating experiment, fork-only, zero engine work: llama-perplexity
+  over a CODE corpus (e.g. a few hundred KB of rust/py source, frozen like
+  the wikitext fixture) in three configs — official, UD as-shipped, UD
+  rope-pinned (--rope-scaling yarn --rope-freq-scale 0.03125
+  --yarn-orig-ctx 8192). If pinning closes most of the code-ppl gap → the
+  fix is the rope-override-at-load engine item (small; gives UD's +17.5%
+  decode at official-grade quality; see 1M-context-tuning item). If not →
+  expert quant damage; mark the UD file "fast but code-degraded" and the
+  mitigation is a self-quantized attention-Q8 file with the official expert
+  mix (see self-quantized-tier item). ONE model process at a time; ppl runs
+  are ~10 min each LPM.
 - [ ] **Native-q8 prefill attention projections** — the UD dual-storage
   design keeps dequant-f16 planes solely for the seq>8 prefill gemm,
   costing ~11GB RAM and the ~3s dequant at load. A q8_0 cooperative-
